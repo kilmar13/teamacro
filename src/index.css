@@ -1,0 +1,88 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --brand-navy: #0B2A5B;
+    --brand-royal: #1E5BD8;
+    --brand-blue: #2563EB;
+    --brand-bg: #F4F7FB;
+    --brand-white: #FFFFFF;
+    --fixed-target: #2563EB;
+    --daily-ajo: #16A34A;
+    --food-contr: #F97316;
+    --leocash: #7C3AED;
+    --loan-mgmt: #0D9488;
+    --font-display: 'Manrope', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-sans: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+
+  html {
+    font-family: var(--font-sans);
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #F4F7FB;
+    color: #0F172A;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  h1, h2, h3, h4, h5, h6, .font-display {
+    font-family: var(--font-display);
+    letter-spacing: -0.022em;
+  }
+
+  table th {
+    font-family: var(--font-display);
+    letter-spacing: 0.06em;
+  }
+
+  table td {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.022em;
+}
+
+.font-sans {
+  font-family: var(--font-sans);
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Elementor & Luxury Elevator Architectural Containers */
+.elementor-panel {
+  background-color: #FFFFFF;
+  border: 1px solid #E2E8F0;
+  border-radius: 0.375rem;
+  box-shadow: 0 1px 3px 0 rgba(11, 42, 91, 0.04);
+}
+
+.dark .elementor-panel {
+  background-color: #0B1536;
+  border-color: #1E2E64;
+}
+
+/* Precision architectural scrollbars for data tables and modals */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #94a3b8;
+}

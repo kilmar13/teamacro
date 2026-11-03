@@ -1,0 +1,8 @@
+{
+  "name": "TEAMACRO",
+  "description": "Enterprise-grade microfinance banking platform featuring a comprehensive public portal, customer internet banking, staff operations, double-entry transaction ledger, and Super Admin control center.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

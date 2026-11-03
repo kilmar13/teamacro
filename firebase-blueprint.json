@@ -1,0 +1,288 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile with role-based access for customers, branch staff, and system administrators.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique user identifier matching auth UID."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "User primary email address."
+        },
+        "fullName": {
+          "type": "string",
+          "description": "User legal full name."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["CUSTOMER", "TELLER", "COMPLIANCE_OFFICER", "BRANCH_MANAGER", "SUPER_ADMIN", "ADMIN", "STAFF"],
+          "description": "Authorization role within the banking system."
+        },
+        "roleTitle": {
+          "type": "string",
+          "description": "Operational job title or responsibility designation."
+        },
+        "phone": {
+          "type": "string",
+          "description": "Verified Nigerian mobile contact number."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Whether the user account is active."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of user creation."
+        }
+      },
+      "required": ["id", "email", "fullName", "role", "active"]
+    },
+    "Admin": {
+      "title": "Admin",
+      "description": "Super admin authorization document designating administrative privileges.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "User UID granted super administrative privileges."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Admin email address."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Timestamp when admin role was granted."
+        }
+      },
+      "required": ["uid", "email"]
+    },
+    "Account": {
+      "title": "Account",
+      "description": "Deposit, savings, or current account record linked to a customer.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "System account ID."
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner customer UID."
+        },
+        "nuban": {
+          "type": "string",
+          "pattern": "^[0-9]{10}$",
+          "description": "10-digit NUBAN account number."
+        },
+        "accountName": {
+          "type": "string",
+          "description": "Full name registered on the bank account."
+        },
+        "productType": {
+          "type": "string",
+          "enum": ["SAVINGS", "CURRENT", "SME_ENTERPRISE", "INTERNAL_LEDGER"],
+          "description": "Account category."
+        },
+        "balanceKobo": {
+          "type": "number",
+          "description": "Available balance in kobo (1 NGN = 100 kobo)."
+        },
+        "ledgerBalanceKobo": {
+          "type": "number",
+          "description": "Ledger balance in kobo."
+        },
+        "currency": {
+          "type": "string",
+          "enum": ["NGN"],
+          "description": "Account currency."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["ACTIVE", "DORMANT", "FROZEN", "RESTRICTED"],
+          "description": "Account operational status."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp of account creation."
+        }
+      },
+      "required": ["id", "userId", "nuban", "accountName", "productType", "balanceKobo", "status"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "Immutable ledger transaction entry recording balance movement.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Transaction unique identifier."
+        },
+        "reference": {
+          "type": "string",
+          "description": "Unique transaction payment reference."
+        },
+        "userId": {
+          "type": "string",
+          "description": "Initiator customer UID."
+        },
+        "debitAccountId": {
+          "type": "string",
+          "description": "Source account ID."
+        },
+        "creditAccountId": {
+          "type": "string",
+          "description": "Destination account ID or external institution."
+        },
+        "amountKobo": {
+          "type": "number",
+          "description": "Transaction amount in kobo."
+        },
+        "currency": {
+          "type": "string",
+          "enum": ["NGN"],
+          "description": "Currency."
+        },
+        "channel": {
+          "type": "string",
+          "enum": ["INTERNET_BANKING", "MOBILE_APP", "BRANCH_COUNTER", "NIP_SWITCH"],
+          "description": "Originating channel."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["TRANSFER_INTERNAL", "TRANSFER_NIP_OUT", "TRANSFER_NIP_IN", "DEPOSIT_CASH", "WITHDRAWAL_CASH", "FEE"],
+          "description": "Transaction classification."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["PENDING", "SUCCESSFUL", "FAILED", "REVERSED"],
+          "description": "Execution status."
+        },
+        "narration": {
+          "type": "string",
+          "description": "Payment description/memo."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO timestamp when the transaction was executed."
+        }
+      },
+      "required": ["id", "reference", "userId", "amountKobo", "status"]
+    },
+    "AccountApplication": {
+      "title": "AccountApplication",
+      "description": "Digital account onboarding submission.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Application record ID."
+        },
+        "applicationRef": {
+          "type": "string",
+          "description": "Human-readable application tracking reference."
+        },
+        "accountType": {
+          "type": "string",
+          "enum": ["SAVINGS", "CURRENT", "SME_ENTERPRISE"]
+        },
+        "fullName": {
+          "type": "string"
+        },
+        "email": {
+          "type": "string",
+          "format": "email"
+        },
+        "phone": {
+          "type": "string"
+        },
+        "bvn": {
+          "type": "string",
+          "pattern": "^[0-9]{11}$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["SUBMITTED", "PENDING_KYC", "APPROVED", "REJECTED"]
+        },
+        "submittedAt": {
+          "type": "string"
+        }
+      },
+      "required": ["id", "applicationRef", "fullName", "email", "phone", "status"]
+    },
+    "SystemSetting": {
+      "title": "SystemSetting",
+      "description": "Singleton configuration and root lockdown settings for the platform.",
+      "type": "object",
+      "properties": {
+        "initialized": {
+          "type": "boolean",
+          "description": "Whether the root authority has been initialized and locked."
+        },
+        "ownerUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the authoritative Lifetime Super Admin."
+        },
+        "ownerEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "Normalized email address of the Lifetime Super Admin."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["LIFETIME_SUPER_ADMIN"],
+          "description": "Singleton primary administrative role."
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Legal full name of the Lifetime Super Admin."
+        },
+        "phone": {
+          "type": "string",
+          "description": "Official contact phone number."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp."
+        },
+        "setupVersion": {
+          "type": "number",
+          "description": "Protocol version."
+        }
+      },
+      "required": ["initialized", "ownerUid", "ownerEmail", "role", "setupVersion"]
+    }
+  },
+  "firestore": {
+    "/systemSettings/{settingId}": {
+      "schema": { "$ref": "#/entities/SystemSetting" },
+      "description": "Singleton configuration and root lockdown settings for the platform."
+    },
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/User" },
+      "description": "User profile records containing account credentials and roles."
+    },
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/Admin" },
+      "description": "Admin authorization mapping for trusted platform staff and administrators."
+    },
+    "/accounts/{accountId}": {
+      "schema": { "$ref": "#/entities/Account" },
+      "description": "Customer banking deposit, current, and savings accounts."
+    },
+    "/transactions/{transactionId}": {
+      "schema": { "$ref": "#/entities/Transaction" },
+      "description": "Authoritative immutable double-entry ledger transactions."
+    },
+    "/applications/{applicationId}": {
+      "schema": { "$ref": "#/entities/AccountApplication" },
+      "description": "Public customer onboarding account opening submissions."
+    }
+  }
+}

@@ -1,0 +1,201 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // GLOBAL SECURITY HELPERS & PRIMITIVES
+    // =========================================================================
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isSuperAdmin() {
+      return isSignedIn() && (
+        (exists(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin) &&
+         get(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin).data.ownerUid == request.auth.uid) ||
+        (request.auth.token.email == 'eromoseledavidson68@gmail.com' && request.auth.token.email_verified == true)
+      );
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        isSuperAdmin() ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // =========================================================================
+    // ENTITY VALIDATION HELPERS
+    // =========================================================================
+
+    function isValidSystemSetting(data) {
+      return data.keys().hasAll(['initialized', 'ownerUid', 'ownerEmail', 'role', 'setupVersion']) &&
+        data.keys().hasOnly(['initialized', 'ownerUid', 'ownerEmail', 'role', 'fullName', 'phone', 'createdAt', 'setupVersion']) &&
+        data.initialized == true &&
+        data.ownerUid is string && data.ownerUid.size() <= 128 &&
+        data.ownerEmail is string && data.ownerEmail.size() <= 128 &&
+        data.role == 'LIFETIME_SUPER_ADMIN' &&
+        data.setupVersion is number;
+    }
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['id', 'email', 'fullName', 'role', 'active']) &&
+        data.keys().hasOnly(['id', 'email', 'fullName', 'role', 'roleTitle', 'phone', 'active', 'createdAt', 'branchId']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.email is string && data.email.size() <= 128 &&
+        data.fullName is string && data.fullName.size() <= 100 &&
+        data.role in ['CUSTOMER', 'TELLER', 'COMPLIANCE_OFFICER', 'BRANCH_MANAGER', 'SUPER_ADMIN', 'ADMIN', 'STAFF'] &&
+        data.active is bool;
+    }
+
+    function isValidAccount(data) {
+      return data.keys().hasAll(['id', 'userId', 'nuban', 'accountName', 'productType', 'balanceKobo', 'status']) &&
+        data.keys().hasOnly(['id', 'userId', 'nuban', 'accountName', 'productType', 'balanceKobo', 'ledgerBalanceKobo', 'currency', 'status', 'createdAt']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.userId is string && data.userId.size() <= 128 &&
+        data.nuban is string && data.nuban.matches('^[0-9]{10}$') &&
+        data.accountName is string && data.accountName.size() <= 120 &&
+        data.productType in ['SAVINGS', 'CURRENT', 'SME_ENTERPRISE', 'INTERNAL_LEDGER'] &&
+        data.balanceKobo is number && data.balanceKobo >= 0 &&
+        data.status in ['ACTIVE', 'DORMANT', 'FROZEN', 'RESTRICTED'];
+    }
+
+    function isValidTransaction(data) {
+      return data.keys().hasAll(['id', 'reference', 'userId', 'amountKobo', 'status']) &&
+        data.keys().hasOnly(['id', 'reference', 'userId', 'debitAccountId', 'creditAccountId', 'amountKobo', 'currency', 'channel', 'type', 'status', 'narration', 'createdAt', 'beneficiaryName', 'beneficiaryBank']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.reference is string && data.reference.size() <= 64 &&
+        data.userId is string && data.userId.size() <= 128 &&
+        data.amountKobo is number && data.amountKobo > 0 &&
+        data.status in ['PENDING', 'SUCCESSFUL', 'FAILED', 'REVERSED'];
+    }
+
+    function isValidApplication(data) {
+      return data.keys().hasAll(['id', 'applicationRef', 'fullName', 'email', 'phone', 'status']) &&
+        data.keys().hasOnly(['id', 'applicationRef', 'accountType', 'tierRequested', 'fullName', 'email', 'phone', 'bvn', 'nin', 'status', 'submittedAt', 'residentialAddress', 'state', 'lga', 'occupation']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.applicationRef is string && data.applicationRef.size() <= 64 &&
+        data.fullName is string && data.fullName.size() <= 100 &&
+        data.email is string && data.email.size() <= 120 &&
+        data.phone is string && data.phone.size() <= 30 &&
+        data.status in ['SUBMITTED', 'PENDING_KYC', 'APPROVED', 'REJECTED'];
+    }
+
+    // =========================================================================
+    // GLOBAL DEFAULT-DENY FALLBACK
+    // =========================================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // 0. SYSTEM SETTINGS & SINGLETON LIFETIME SUPER ADMIN ROOT LOCKDOWN
+    // =========================================================================
+    match /systemSettings/{settingId} {
+      allow get: if isValidId(settingId);
+      allow list: if false;
+      allow create: if settingId == 'lifetimeSuperAdmin' &&
+        !exists(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin) &&
+        isValidSystemSetting(incoming());
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 1. USERS COLLECTION
+    // =========================================================================
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId) && (
+        isAdmin() ||
+        (isOwner(userId) && isValidUser(incoming()) && incoming().role == 'CUSTOMER')
+      );
+      allow update: if isValidId(userId) && (
+        isAdmin() ||
+        (
+          isOwner(userId) &&
+          isValidUser(incoming()) &&
+          incoming().id == existing().id &&
+          incoming().role == existing().role &&
+          incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'phone'])
+        )
+      );
+      allow delete: if isAdmin();
+    }
+
+    // =========================================================================
+    // 2. ADMINS & STAFF COLLECTIONS
+    // =========================================================================
+    match /admins/{adminId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin() || (
+        isSignedIn() &&
+        request.auth.uid == adminId &&
+        exists(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin) &&
+        get(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin).data.ownerUid == request.auth.uid
+      );
+    }
+
+    match /staff/{staffId} {
+      allow read: if isAdmin();
+      allow write: if isAdmin();
+    }
+
+    // =========================================================================
+    // 3. ACCOUNTS COLLECTION
+    // =========================================================================
+    match /accounts/{accountId} {
+      allow get: if isValidId(accountId) && ((isSignedIn() && resource.data.userId == request.auth.uid) || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isValidId(accountId) && (
+        isAdmin() ||
+        (isSignedIn() && incoming().userId == request.auth.uid && isValidAccount(incoming()))
+      );
+      allow update: if isValidId(accountId) && isAdmin();
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 4. TRANSACTIONS COLLECTION (IMMUTABLE DOUBLE-ENTRY LEDGER)
+    // =========================================================================
+    match /transactions/{transactionId} {
+      allow get: if isValidId(transactionId) && ((isSignedIn() && resource.data.userId == request.auth.uid) || isAdmin());
+      allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isValidId(transactionId) && (
+        isAdmin() ||
+        (isSignedIn() && incoming().userId == request.auth.uid && isValidTransaction(incoming()))
+      );
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // =========================================================================
+    // 5. APPLICATIONS (ACCOUNT ONBOARDING)
+    // =========================================================================
+    match /applications/{applicationId} {
+      allow get: if isValidId(applicationId) && isAdmin();
+      allow list: if isAdmin();
+      allow create: if isValidId(applicationId) && isValidApplication(incoming()) && incoming().status == 'SUBMITTED';
+      allow update: if isValidId(applicationId) && isAdmin();
+      allow delete: if isAdmin();
+    }
+  }
+}
