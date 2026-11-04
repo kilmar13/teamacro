@@ -12,7 +12,6 @@ import {
   auth,
   handleFirestoreError,
   OperationType,
-  provisionUserViaSecondaryFirebaseApp,
 } from './firebase';
 import { safeApiFetch, getActiveSessionToken, setActiveSessionToken } from '../utils/apiClient';
 import { normalizeError } from '../utils/errorNormalizer';
@@ -843,110 +842,84 @@ class AuthService {
   }
 
   /**
-   * Update Granular Account Permissions
+   * Update Granular Account Permissions (Server-side only)
    */
-  public async updatePermissions(targetUserId: string, permissions: Record<string, boolean>): Promise<{ success: boolean; message?: string; error?: string }> {
+  public async updatePermissions(targetUserId: string, permissions: Record<string, boolean>): Promise<{ success: boolean; message?: string; error?: string; correlationId?: string }> {
     await this.ensureSuperAdminSession();
     const res = await safeApiFetch('/api/auth/access/update-permissions', {
       method: 'POST',
       body: JSON.stringify({ targetUserId, permissions }),
     });
 
-    if (targetUserId) {
-      try {
-        await setDoc(doc(db, 'users', targetUserId), { permissions }, { merge: true }).catch(() => {});
-        await setDoc(doc(db, 'staff', targetUserId), { permissions }, { merge: true }).catch(() => {});
-        await setDoc(doc(db, 'admins', targetUserId), { permissions }, { merge: true }).catch(() => {});
-      } catch {
-        // Non-fatal
-      }
-    }
-
     if (!res.success) {
       return {
         success: false,
         message: res.message || res.error || 'Failed to update permissions.',
         error: res.error || res.message || 'Failed to update permissions.',
+        correlationId: res.correlationId,
       };
     }
 
     return {
       success: true,
       message: res.message || 'Permissions updated successfully.',
+      correlationId: res.correlationId,
     };
   }
 
   /**
-   * Toggle Account Status (Active / Suspended / Inactive) on Server & Firestore
+   * Toggle Account Status (Active / Suspended / Inactive) on Server
    */
   public async toggleAccountStatus(
     targetUserId: string,
     status: 'active' | 'suspended' | 'inactive',
-    role?: string
-  ): Promise<{ success: boolean; message?: string; error?: string }> {
+    _role?: string
+  ): Promise<{ success: boolean; message?: string; error?: string; correlationId?: string }> {
     await this.ensureSuperAdminSession();
     const res = await safeApiFetch('/api/auth/toggle-status', {
       method: 'POST',
       body: JSON.stringify({ targetUserId, status }),
     });
 
-    if (targetUserId) {
-      const isActive = status === 'active';
-      try {
-        await setDoc(doc(db, 'users', targetUserId), { status, active: isActive }, { merge: true }).catch(() => {});
-        if (role === 'ADMIN') {
-          await setDoc(doc(db, 'admins', targetUserId), { status, active: isActive }, { merge: true }).catch(() => {});
-        } else {
-          await setDoc(doc(db, 'staff', targetUserId), { status, active: isActive }, { merge: true }).catch(() => {});
-        }
-      } catch {
-        // Non-fatal
-      }
-    }
-
     if (!res.success) {
       return {
         success: false,
         message: res.message || res.error || 'Failed to update account status.',
         error: res.error || res.message || 'Failed to update account status.',
+        correlationId: res.correlationId,
       };
     }
 
     return {
       success: true,
       message: res.message || 'Account status updated successfully.',
+      correlationId: res.correlationId,
     };
   }
 
   /**
-   * Revoke Admin Privileges on Server & Firestore
+   * Revoke Admin Privileges on Server
    */
-  public async revokeAdminRole(targetUserId: string): Promise<{ success: boolean; message?: string; error?: string }> {
+  public async revokeAdminRole(targetUserId: string): Promise<{ success: boolean; message?: string; error?: string; correlationId?: string }> {
     await this.ensureSuperAdminSession();
     const res = await safeApiFetch('/api/auth/revoke-admin', {
       method: 'POST',
       body: JSON.stringify({ targetUserId }),
     });
 
-    if (targetUserId) {
-      try {
-        await setDoc(doc(db, 'users', targetUserId), { role: 'STAFF', roleTitle: 'Field Officer' }, { merge: true }).catch(() => {});
-      } catch {
-        // Non-fatal
-      }
-    }
-
     if (!res.success) {
       return {
         success: false,
         message: res.message || res.error || 'Failed to revoke administrator role.',
         error: res.error || res.message || 'Failed to revoke administrator role.',
+        correlationId: res.correlationId,
       };
     }
 
     return {
       success: true,
       message: res.message || 'Administrator privileges revoked successfully.',
+      correlationId: res.correlationId,
     };
   }
 
@@ -993,7 +966,7 @@ class AuthService {
   }
 
   /**
-   * Appoint Administrator with Access Code (Exclusive Lifetime Super Admin Privilege)
+   * Appoint Administrator with Access Code (Exclusive Lifetime Super Admin Privilege - Server-Side Only)
    */
   public async appointAdministrator(payload: {
     fullName: string;
@@ -1004,7 +977,14 @@ class AuthService {
     password?: string;
     initialPassword?: string;
     assignedModules?: string[];
-  }): Promise<{ success: boolean; message?: string; error?: string; invitation?: any; account?: any; initialPassword?: string }> {
+  }): Promise<{
+    success: boolean;
+    message?: string;
+    error?: string;
+    correlationId?: string;
+    invitation?: any;
+    account?: any;
+  }> {
     await this.ensureSuperAdminSession();
 
     let res = await safeApiFetch('/api/auth/access/appoint-admin', {
@@ -1020,94 +1000,18 @@ class AuthService {
       });
     }
 
-    const currentActor = ledgerEngine.getCurrentUser();
-    const fbUser = auth.currentUser;
-    const isSuperAdminCaller =
-      currentActor?.role === 'LIFETIME_SUPER_ADMIN' ||
-      currentActor?.role === 'SUPER_ADMIN' ||
-      currentActor?.isLifetimeSuperAdmin ||
-      fbUser?.email?.toLowerCase() === 'eromoseledavidson68@gmail.com';
-
-    let account = res.account || res.data?.account;
-    const initialPassword =
-      res.initialPassword ||
-      res.data?.initialPassword ||
-      payload.password ||
-      payload.initialPassword ||
-      payload.accessCode;
-
     if (!res.success) {
-      // If server returned a validation/duplicate/permission error (400/401/403/409), surface it directly
-      if (res.statusCode && res.statusCode >= 400 && res.statusCode < 500) {
-        return {
-          success: false,
-          message: res.message || res.error || 'Failed to appoint administrator.',
-          error: res.error || res.message || 'Failed to appoint administrator.',
-        };
-      }
-
-      // If serverless endpoint experienced a transient 5xx/network error and caller is verified Super Admin,
-      // provision directly via isolated secondary Firebase Auth app + Firestore
-      if (!isSuperAdminCaller) {
-        return {
-          success: false,
-          message: res.message || res.error || 'Failed to appoint administrator.',
-          error: res.error || res.message || 'Failed to appoint administrator.',
-        };
-      }
-
-      const cleanEmail = payload.email.trim().toLowerCase();
-      const cleanName = payload.fullName.trim();
-      const cleanPhone = payload.phone.trim();
-      const duty = payload.operationalResponsibility?.trim() || 'Admin / General Branch Administrator';
-
-      const prov = await provisionUserViaSecondaryFirebaseApp({
-        email: cleanEmail,
-        password: initialPassword,
-        fullName: cleanName,
-      });
-
-      if (!prov.success) {
-        return {
-          success: false,
-          message: prov.errorMessage || 'Failed to provision administrator in Firebase Authentication.',
-          error: prov.errorCode || 'FIREBASE_AUTH_ERROR',
-        };
-      }
-
-      const newUid = prov.uid || `STAFF_ADM_${Date.now().toString(36).toUpperCase()}`;
-      const createdAt = new Date().toISOString();
-      account = {
-        id: newUid,
-        uid: newUid,
-        staffCode: `TMC-ADM-${newUid.slice(-4).toUpperCase()}`,
-        fullName: cleanName,
-        email: cleanEmail,
-        phone: cleanPhone,
-        role: 'ADMIN',
-        roleTitle: duty,
-        duty,
-        status: 'active',
-        active: true,
-        createdAt,
+      return {
+        success: false,
+        message: res.message || res.error || 'Failed to appoint administrator.',
+        error: res.error || res.message || 'Failed to appoint administrator.',
+        correlationId: res.correlationId,
       };
-    } else if (account && isSuperAdminCaller && String(account.id || '').startsWith('STAFF_')) {
-      // If server generated a local ID because Identity Toolkit was unreachable, also ensure Firebase Auth account exists
-      try {
-        const prov = await provisionUserViaSecondaryFirebaseApp({
-          email: payload.email.trim().toLowerCase(),
-          password: initialPassword,
-          fullName: payload.fullName.trim(),
-        });
-        if (prov.success && prov.uid) {
-          account = { ...account, id: prov.uid, uid: prov.uid };
-        }
-      } catch {
-        // Non-fatal
-      }
     }
 
-    // Immediately reflect in local ledgerEngine directory
+    const account = res.account || res.data?.account;
+
+    // Immediately reflect in local ledgerEngine directory for UI rendering
     try {
       const actor = ledgerEngine.getCurrentStaff() || ledgerEngine.getCurrentUser() || {
         id: 'ROOT_SUPER_ADMIN',
@@ -1124,8 +1028,6 @@ class AuthService {
           phone: payload.phone,
           operationalResponsibility: payload.operationalResponsibility,
           assignedModules: payload.assignedModules,
-          accessCode: payload.accessCode,
-          initialPassword,
         },
         actor
       );
@@ -1133,67 +1035,17 @@ class AuthService {
       console.warn('[AUTH] Local ledgerEngine admin sync note:', err);
     }
 
-    // Also reflect in Firestore /admins and /users when authenticated
-    if (account?.id) {
-      const createdAt = account.createdAt || new Date().toISOString();
-      const duty =
-        account.duty ||
-        account.roleTitle ||
-        payload.operationalResponsibility ||
-        'Admin / General Branch Administrator';
-      try {
-        await setDoc(
-          doc(db, 'admins', account.id),
-          {
-            uid: account.id,
-            id: account.id,
-            email: (account.email || payload.email).toLowerCase().trim(),
-            fullName: account.fullName || payload.fullName.trim(),
-            phone: account.phone || payload.phone.trim(),
-            role: 'ADMIN',
-            roleTitle: duty,
-            duty,
-            status: 'active',
-            active: true,
-            createdBy: fbUser?.uid || currentActor?.id || 'LIFETIME_SUPER_ADMIN',
-            createdAt,
-          },
-          { merge: true }
-        );
-        await setDoc(
-          doc(db, 'users', account.id),
-          {
-            id: account.id,
-            uid: account.id,
-            email: (account.email || payload.email).toLowerCase().trim(),
-            fullName: account.fullName || payload.fullName.trim(),
-            phone: account.phone || payload.phone.trim(),
-            role: 'ADMIN',
-            roleTitle: duty,
-            duty,
-            status: 'active',
-            active: true,
-            createdBy: fbUser?.uid || currentActor?.id || 'LIFETIME_SUPER_ADMIN',
-            createdAt,
-          },
-          { merge: true }
-        );
-      } catch (fsErr) {
-        console.warn('[AUTH] Firestore admin client sync note:', fsErr);
-      }
-    }
-
     return {
       success: true,
       message: res.message || 'Administrator appointed successfully.',
+      correlationId: res.correlationId,
       invitation: res.invitation || res.data?.invitation,
       account,
-      initialPassword,
     };
   }
 
   /**
-   * Create Staff Account with Access Code verification
+   * Create Staff Account with Access Code verification (Server-Side Only)
    */
   public async createStaffAccount(payload: {
     fullName: string;
@@ -1205,7 +1057,14 @@ class AuthService {
     password?: string;
     initialPassword?: string;
     assignedModules?: string[];
-  }): Promise<{ success: boolean; message?: string; error?: string; account?: any; invitation?: any; initialPassword?: string }> {
+  }): Promise<{
+    success: boolean;
+    message?: string;
+    error?: string;
+    correlationId?: string;
+    account?: any;
+    invitation?: any;
+  }> {
     const existingToken = this.getStoredToken();
     if (!existingToken) {
       await this.ensureSuperAdminSession();
@@ -1224,94 +1083,18 @@ class AuthService {
       });
     }
 
-    const currentActor = ledgerEngine.getCurrentUser();
-    const fbUser = auth.currentUser;
-    const isPrivilegedCaller =
-      currentActor?.role === 'LIFETIME_SUPER_ADMIN' ||
-      currentActor?.role === 'SUPER_ADMIN' ||
-      currentActor?.role === 'ADMIN' ||
-      currentActor?.isLifetimeSuperAdmin ||
-      fbUser?.email?.toLowerCase() === 'eromoseledavidson68@gmail.com';
-
-    let account = res.account || res.data?.account;
-    const initialPassword =
-      res.initialPassword ||
-      res.data?.initialPassword ||
-      payload.password ||
-      payload.initialPassword ||
-      payload.accessCode;
-
     if (!res.success) {
-      if (res.statusCode && res.statusCode >= 400 && res.statusCode < 500) {
-        return {
-          success: false,
-          message: res.message || res.error || 'Failed to create staff account.',
-          error: res.error || res.message || 'Failed to create staff account.',
-        };
-      }
-
-      if (!isPrivilegedCaller) {
-        return {
-          success: false,
-          message: res.message || res.error || 'Failed to create staff account.',
-          error: res.error || res.message || 'Failed to create staff account.',
-        };
-      }
-
-      const cleanEmail = payload.email.trim().toLowerCase();
-      const cleanName = payload.fullName.trim();
-      const cleanPhone = payload.phone.trim();
-      const duty =
-        payload.roleTitle?.trim() ||
-        payload.operationalResponsibility?.trim() ||
-        'Operations Staff';
-
-      const prov = await provisionUserViaSecondaryFirebaseApp({
-        email: cleanEmail,
-        password: initialPassword,
-        fullName: cleanName,
-      });
-
-      if (!prov.success) {
-        return {
-          success: false,
-          message: prov.errorMessage || 'Failed to provision staff account in Firebase Authentication.',
-          error: prov.errorCode || 'FIREBASE_AUTH_ERROR',
-        };
-      }
-
-      const newUid = prov.uid || `STAFF_USR_${Date.now().toString(36).toUpperCase()}`;
-      const createdAt = new Date().toISOString();
-      account = {
-        id: newUid,
-        uid: newUid,
-        staffCode: `TMC-STF-${newUid.slice(-4).toUpperCase()}`,
-        fullName: cleanName,
-        email: cleanEmail,
-        phone: cleanPhone,
-        role: 'STAFF',
-        roleTitle: duty,
-        duty,
-        status: 'active',
-        active: true,
-        createdAt,
+      return {
+        success: false,
+        message: res.message || res.error || 'Failed to create staff account.',
+        error: res.error || res.message || 'Failed to create staff account.',
+        correlationId: res.correlationId,
       };
-    } else if (account && isPrivilegedCaller && String(account.id || '').startsWith('STAFF_')) {
-      try {
-        const prov = await provisionUserViaSecondaryFirebaseApp({
-          email: payload.email.trim().toLowerCase(),
-          password: initialPassword,
-          fullName: payload.fullName.trim(),
-        });
-        if (prov.success && prov.uid) {
-          account = { ...account, id: prov.uid, uid: prov.uid };
-        }
-      } catch {
-        // Non-fatal
-      }
     }
 
-    // Immediately reflect in local ledgerEngine directory
+    const account = res.account || res.data?.account;
+
+    // Immediately reflect in local ledgerEngine directory for UI rendering
     try {
       const actor = ledgerEngine.getCurrentStaff() || ledgerEngine.getCurrentUser() || {
         id: 'ROOT_SUPER_ADMIN',
@@ -1327,11 +1110,9 @@ class AuthService {
           email: payload.email,
           phone: payload.phone,
           role: 'STAFF',
-          roleTitle: payload.roleTitle || payload.operationalResponsibility || 'Operations Staff',
-          operationalResponsibility: payload.operationalResponsibility || payload.roleTitle || 'Operations Staff',
+          roleTitle: payload.roleTitle || payload.operationalResponsibility || 'Customer Registration Officer',
+          operationalResponsibility: payload.operationalResponsibility || payload.roleTitle || 'Customer Registration Officer',
           assignedModules: payload.assignedModules || ['DASHBOARD'],
-          accessCode: payload.accessCode,
-          initialPassword,
         },
         actor
       );
@@ -1339,63 +1120,12 @@ class AuthService {
       console.warn('[AUTH] Local ledgerEngine staff sync note:', err);
     }
 
-    // Also reflect in Firestore /staff and /users when authenticated
-    if (account?.id) {
-      const createdAt = account.createdAt || new Date().toISOString();
-      const duty =
-        account.duty ||
-        account.roleTitle ||
-        payload.roleTitle ||
-        payload.operationalResponsibility ||
-        'Operations Staff';
-      try {
-        await setDoc(
-          doc(db, 'staff', account.id),
-          {
-            uid: account.id,
-            id: account.id,
-            email: (account.email || payload.email).toLowerCase().trim(),
-            fullName: account.fullName || payload.fullName.trim(),
-            phone: account.phone || payload.phone.trim(),
-            role: 'STAFF',
-            roleTitle: duty,
-            duty,
-            status: 'active',
-            active: true,
-            createdBy: fbUser?.uid || currentActor?.id || 'LIFETIME_SUPER_ADMIN',
-            createdAt,
-          },
-          { merge: true }
-        );
-        await setDoc(
-          doc(db, 'users', account.id),
-          {
-            id: account.id,
-            uid: account.id,
-            email: (account.email || payload.email).toLowerCase().trim(),
-            fullName: account.fullName || payload.fullName.trim(),
-            phone: account.phone || payload.phone.trim(),
-            role: 'STAFF',
-            roleTitle: duty,
-            duty,
-            status: 'active',
-            active: true,
-            createdBy: fbUser?.uid || currentActor?.id || 'LIFETIME_SUPER_ADMIN',
-            createdAt,
-          },
-          { merge: true }
-        );
-      } catch (fsErr) {
-        console.warn('[AUTH] Firestore staff client sync note:', fsErr);
-      }
-    }
-
     return {
       success: true,
       message: res.message || 'Staff account created successfully',
+      correlationId: res.correlationId,
       account,
       invitation: res.invitation || res.data?.invitation,
-      initialPassword,
     };
   }
 

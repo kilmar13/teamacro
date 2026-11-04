@@ -209,15 +209,41 @@ export async function safeApiFetch<T = any>(
   // If response is valid JSON
   if (isJson) {
     const success = typeof json.success === 'boolean' ? json.success : res.ok;
-    const rawMsg = json.message || json.error;
-    const message = rawMsg ? normalizeError(rawMsg) : (success ? 'Operation completed successfully.' : `Request failed (${res.status}).`);
-    const error = !success ? (json.error ? normalizeError(json.error) : (json.message ? normalizeError(json.message) : `Request failed (${res.status})`)) : undefined;
+    const correlationId =
+      typeof json.correlationId === 'string'
+        ? json.correlationId
+        : typeof json.error === 'object' && json.error && typeof json.error.correlationId === 'string'
+        ? json.error.correlationId
+        : undefined;
+    const errorCode =
+      typeof json.error === 'object' && json.error && typeof json.error.code === 'string'
+        ? json.error.code
+        : typeof json.error === 'string'
+        ? json.error
+        : undefined;
+    const rawMsg =
+      (typeof json.error === 'object' && json.error?.message) ||
+      json.message ||
+      json.error;
+    const baseMessage = rawMsg
+      ? normalizeError(rawMsg)
+      : success
+      ? 'Operation completed successfully.'
+      : `Request failed (${res.status}).`;
+    const message = !success && correlationId && !baseMessage.includes(correlationId)
+      ? `${baseMessage} (Ref: ${correlationId})`
+      : baseMessage;
+    const error = !success
+      ? message
+      : undefined;
 
     return {
       ...json,
       success,
       message,
       error,
+      errorCode,
+      correlationId,
       statusCode: res.status,
       data: json.data !== undefined ? json.data : json,
     };
@@ -231,6 +257,7 @@ export async function safeApiFetch<T = any>(
     message: cleanMessage,
     error: cleanMessage,
     statusCode: res.status,
+    isNonJson: true,
     rawText: rawText.slice(0, 300),
   };
 }

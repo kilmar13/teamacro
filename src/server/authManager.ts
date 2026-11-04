@@ -1833,6 +1833,76 @@ class ServerAuthManager {
   // - Admin can create Staff only (cannot create Admin or Super Admin)
   // - Staff cannot create Admin or Super Admin
   // -------------------------------------------------------------------------
+  public static readonly ALLOWED_STAFF_DUTIES: ReadonlySet<string> = new Set([
+    'customer registration officer',
+    'payment collection officer',
+    'loan officer',
+    'accounts officer',
+    'operations manager',
+    'auditor / read-only user',
+    'field collector',
+    'field officer',
+    'customer service',
+    'accountant',
+    'auditor',
+    'operations staff',
+    'operational staff',
+    'field operations & customer servicing',
+    'teller',
+    'compliance officer',
+  ]);
+
+  public static readonly ALLOWED_ADMIN_DUTIES: ReadonlySet<string> = new Set([
+    'admin / general branch administrator',
+    'executive administrator',
+    'credit & risk portfolio oversight',
+    'branch operations administrator',
+    'compliance & audit administrator',
+    'treasury & ledger administrator',
+    'general branch administrator',
+    'operations manager',
+    'branch manager',
+  ]);
+
+  public isValidOperationalDuty(duty: string, targetRole: 'ADMIN' | 'STAFF'): boolean {
+    const normalized = (duty || '').trim().toLowerCase();
+    if (!normalized) return false;
+    if (targetRole === 'ADMIN') {
+      return (
+        ServerAuthManager.ALLOWED_ADMIN_DUTIES.has(normalized) ||
+        ServerAuthManager.ALLOWED_STAFF_DUTIES.has(normalized)
+      );
+    }
+    return ServerAuthManager.ALLOWED_STAFF_DUTIES.has(normalized);
+  }
+
+  public getAccountAccessCodeSaltedHash(uid: string): string | undefined {
+    const acc = this.accounts.get(uid);
+    if (!acc || !acc.accessCodeSalt || !acc.accessCodeHash) return undefined;
+    return `${acc.accessCodeSalt}:${acc.accessCodeHash}`;
+  }
+
+  public removeAccountOnRollback(uid: string, email?: string): void {
+    if (uid && this.accounts.has(uid)) {
+      this.accounts.delete(uid);
+    }
+    if (email) {
+      const clean = email.trim().toLowerCase();
+      for (const [key, acc] of this.accounts.entries()) {
+        if (acc.email.toLowerCase() === clean) {
+          this.accounts.delete(key);
+        }
+      }
+      for (const [invId, inv] of this.invitations.entries()) {
+        if (inv.email.toLowerCase() === clean) {
+          this.invitations.delete(invId);
+        }
+      }
+      this.persistInvitations();
+    }
+    this.persistAccounts();
+  }
+
   public createStaffAccount(
     actorSession: UserSession,
     data: {
@@ -1842,6 +1912,7 @@ class ServerAuthManager {
       username?: string;
       role?: UserRole;
       roleTitle?: string;
+      duty?: string;
       operationalResponsibility?: string;
       accessCode: string;
       password?: string;
@@ -1856,13 +1927,13 @@ class ServerAuthManager {
     error?: string;
     statusCode?: number;
     isDuplicate?: boolean;
-    account?: Omit<AuthAccount, 'passwordHash' | 'passwordSalt'>;
-    initialPassword?: string;
+    account?: Record<string, any>;
     invitation?: any;
     data?: any;
   } {
     // 1. Invariant: Nobody can create a Lifetime Super Admin
-    if (data.role === 'LIFETIME_SUPER_ADMIN' || (data.role as string) === 'SUPER_ADMIN') {
+    const rawRole = String(data.role || 'STAFF').trim().toUpperCase();
+    if (rawRole === 'LIFETIME_SUPER_ADMIN' || rawRole === 'SUPER_ADMIN') {
       const error = 'Security Invariant: Creation of a second Lifetime Super Admin is strictly prohibited.';
       return {
         success: false,
@@ -1872,16 +1943,26 @@ class ServerAuthManager {
       };
     }
 
-    // 2. Invariant: Only Lifetime Super Admin can create/appoint Admins
-    if (data.role === 'ADMIN' && actorSession.role !== 'LIFETIME_SUPER_ADMIN') {
-      const error = 'Privilege Violation: Only the Lifetime Super Admin may appoint or promote Administrator accounts.';
+    if (rawRole !== 'STAFF' && rawRole !== 'ADMIN') {
+      const error = 'Invalid role: Account creation route may only assign STAFF or ADMIN role.';
+      return {
+        success: false,
+        statusCode: 400,
+        message: error,
+        error,
+      };
+    }
+
+    // 2. Invariant: Only the active Lifetime Super Admin can create Staff or Admin accounts on this endpoint
+    if (actorSession.role !== 'LIFETIME_SUPER_ADMIN' || !actorSession.isLifetimeSuperAdmin) {
+      const error = 'Privilege Violation: Only the Lifetime Super Admin holds account provisioning clearance.';
       this.recordAudit({
         actorId: actorSession.userId,
         actorName: actorSession.fullName,
         actorRole: actorSession.role,
-        action: 'ILLEGAL_ADMIN_CREATION_ATTEMPT',
+        action: 'UNAUTHORIZED_ACCOUNT_CREATION_ATTEMPT',
         resource: '/api/auth/create-staff',
-        details: `Non-Super-Admin user attempted to create an Administrator account.`,
+        details: `Non-Super-Admin user (${actorSession.role}) attempted to create an account.`,
         ip: actorSession.ip,
         status: 'DENIED',
       });
@@ -1893,23 +1974,13 @@ class ServerAuthManager {
       };
     }
 
-    // 3. Invariant: Ordinary Staff cannot create accounts (Only Super Admin and Admin)
-    if (actorSession.role !== 'LIFETIME_SUPER_ADMIN' && actorSession.role !== 'ADMIN') {
-      const error = 'Privilege Violation: Ordinary staff members do not hold provisioning clearance.';
-      return {
-        success: false,
-        statusCode: 403,
-        message: error,
-        error,
-      };
-    }
-
-    // 4. Validate mandatory inputs
+    // 3. Validate mandatory inputs
     const fullName = data.fullName?.trim();
     const email = data.email?.trim().toLowerCase();
     const phone = data.phone?.trim();
     const accessCode = data.accessCode?.trim();
-    const roleTitle = data.roleTitle?.trim() || data.operationalResponsibility?.trim() || 'Customer Registration Officer';
+    const explicitDuty = (data.duty || data.roleTitle || data.operationalResponsibility || '').trim();
+    const roleTitle = explicitDuty || 'Customer Registration Officer';
 
     if (!fullName || !email || !phone || !accessCode) {
       const error = 'Full Legal Name, Official Email Address, Phone Number, and Access Code are mandatory.';
@@ -1925,6 +1996,16 @@ class ServerAuthManager {
     if (!emailRegex.test(email)) {
       const error = 'A valid official email address is required.';
       return { success: false, statusCode: 400, message: error, error };
+    }
+
+    if (!this.isValidOperationalDuty(roleTitle, rawRole === 'ADMIN' ? 'ADMIN' : 'STAFF')) {
+      const error = `Invalid operational duty "${roleTitle}". Please select an approved operational duty from the allowed list.`;
+      return {
+        success: false,
+        statusCode: 400,
+        message: error,
+        error,
+      };
     }
 
     if (accessCode.length < 6) {
@@ -2032,16 +2113,6 @@ class ServerAuthManager {
         };
       }
 
-      if (matchedInvitation.accessType === 'Admin' && actorSession.role !== 'LIFETIME_SUPER_ADMIN') {
-        const error = 'Clearance Violation: This access code is designated for Administrator clearance, not ordinary Staff.';
-        return {
-          success: false,
-          statusCode: 403,
-          message: error,
-          error,
-        };
-      }
-
       matchedInvitation.email = email;
       matchedInvitation.fullName = fullName;
       matchedInvitation.phone = phone;
@@ -2063,7 +2134,7 @@ class ServerAuthManager {
       const newInvitation: AccessInvitation = {
         id: invitationId,
         email,
-        accessType: data.role === 'ADMIN' ? 'Admin' : 'Staff',
+        accessType: rawRole === 'ADMIN' ? 'Admin' : 'Staff',
         duty: roleTitle,
         codeHash,
         codeSalt,
@@ -2099,7 +2170,7 @@ class ServerAuthManager {
       existingByEmail.isVerified = true;
       existingByEmail.fullName = fullName;
       existingByEmail.phone = phone;
-      existingByEmail.role = (data.role || existingByEmail.role || 'STAFF') as UserRole;
+      existingByEmail.role = (rawRole === 'ADMIN' ? 'ADMIN' : 'STAFF') as UserRole;
       existingByEmail.roleTitle = roleTitle;
       existingByEmail.duty = roleTitle;
       existingByEmail.createdBy = existingByEmail.createdBy || actorSession.userId;
@@ -2130,22 +2201,37 @@ class ServerAuthManager {
         status: 'SUCCESS',
       });
 
-      const { passwordHash: _, passwordSalt: __, ...safe } = existingByEmail;
+      const safeAccount = {
+        id: existingByEmail.id,
+        uid: existingByEmail.uid || existingByEmail.id,
+        email: existingByEmail.email,
+        username: existingByEmail.username,
+        fullName: existingByEmail.fullName,
+        phone: existingByEmail.phone,
+        role: existingByEmail.role,
+        roleTitle: existingByEmail.roleTitle,
+        duty: existingByEmail.duty,
+        staffId: existingByEmail.staffId || existingByEmail.id,
+        staffCode: existingByEmail.staffCode,
+        status: existingByEmail.status,
+        active: existingByEmail.active,
+        createdBy: existingByEmail.createdBy,
+        createdAt: existingByEmail.createdAt,
+        permissions: existingByEmail.permissions,
+      };
       const msg = 'Staff account created successfully';
       return {
         success: true,
         statusCode: 201,
         message: msg,
-        account: safe,
-        initialPassword: explicitPassword || fallbackPassword,
+        account: safeAccount,
         invitation: {
           codeMasked,
           accessType: existingByEmail.role === 'ADMIN' ? 'Admin' : 'Staff',
           duty: roleTitle,
         },
         data: {
-          account: safe,
-          initialPassword: explicitPassword || fallbackPassword,
+          account: safeAccount,
           invitation: {
             codeMasked,
             accessType: existingByEmail.role === 'ADMIN' ? 'Admin' : 'Staff',
@@ -2155,7 +2241,7 @@ class ServerAuthManager {
       };
     }
 
-    // 7. Initial password & Firebase UID linking
+    // 7. Initial password & Firebase UID linking (never echoed in response or logs)
     const rawPassword = (data.password || data.initialPassword || data.accessCode || '').trim();
     const initialPass = rawPassword && rawPassword.length >= 6
       ? rawPassword
@@ -2172,7 +2258,7 @@ class ServerAuthManager {
       username,
       fullName,
       phone,
-      role: (data.role || 'STAFF') as UserRole,
+      role: (rawRole === 'ADMIN' ? 'ADMIN' : 'STAFF') as UserRole,
       roleTitle,
       duty: roleTitle,
       isLifetimeSuperAdmin: false,
@@ -2211,22 +2297,37 @@ class ServerAuthManager {
       status: 'SUCCESS',
     });
 
-    const { passwordHash: _, passwordSalt: __, ...safe } = newAccount;
+    const safeAccount = {
+      id: newAccount.id,
+      uid: newAccount.uid || newAccount.id,
+      email: newAccount.email,
+      username: newAccount.username,
+      fullName: newAccount.fullName,
+      phone: newAccount.phone,
+      role: newAccount.role,
+      roleTitle: newAccount.roleTitle,
+      duty: newAccount.duty,
+      staffId: newAccount.staffId || newAccount.id,
+      staffCode: newAccount.staffCode,
+      status: newAccount.status,
+      active: newAccount.active,
+      createdBy: newAccount.createdBy,
+      createdAt: newAccount.createdAt,
+      permissions: newAccount.permissions,
+    };
     const successMsg = 'Staff account created successfully';
     return {
       success: true,
       statusCode: 201,
       message: successMsg,
-      account: safe,
-      initialPassword: initialPass,
+      account: safeAccount,
       invitation: {
         codeMasked,
         accessType: 'Staff',
         duty: roleTitle,
       },
       data: {
-        account: safe,
-        initialPassword: initialPass,
+        account: safeAccount,
         invitation: {
           codeMasked,
           accessType: 'Staff',
@@ -2492,7 +2593,7 @@ class ServerAuthManager {
     const email = data.email?.trim().toLowerCase();
     const phone = data.phone?.trim();
     const accessCode = data.accessCode?.trim();
-    const duty = data.operationalResponsibility?.trim() || 'Admin / General Branch Administrator';
+    const duty = (data.operationalResponsibility || (data as any).duty || (data as any).roleTitle || '').trim() || 'Admin / General Branch Administrator';
 
     if (!fullName || !email || !phone || !accessCode) {
       const error = 'Full Legal Name, Official Email Address, Phone Number, and Access Code are mandatory.';
@@ -2508,6 +2609,16 @@ class ServerAuthManager {
     if (!emailRegex.test(email)) {
       const error = 'A valid official email address is required.';
       return { success: false, statusCode: 400, message: error, error };
+    }
+
+    if (!this.isValidOperationalDuty(duty, 'ADMIN')) {
+      const error = `Invalid operational duty "${duty}". Please select an approved administrative duty from the allowed list.`;
+      return {
+        success: false,
+        statusCode: 400,
+        message: error,
+        error,
+      };
     }
 
     if (accessCode.length < 6) {
@@ -2734,11 +2845,9 @@ class ServerAuthManager {
       message: msg,
       invitation: safeInvitation,
       account: safeAccount,
-      initialPassword: initialPass,
       data: {
         invitation: safeInvitation,
         account: safeAccount,
-        initialPassword: initialPass,
       },
     };
   }

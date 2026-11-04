@@ -170,52 +170,40 @@ service cloud.firestore {
 
     // =========================================================================
     // 1. USERS COLLECTION
-    // Admins cannot promote themselves or others to SUPER_ADMIN or ADMIN.
-    // Users cannot modify their own roles or active status.
+    // User profiles are created exclusively server-side via Firebase Admin SDK.
+    // Clients cannot create user profiles or edit role, status, active, or permissions.
     // =========================================================================
     match /users/{userId} {
       allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
       allow list: if isAdmin();
-      allow create: if isValidId(userId) && isValidUser(incoming()) && (
-        isSuperAdmin() ||
-        (isAdmin() && incoming().role in ['STAFF', 'CUSTOMER', 'TELLER', 'COMPLIANCE_OFFICER']) ||
-        (isOwner(userId) && incoming().id == request.auth.uid && incoming().role == 'CUSTOMER')
-      );
-      allow update: if isValidId(userId) && isValidUser(incoming()) && (
-        isSuperAdmin() ||
-        (
-          isAdmin() &&
-          existing().role in ['STAFF', 'CUSTOMER', 'TELLER', 'COMPLIANCE_OFFICER'] &&
-          incoming().role in ['STAFF', 'CUSTOMER', 'TELLER', 'COMPLIANCE_OFFICER']
-        ) ||
-        (
-          isOwner(userId) &&
-          incoming().id == existing().id &&
-          incoming().role == existing().role &&
-          incoming().active == existing().active &&
-          incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'phone'])
-        )
-      );
-      allow delete: if isValidId(userId) && isSuperAdmin();
+      allow create: if false;
+      allow update: if isValidId(userId) &&
+        isValidUser(incoming()) &&
+        isOwner(userId) &&
+        incoming().id == existing().id &&
+        incoming().role == existing().role &&
+        incoming().active == existing().active &&
+        (!('status' in existing()) || incoming().status == existing().status) &&
+        (!('permissions' in existing()) || incoming().permissions == existing().permissions) &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'phone']);
+      allow delete: if false;
     }
 
     // =========================================================================
     // 2. ADMINS & STAFF COLLECTIONS
-    // Only Lifetime Super Admin can appoint/modify Admins.
-    // Staff cannot create Admin, Super Admin, or Staff accounts.
+    // Admin and Staff profiles, roles, statuses, and permissions are managed
+    // exclusively server-side via Firebase Admin SDK.
     // =========================================================================
     match /admins/{adminId} {
       allow get: if isValidId(adminId) && (isOwner(adminId) || isAdmin());
       allow list: if isAdmin();
-      allow create, update: if isValidId(adminId) && isSuperAdmin() && isValidAdminDoc(incoming());
-      allow delete: if isValidId(adminId) && isSuperAdmin();
+      allow create, update, delete: if false;
     }
 
     match /staff/{staffId} {
       allow get: if isValidId(staffId) && (isOwner(staffId) || isAdmin());
       allow list: if isAdmin();
-      allow create, update: if isValidId(staffId) && isAdmin() && isValidStaffDoc(incoming());
-      allow delete: if isValidId(staffId) && isAdmin();
+      allow create, update, delete: if false;
     }
 
     // =========================================================================

@@ -1,11 +1,5 @@
-import { initializeApp, getApps } from 'firebase/app';
-import {
-  getAuth,
-  createUserWithEmailAndPassword,
-  signInWithEmailAndPassword,
-  updateProfile,
-  signOut as firebaseSignOut,
-} from 'firebase/auth';
+import { initializeApp } from 'firebase/app';
+import { getAuth } from 'firebase/auth';
 import {
   initializeFirestore,
   getFirestore,
@@ -63,70 +57,6 @@ if (typeof window !== 'undefined') {
 
 // Initialize Primary Firebase App
 const app = initializeApp(firebaseConfig);
-
-/**
- * Provisions a new user in Firebase Authentication using an isolated secondary FirebaseApp
- * instance so the currently signed-in Lifetime Super Admin's session on `auth` is never replaced.
- */
-export async function provisionUserViaSecondaryFirebaseApp(params: {
-  email: string;
-  password: string;
-  fullName: string;
-}): Promise<{
-  success: boolean;
-  uid?: string;
-  alreadyExisted?: boolean;
-  errorCode?: string;
-  errorMessage?: string;
-}> {
-  const cleanEmail = (params.email || '').trim().toLowerCase();
-  const cleanName = (params.fullName || '').trim();
-  const rawPass = (params.password || '').trim();
-  const effectivePassword = rawPass.length >= 6 ? rawPass : `${rawPass}_Tmc2026!`;
-
-  const secondaryAppName = 'TeamacroProvisioningWorkerApp';
-  const secondaryApp =
-    getApps().find((a) => a.name === secondaryAppName) ||
-    initializeApp(firebaseConfig, secondaryAppName);
-  const secondaryAuth = getAuth(secondaryApp);
-
-  try {
-    const cred = await createUserWithEmailAndPassword(secondaryAuth, cleanEmail, effectivePassword);
-    const uid = cred.user.uid;
-    try {
-      await updateProfile(cred.user, { displayName: cleanName });
-    } catch {
-      // Ignore profile displayName update warning
-    }
-    try {
-      await firebaseSignOut(secondaryAuth);
-    } catch {
-      // Ignore secondary signOut warning
-    }
-    return { success: true, uid, alreadyExisted: false };
-  } catch (err: any) {
-    const code = err?.code || '';
-    if (code === 'auth/email-already-in-use') {
-      try {
-        const signInCred = await signInWithEmailAndPassword(secondaryAuth, cleanEmail, effectivePassword);
-        const existingUid = signInCred.user.uid;
-        await firebaseSignOut(secondaryAuth).catch(() => {});
-        return { success: true, uid: existingUid, alreadyExisted: true };
-      } catch {
-        return {
-          success: true,
-          alreadyExisted: true,
-          errorCode: 'auth/email-already-in-use',
-        };
-      }
-    }
-    return {
-      success: false,
-      errorCode: code || 'auth/provisioning-failed',
-      errorMessage: err?.message || 'Failed to provision Firebase Authentication user.',
-    };
-  }
-}
 
 /**
  * Robust Firestore initialization:

@@ -16,7 +16,7 @@ async function buildVercelApi() {
     define: {
       'process.env.VERCEL': '"1"',
     },
-    external: ['vite'],
+    external: ['vite', 'firebase-admin', 'firebase-admin/app', 'firebase-admin/auth', 'firebase-admin/firestore'],
     banner: {
       js: [
         '// Auto-generated self-contained Vercel Serverless Function bundle for TEAMACRO SERVICES LTD',

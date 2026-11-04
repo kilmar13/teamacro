@@ -577,6 +577,7 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
   // Handle Create / Appoint Admin (Exclusive to Lifetime Super Admin)
   const handleCreateAdmin = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (adminModalLoading) return;
     setStaffActionMsg(null);
     setAdminModalError(null);
 
@@ -713,6 +714,7 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
   // Handle Create Ordinary Staff with Backend Access Code Verification
   const handleCreateStaff = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (staffModalLoading) return;
     setStaffModalError(null);
     setStaffActionMsg(null);
 
@@ -2932,13 +2934,19 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
 
                 <div>
                   <label className="block font-semibold mb-1 text-slate-700 dark:text-slate-300">Operational Responsibility</label>
-                  <input
-                    type="text"
-                    value={newAdminForm.operationalResponsibility}
+                  <select
+                    value={newAdminForm.operationalResponsibility || 'Admin / General Branch Administrator'}
                     onChange={(e) => setNewAdminForm({ ...newAdminForm, operationalResponsibility: e.target.value })}
-                    placeholder="e.g. Credit & Risk Portfolio Oversight"
-                    className="w-full p-2 border border-slate-300 dark:border-slate-700 rounded-lg dark:bg-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-[#0B2A5B]"
-                  />
+                    className="w-full p-2 border border-slate-300 dark:border-slate-700 rounded-lg dark:bg-slate-900 dark:text-white focus:outline-hidden focus:ring-2 focus:ring-[#0B2A5B] font-medium"
+                  >
+                    <option value="Admin / General Branch Administrator">Admin / General Branch Administrator</option>
+                    <option value="Executive Administrator">Executive Administrator</option>
+                    <option value="Credit & Risk Portfolio Oversight">Credit & Risk Portfolio Oversight</option>
+                    <option value="Branch Operations Administrator">Branch Operations Administrator</option>
+                    <option value="Compliance & Audit Administrator">Compliance & Audit Administrator</option>
+                    <option value="Treasury & Ledger Administrator">Treasury & Ledger Administrator</option>
+                    <option value="Operations Manager">Operations Manager</option>
+                  </select>
                 </div>
 
                 {/* Set Access Code Field */}

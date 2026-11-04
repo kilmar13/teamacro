@@ -457,18 +457,42 @@ app.use('/api', (_req: Request, res: Response, next: NextFunction) => {
  * Robust async route handler wrapper.
  * Catches all errors and returns standardized JSON responses.
  */
+function generateCorrelationId(req?: Request): string {
+  const headerId = req?.headers?.['x-correlation-id'];
+  if (typeof headerId === 'string' && headerId.trim()) {
+    return headerId.trim();
+  }
+  return `req_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
+}
+
 function apiHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<any> | any) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
       await fn(req, res, next);
     } catch (err: any) {
-      console.error(`[API UNCAUGHT ERROR] ${req.method} ${req.originalUrl || req.path}:`, err);
+      const correlationId = generateCorrelationId(req);
+      const endpoint = req.originalUrl || req.path || '/api/unknown';
+      const status = typeof err?.status === 'number' && err.status >= 400 && err.status < 600 ? err.status : 500;
+      const safeMessage = err?.message || 'A server error occurred while processing the request.';
+      logStructuredServerError({
+        correlationId,
+        endpoint,
+        operation: `${req.method}_HANDLER`,
+        errorCategory: 'INTERNAL_SERVER_ERROR',
+        firebaseErrorCode: err?.code || 'INTERNAL_SERVER_ERROR',
+        statusCode: status,
+        message: safeMessage,
+      });
       if (!res.headersSent) {
-        const status = typeof err?.status === 'number' && err.status >= 400 && err.status < 600 ? err.status : 500;
         return res.status(status).json({
           success: false,
-          message: err?.message || 'A server error occurred while processing the request.',
-          error: err?.message || 'INTERNAL_SERVER_ERROR',
+          error: {
+            code: err?.code || 'INTERNAL_SERVER_ERROR',
+            message: safeMessage,
+            correlationId,
+          },
+          message: safeMessage,
+          correlationId,
           statusCode: status,
         });
       }
@@ -1099,37 +1123,53 @@ app.post('/api/auth/reset-password', (req: Request, res: Response) => {
  * Shared handler for creating Staff accounts (used by /api/auth/create-staff and /api/super-admin/create-staff)
  */
 const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) => {
+  const correlationId = generateCorrelationId(req);
   const endpoint = req.originalUrl || req.path || '/api/auth/create-staff';
   const session = await authenticateRequest(req);
   if (!session) {
+    const msg = 'Authentication required. Please sign in with Lifetime Super Admin credentials.';
     logStructuredServerError({
+      correlationId,
       endpoint,
       operation: 'CREATE_STAFF_AUTH_CHECK',
       errorCategory: 'AUTHENTICATION_REQUIRED',
+      firebaseErrorCode: 'auth/unauthenticated',
       statusCode: 401,
-      message: 'Unauthenticated request to create staff account.',
+      message: msg,
     });
     return res.status(401).json({
       success: false,
-      message: 'Authentication required. Please sign in with an authorized account.',
-      error: 'Authentication required.',
+      error: {
+        code: 'AUTHENTICATION_REQUIRED',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: 401,
     });
   }
 
-  if (session.role !== 'LIFETIME_SUPER_ADMIN' && session.role !== 'ADMIN') {
+  if (session.role !== 'LIFETIME_SUPER_ADMIN' || !session.isLifetimeSuperAdmin) {
+    const msg = 'Insufficient privileges: Only the Lifetime Super Admin can create staff accounts.';
     logStructuredServerError({
+      correlationId,
       endpoint,
       operation: 'CREATE_STAFF_ROLE_CHECK',
       errorCategory: 'INSUFFICIENT_PRIVILEGES',
+      firebaseErrorCode: 'auth/insufficient-permission',
       statusCode: 403,
       message: `Role ${session.role} is forbidden from creating staff accounts.`,
-      actorEmail: session.email,
     });
     return res.status(403).json({
       success: false,
-      message: 'Insufficient privileges: Only the Lifetime Super Admin or an active Administrator can create staff accounts.',
-      error: 'Insufficient privileges.',
+      error: {
+        code: 'INSUFFICIENT_PRIVILEGES',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: 403,
     });
   }
@@ -1138,22 +1178,101 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
   const cleanEmail = String(body.email || '').trim().toLowerCase();
   const cleanName = String(body.fullName || '').trim();
   const cleanPhone = String(body.phone || '').trim();
-  const secretCredential = String(body.accessCode || body.password || '').trim();
+  const cleanAccessCode = String(body.accessCode || '').trim();
+  const cleanInitialPassword = String(body.password || body.initialPassword || '').trim();
+  const secretCredential = cleanInitialPassword || cleanAccessCode;
+  const duty = String(body.duty || body.roleTitle || body.operationalResponsibility || 'Customer Registration Officer').trim();
+  const requestedRole = String(body.role || 'STAFF').trim().toUpperCase();
 
-  if (!cleanEmail || !cleanEmail.includes('@') || !cleanName || !cleanPhone) {
+  if (requestedRole === 'SUPER_ADMIN' || requestedRole === 'LIFETIME_SUPER_ADMIN') {
+    const msg = 'Security Invariant: Creation of a second Lifetime Super Admin is strictly prohibited.';
+    logStructuredServerError({
+      correlationId,
+      endpoint,
+      operation: 'CREATE_STAFF_ROLE_VALIDATION',
+      errorCategory: 'VALIDATION_ERROR',
+      statusCode: 400,
+      message: msg,
+    });
     return res.status(400).json({
       success: false,
-      message: 'Full Name, valid Email Address, and Phone Number are required to create a staff account.',
-      error: 'MISSING_REQUIRED_FIELDS',
+      error: {
+        code: 'INVALID_ROLE',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: 400,
     });
   }
 
-  if (!secretCredential || secretCredential.length < 6) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!cleanName || !cleanEmail || !emailRegex.test(cleanEmail) || !cleanPhone) {
+    const msg = 'Full Legal Name, valid Official Email Address, and Phone Number are required to create a staff account.';
+    logStructuredServerError({
+      correlationId,
+      endpoint,
+      operation: 'CREATE_STAFF_INPUT_VALIDATION',
+      errorCategory: 'VALIDATION_ERROR',
+      statusCode: 400,
+      message: msg,
+    });
     return res.status(400).json({
       success: false,
-      message: 'An initial password or access code of at least 6 characters is required.',
-      error: 'WEAK_OR_MISSING_PASSWORD',
+      error: {
+        code: 'MISSING_OR_INVALID_FIELDS',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      statusCode: 400,
+    });
+  }
+
+  if (!serverAuthManager.isValidOperationalDuty(duty, 'STAFF')) {
+    const msg = `Invalid operational duty "${duty}". Please select an approved operational duty from the allowed list.`;
+    logStructuredServerError({
+      correlationId,
+      endpoint,
+      operation: 'CREATE_STAFF_DUTY_VALIDATION',
+      errorCategory: 'VALIDATION_ERROR',
+      statusCode: 400,
+      message: msg,
+    });
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: 'INVALID_OPERATIONAL_DUTY',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      statusCode: 400,
+    });
+  }
+
+  if (!cleanAccessCode || cleanAccessCode.length < 6 || !secretCredential || secretCredential.length < 6) {
+    const msg = 'An access code (and optional initial password) of at least 6 characters is required.';
+    logStructuredServerError({
+      correlationId,
+      endpoint,
+      operation: 'CREATE_STAFF_CREDENTIAL_VALIDATION',
+      errorCategory: 'VALIDATION_ERROR',
+      statusCode: 400,
+      message: msg,
+    });
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: 'WEAK_OR_MISSING_ACCESS_CODE',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: 400,
     });
   }
@@ -1161,20 +1280,25 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
   // Check if duplicate active account already exists in server memory
   const existingLocal = serverAuthManager.findAccountByIdentifier(cleanEmail);
   if (existingLocal && existingLocal.status === 'active') {
+    const msg = `An account with email address "${cleanEmail}" already exists.`;
     logStructuredServerError({
+      correlationId,
       endpoint,
       operation: 'CREATE_STAFF_DUPLICATE_CHECK',
       errorCategory: 'DUPLICATE_EMAIL',
       firebaseErrorCode: 'auth/email-already-exists',
       statusCode: 409,
-      message: `A staff or administrative account with email ${cleanEmail} already exists.`,
-      actorEmail: session.email,
-      targetEmail: cleanEmail,
+      message: msg,
     });
     return res.status(409).json({
       success: false,
-      message: `An account with email address "${cleanEmail}" already exists.`,
-      error: 'EMAIL_ALREADY_EXISTS',
+      error: {
+        code: 'EMAIL_ALREADY_EXISTS',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: 409,
     });
   }
@@ -1187,21 +1311,27 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
   });
 
   if (!fbProvision.success) {
-    const status = fbProvision.isDuplicate ? 409 : 400;
+    const status = fbProvision.isDuplicate ? 409 : fbProvision.statusCode || 400;
+    const msg = fbProvision.errorMessage || 'Failed to create Firebase Authentication account.';
+    const code = fbProvision.errorCode || (fbProvision.isDuplicate ? 'EMAIL_ALREADY_EXISTS' : 'FIREBASE_AUTH_ERROR');
     logStructuredServerError({
+      correlationId,
       endpoint,
       operation: 'CREATE_STAFF_FIREBASE_AUTH',
       errorCategory: fbProvision.isDuplicate ? 'DUPLICATE_EMAIL' : 'FIREBASE_AUTH_ERROR',
-      firebaseErrorCode: fbProvision.errorCode,
+      firebaseErrorCode: code,
       statusCode: status,
-      message: fbProvision.errorMessage || 'Failed to create Firebase Authentication user.',
-      actorEmail: session.email,
-      targetEmail: cleanEmail,
+      message: msg,
     });
     return res.status(status).json({
       success: false,
-      message: fbProvision.errorMessage || 'Failed to create Firebase Authentication account.',
-      error: fbProvision.errorCode || 'FIREBASE_AUTH_ERROR',
+      error: {
+        code,
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: status,
     });
   }
@@ -1209,6 +1339,9 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
   // 2. Create authoritative server account record linked to Firebase UID
   const result = serverAuthManager.createStaffAccount(session, {
     ...body,
+    role: 'STAFF',
+    duty,
+    roleTitle: duty,
     firebaseUid: fbProvision.uid,
   });
 
@@ -1220,36 +1353,34 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
     const status =
       result.statusCode ||
       (result.isDuplicate ? 409 : result.error?.includes('Privilege') || result.error?.includes('Security Invariant') ? 403 : 400);
+    const msg = result.message || result.error || 'Failed to create staff account.';
+    const code = status === 409 ? 'EMAIL_ALREADY_EXISTS' : status === 403 ? 'INSUFFICIENT_PRIVILEGES' : 'VALIDATION_ERROR';
     logStructuredServerError({
+      correlationId,
       endpoint,
       operation: 'CREATE_STAFF_SERVER_RECORD',
       errorCategory: status === 409 ? 'DUPLICATE_EMAIL' : status === 403 ? 'INSUFFICIENT_PRIVILEGES' : 'VALIDATION_ERROR',
       statusCode: status,
-      message: result.message || result.error || 'Failed to create staff account.',
-      actorEmail: session.email,
-      targetEmail: cleanEmail,
+      message: msg,
     });
-    return res.status(status).json(
-      buildApiResponse(
-        {
-          message: result.message || result.error || 'Failed to create staff account.',
-          error: result.error,
-          statusCode: status,
-          ...result,
-        },
-        false
-      )
-    );
+    return res.status(status).json({
+      success: false,
+      error: {
+        code,
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      statusCode: status,
+    });
   }
 
   // 3. Synchronize Staff profile to Cloud Firestore (/users/{uid} and /staff/{uid})
   const acct = result.account;
-  const callerFbToken =
-    typeof req.headers['x-firebase-token'] === 'string'
-      ? req.headers['x-firebase-token'].trim()
-      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
-      ? req.headers.authorization.substring(7).trim()
-      : undefined;
+  const callerFbToken = extractCallerFirebaseToken(req);
+  const simulateFirestoreFailure = req.headers['x-test-simulate-firestore-failure'] === 'true';
+  const accessCodeSaltedHash = serverAuthManager.getAccountAccessCodeSaltedHash(acct.id);
 
   const firestoreResult = await withServerTimeout(
     writeFirestoreUserProfile({
@@ -1261,29 +1392,62 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
       roleTitle: acct.roleTitle,
       duty: acct.duty || acct.roleTitle,
       status: 'active',
-      createdBy: session.email,
+      createdBy: session.userId,
       createdAt: acct.createdAt || new Date().toISOString(),
+      accessCodeHash: accessCodeSaltedHash,
       staffCode: acct.staffCode,
       permissions: acct.permissions as unknown as Record<string, boolean>,
       callerIdToken: callerFbToken,
+      simulateFailure: simulateFirestoreFailure,
     }),
     3500
   ).catch((err) => ({
     success: false,
+    errorCode: 'firestore/timeout',
     errorMessage: err?.message || 'Firestore profile write timed out',
   }));
 
   if (!firestoreResult.success) {
-    console.warn('[CREATE STAFF] Firestore sync warning (server record preserved):', firestoreResult.errorMessage);
+    // Rollback both the Firebase Auth user and the in-memory/disk server account record
+    const rollbackOutcome = await rollbackFirebaseAuthAccount(acct.id, fbProvision.idToken);
+    serverAuthManager.removeAccountOnRollback(acct.id, cleanEmail);
+
+    const msg = 'Failed to create staff profile in Firestore. The authentication account has been rolled back.';
+    logStructuredServerError({
+      correlationId,
+      endpoint,
+      operation: 'CREATE_STAFF_FIRESTORE_PROFILE_ROLLBACK',
+      errorCategory: 'FIRESTORE_ERROR',
+      firebaseErrorCode: (firestoreResult as any).errorCode || 'firestore/write-failed',
+      statusCode: 500,
+      message: `${msg} (${firestoreResult.errorMessage || 'write failed'}, rolledBack=${rollbackOutcome.rolledBack})`,
+    });
+
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: 'FIRESTORE_PROFILE_WRITE_FAILED',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      rolledBack: rollbackOutcome.rolledBack,
+      rolledBackAuthUid: acct.id,
+      statusCode: 500,
+    });
   }
 
   return res.status(201).json({
     success: true,
+    correlationId,
     message: 'Staff account created successfully.',
-    data: result.data || { account: result.account, invitation: result.invitation, initialPassword: result.initialPassword },
+    data: {
+      account: result.account,
+      invitation: result.invitation,
+    },
     account: result.account,
     invitation: result.invitation,
-    initialPassword: result.initialPassword,
   });
 });
 
@@ -1505,37 +1669,53 @@ app.post('/api/auth/access/update-permissions', apiHandler(async (req: Request, 
  * Exclusive privilege: Lifetime Super Admin appoints an Administrator.
  */
 const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response) => {
+  const correlationId = generateCorrelationId(req);
   const endpoint = req.originalUrl || req.path || '/api/auth/access/appoint-admin';
   const session = await authenticateRequest(req);
   if (!session) {
+    const msg = 'Authentication required. Please sign in with Lifetime Super Admin credentials.';
     logStructuredServerError({
+      correlationId,
       endpoint,
       operation: 'CREATE_ADMIN_AUTH_CHECK',
       errorCategory: 'AUTHENTICATION_REQUIRED',
+      firebaseErrorCode: 'auth/unauthenticated',
       statusCode: 401,
-      message: 'Unauthenticated request to appoint administrator.',
+      message: msg,
     });
     return res.status(401).json({
       success: false,
-      message: 'Authentication required. Please sign in with Lifetime Super Admin credentials.',
-      error: 'Authentication required.',
+      error: {
+        code: 'AUTHENTICATION_REQUIRED',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: 401,
     });
   }
 
-  if (session.role !== 'LIFETIME_SUPER_ADMIN') {
+  if (session.role !== 'LIFETIME_SUPER_ADMIN' || !session.isLifetimeSuperAdmin) {
+    const msg = 'Clearance Violation: Only the Lifetime Super Admin can appoint Administrators.';
     logStructuredServerError({
+      correlationId,
       endpoint,
       operation: 'CREATE_ADMIN_ROLE_CHECK',
       errorCategory: 'INSUFFICIENT_PRIVILEGES',
+      firebaseErrorCode: 'auth/insufficient-permission',
       statusCode: 403,
       message: `Role ${session.role} is forbidden from appointing Administrators.`,
-      actorEmail: session.email,
     });
     return res.status(403).json({
       success: false,
-      message: 'Clearance Violation: Only the Lifetime Super Admin can appoint Administrators.',
-      error: 'Clearance Violation: Only the Lifetime Super Admin can appoint Administrators.',
+      error: {
+        code: 'INSUFFICIENT_PRIVILEGES',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: 403,
     });
   }
@@ -1544,22 +1724,77 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
   const cleanEmail = String(body.email || '').trim().toLowerCase();
   const cleanName = String(body.fullName || '').trim();
   const cleanPhone = String(body.phone || '').trim();
-  const secretCredential = String(body.accessCode || body.password || '').trim();
+  const cleanAccessCode = String(body.accessCode || '').trim();
+  const cleanInitialPassword = String(body.password || body.initialPassword || '').trim();
+  const secretCredential = cleanInitialPassword || cleanAccessCode;
+  const duty = String(body.operationalResponsibility || body.duty || body.roleTitle || 'Admin / General Branch Administrator').trim();
 
-  if (!cleanEmail || !cleanEmail.includes('@') || !cleanName || !cleanPhone) {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!cleanName || !cleanEmail || !emailRegex.test(cleanEmail) || !cleanPhone) {
+    const msg = 'Full Name, valid Email Address, and Phone Number are required to appoint an Administrator.';
+    logStructuredServerError({
+      correlationId,
+      endpoint,
+      operation: 'CREATE_ADMIN_INPUT_VALIDATION',
+      errorCategory: 'VALIDATION_ERROR',
+      statusCode: 400,
+      message: msg,
+    });
     return res.status(400).json({
       success: false,
-      message: 'Full Name, valid Email Address, and Phone Number are required to appoint an Administrator.',
-      error: 'MISSING_REQUIRED_FIELDS',
+      error: {
+        code: 'MISSING_REQUIRED_FIELDS',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: 400,
     });
   }
 
-  if (!secretCredential || secretCredential.length < 6) {
+  if (!serverAuthManager.isValidOperationalDuty(duty, 'ADMIN')) {
+    const msg = `Invalid operational duty "${duty}". Please select an approved administrative duty from the allowed list.`;
+    logStructuredServerError({
+      correlationId,
+      endpoint,
+      operation: 'CREATE_ADMIN_DUTY_VALIDATION',
+      errorCategory: 'VALIDATION_ERROR',
+      statusCode: 400,
+      message: msg,
+    });
     return res.status(400).json({
       success: false,
-      message: 'An initial password or access code of at least 6 characters is required.',
-      error: 'WEAK_OR_MISSING_PASSWORD',
+      error: {
+        code: 'INVALID_OPERATIONAL_DUTY',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      statusCode: 400,
+    });
+  }
+
+  if (!cleanAccessCode || cleanAccessCode.length < 6 || !secretCredential || secretCredential.length < 6) {
+    const msg = 'An access code (and optional initial password) of at least 6 characters is required.';
+    logStructuredServerError({
+      correlationId,
+      endpoint,
+      operation: 'CREATE_ADMIN_CREDENTIAL_VALIDATION',
+      errorCategory: 'VALIDATION_ERROR',
+      statusCode: 400,
+      message: msg,
+    });
+    return res.status(400).json({
+      success: false,
+      error: {
+        code: 'WEAK_OR_MISSING_PASSWORD',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: 400,
     });
   }
@@ -1567,20 +1802,25 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
   // Check if duplicate active account already exists in server memory
   const existingLocal = serverAuthManager.findAccountByIdentifier(cleanEmail);
   if (existingLocal && existingLocal.status === 'active') {
+    const msg = `An account with email address "${cleanEmail}" already exists.`;
     logStructuredServerError({
+      correlationId,
       endpoint,
       operation: 'CREATE_ADMIN_DUPLICATE_CHECK',
       errorCategory: 'DUPLICATE_EMAIL',
       firebaseErrorCode: 'auth/email-already-exists',
       statusCode: 409,
-      message: `An account with email ${cleanEmail} already exists.`,
-      actorEmail: session.email,
-      targetEmail: cleanEmail,
+      message: msg,
     });
     return res.status(409).json({
       success: false,
-      message: `An account with email address "${cleanEmail}" already exists.`,
-      error: 'EMAIL_ALREADY_EXISTS',
+      error: {
+        code: 'EMAIL_ALREADY_EXISTS',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: 409,
     });
   }
@@ -1593,21 +1833,27 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
   });
 
   if (!fbProvision.success) {
-    const status = fbProvision.isDuplicate ? 409 : 400;
+    const status = fbProvision.isDuplicate ? 409 : fbProvision.statusCode || 400;
+    const msg = fbProvision.errorMessage || 'Failed to create Firebase Authentication account.';
+    const code = fbProvision.errorCode || (fbProvision.isDuplicate ? 'EMAIL_ALREADY_EXISTS' : 'FIREBASE_AUTH_ERROR');
     logStructuredServerError({
+      correlationId,
       endpoint,
       operation: 'CREATE_ADMIN_FIREBASE_AUTH',
       errorCategory: fbProvision.isDuplicate ? 'DUPLICATE_EMAIL' : 'FIREBASE_AUTH_ERROR',
-      firebaseErrorCode: fbProvision.errorCode,
+      firebaseErrorCode: code,
       statusCode: status,
-      message: fbProvision.errorMessage || 'Failed to create Firebase Authentication user.',
-      actorEmail: session.email,
-      targetEmail: cleanEmail,
+      message: msg,
     });
     return res.status(status).json({
       success: false,
-      message: fbProvision.errorMessage || 'Failed to create Firebase Authentication account.',
-      error: fbProvision.errorCode || 'FIREBASE_AUTH_ERROR',
+      error: {
+        code,
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
       statusCode: status,
     });
   }
@@ -1615,6 +1861,7 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
   // 2. Create authoritative server account record linked to Firebase UID
   const result = serverAuthManager.appointAdministrator(session, {
     ...body,
+    operationalResponsibility: duty,
     firebaseUid: fbProvision.uid,
   });
 
@@ -1623,31 +1870,34 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
       await rollbackFirebaseAuthAccount(fbProvision.uid, fbProvision.idToken);
     }
     const status = result.statusCode || (result.isDuplicate ? 409 : 400);
+    const msg = result.message || result.error || 'Failed to appoint administrator.';
+    const code = status === 409 ? 'EMAIL_ALREADY_EXISTS' : 'VALIDATION_ERROR';
     logStructuredServerError({
+      correlationId,
       endpoint,
       operation: 'CREATE_ADMIN_SERVER_RECORD',
       errorCategory: status === 409 ? 'DUPLICATE_EMAIL' : 'VALIDATION_ERROR',
       statusCode: status,
-      message: result.message || result.error || 'Failed to appoint administrator.',
-      actorEmail: session.email,
-      targetEmail: cleanEmail,
+      message: msg,
     });
-    return res.status(status).json(
-      buildApiResponse(
-        {
-          message: result.message || result.error || 'Failed to appoint administrator.',
-          error: result.error,
-          statusCode: status,
-          ...result,
-        },
-        false
-      )
-    );
+    return res.status(status).json({
+      success: false,
+      error: {
+        code,
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      statusCode: status,
+    });
   }
 
   // 3. Synchronize Admin profile to Cloud Firestore (/users/{uid} and /admins/{uid})
   const acct = result.account;
   const callerFbToken = extractCallerFirebaseToken(req);
+  const simulateFirestoreFailure = req.headers['x-test-simulate-firestore-failure'] === 'true';
+  const accessCodeSaltedHash = serverAuthManager.getAccountAccessCodeSaltedHash(acct.id);
 
   const firestoreResult = await withServerTimeout(
     writeFirestoreUserProfile({
@@ -1659,26 +1909,59 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
       roleTitle: acct.roleTitle,
       duty: acct.duty || acct.roleTitle,
       status: 'active',
-      createdBy: session.email,
+      createdBy: session.userId,
       createdAt: acct.createdAt || new Date().toISOString(),
+      accessCodeHash: accessCodeSaltedHash,
       staffCode: acct.staffCode,
       permissions: acct.permissions as unknown as Record<string, boolean>,
       callerIdToken: callerFbToken,
+      simulateFailure: simulateFirestoreFailure,
     }),
     3500
   ).catch((err) => ({
     success: false,
+    errorCode: 'firestore/timeout',
     errorMessage: err?.message || 'Firestore profile write timed out',
   }));
 
   if (!firestoreResult.success) {
-    console.warn('[APPOINT ADMIN] Firestore sync warning (server record preserved):', firestoreResult.errorMessage);
+    const rollbackOutcome = await rollbackFirebaseAuthAccount(acct.id, fbProvision.idToken);
+    serverAuthManager.removeAccountOnRollback(acct.id, cleanEmail);
+
+    const msg = 'Failed to create administrator profile in Firestore. The authentication account has been rolled back.';
+    logStructuredServerError({
+      correlationId,
+      endpoint,
+      operation: 'CREATE_ADMIN_FIRESTORE_PROFILE_ROLLBACK',
+      errorCategory: 'FIRESTORE_ERROR',
+      firebaseErrorCode: (firestoreResult as any).errorCode || 'firestore/write-failed',
+      statusCode: 500,
+      message: `${msg} (${firestoreResult.errorMessage || 'write failed'}, rolledBack=${rollbackOutcome.rolledBack})`,
+    });
+
+    return res.status(500).json({
+      success: false,
+      error: {
+        code: 'FIRESTORE_PROFILE_WRITE_FAILED',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      rolledBack: rollbackOutcome.rolledBack,
+      rolledBackAuthUid: acct.id,
+      statusCode: 500,
+    });
   }
 
   return res.status(201).json({
     success: true,
+    correlationId,
     message: 'Admin account created successfully.',
-    data: result.data || { account: result.account, invitation: result.invitation },
+    data: {
+      account: result.account,
+      invitation: result.invitation,
+    },
     account: result.account,
     invitation: result.invitation,
   });
