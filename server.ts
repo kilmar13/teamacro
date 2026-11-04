@@ -2,7 +2,17 @@ import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
-import { serverAuthManager, UserSession } from './src/server/authManager';
+import { serverAuthManager, UserSession } from './src/server/authManager.js';
+import {
+  verifyFirebaseIdToken,
+  provisionFirebaseAuthAccount,
+  rollbackFirebaseAuthAccount,
+  writeFirestoreUserProfile,
+  readFirestoreDocument,
+  listFirestoreCollection,
+  authenticateWithFirebaseOnColdStart,
+  logStructuredServerError,
+} from './src/server/firebaseAdmin.js';
 
 // ============================================================================
 // 0. PROCESS-LEVEL STABILITY GUARDS (PREVENT UNEXPECTED CONNECTION CLOSURES)
@@ -34,32 +44,55 @@ function withServerTimeout<T>(promise: Promise<T>, timeoutMs = 1500): Promise<T>
   });
 }
 
-// Load Firebase configuration safely across CommonJS, Node ESM, tsx, and Vercel Serverless
+// Load environment variables from .env if present before resolving configuration
+dotenv.config();
+
+// Load Firebase configuration safely from environment variables or firebase-applet-config.json
+// without duplicating hardcoded API keys in server source code
 const firebaseConfig: {
   projectId: string;
   apiKey: string;
   firestoreDatabaseId: string;
   [key: string]: string;
 } = (() => {
+  let fileConfig: Record<string, string> = {};
   try {
     const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
     if (fs.existsSync(cfgPath)) {
-      return JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
+      fileConfig = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
     }
   } catch {
-    // Fallback to embedded project configuration
+    // Proceed with environment variables if config file cannot be read
   }
   return {
-    projectId: 'teamacro-a1849',
-    appId: '1:419612802:web:82d48b940af93927734c9b',
-    apiKey: 'AIzaSyCFKb5EtwtTlJnzbEQT3xdF2_Ey3rUCRoo',
-    authDomain: 'teamacro-a1849.firebaseapp.com',
-    firestoreDatabaseId: 'ai-studio-teamacro-1c75b7f5-7b8e-4f90-9452-2820167e5d5a',
+    ...fileConfig,
+    projectId:
+      process.env.FIREBASE_PROJECT_ID ||
+      process.env.VITE_FIREBASE_PROJECT_ID ||
+      fileConfig.projectId ||
+      'teamacro-a1849',
+    appId:
+      process.env.FIREBASE_APP_ID ||
+      process.env.VITE_FIREBASE_APP_ID ||
+      fileConfig.appId ||
+      '1:419612802:web:82d48b940af93927734c9b',
+    apiKey:
+      process.env.FIREBASE_API_KEY ||
+      process.env.VITE_FIREBASE_API_KEY ||
+      fileConfig.apiKey ||
+      '',
+    authDomain:
+      process.env.FIREBASE_AUTH_DOMAIN ||
+      process.env.VITE_FIREBASE_AUTH_DOMAIN ||
+      fileConfig.authDomain ||
+      'teamacro-a1849.firebaseapp.com',
+    firestoreDatabaseId:
+      process.env.FIREBASE_FIRESTORE_DATABASE_ID ||
+      process.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID ||
+      fileConfig.firestoreDatabaseId ||
+      'ai-studio-teamacro-1c75b7f5-7b8e-4f90-9452-2820167e5d5a',
   };
 })();
-
-// Load environment variables from .env if present
-dotenv.config();
 
 const app = express();
 
@@ -99,6 +132,36 @@ app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use((_req: Request, res: Response, next: NextFunction) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   res.setHeader('X-XSS-Protection', '1; mode=block');
+  next();
+});
+
+// Normalize Vercel serverless request URL when /api/(.*) is rewritten to /api?__path=$1 or stripped
+app.use((req: Request, _res: Response, next: NextFunction) => {
+  const queryPath = typeof req.query?.__path === 'string' ? req.query.__path.trim() : '';
+  if (queryPath) {
+    const cleanSubPath = queryPath.replace(/^\/+/, '');
+    const searchIndex = req.url.indexOf('?');
+    let remainingQuery = '';
+    if (searchIndex !== -1) {
+      const params = new URLSearchParams(req.url.slice(searchIndex + 1));
+      params.delete('__path');
+      const qs = params.toString();
+      if (qs) remainingQuery = `?${qs}`;
+    }
+    req.url = `/api/${cleanSubPath}${remainingQuery}`;
+    return next();
+  }
+
+  if (
+    !req.url.startsWith('/api') &&
+    (req.url.startsWith('/auth/') ||
+      req.url.startsWith('/customers') ||
+      req.url.startsWith('/financial/') ||
+      req.url.startsWith('/audit/') ||
+      req.url.startsWith('/super-admin/'))
+  ) {
+    req.url = '/api' + req.url;
+  }
   next();
 });
 
@@ -204,79 +267,65 @@ async function authenticateRequest(req: Request): Promise<UserSession | null> {
     }
   }
 
-  // 2. Check JWT candidates (Firebase ID Token)
+  // 2. Check JWT candidates (Firebase ID Token) via Firebase Admin SDK or Identity Toolkit
   const jwtCandidates = [bearerToken, customFbToken].filter(
     (t) => t && t.split('.').length === 3
   );
 
   for (const jwtToken of jwtCandidates) {
     try {
-      const parts = jwtToken.split('.');
-      const payloadBase64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-      const payloadJson = Buffer.from(payloadBase64, 'base64').toString('utf-8');
-      const payload = JSON.parse(payloadJson);
-      const nowSec = Math.floor(Date.now() / 1000);
-
-      // Verify project match and expiration
-      const projectMatches =
-        payload.aud === firebaseConfig.projectId ||
-        (typeof payload.iss === 'string' && payload.iss.includes(firebaseConfig.projectId));
-
-      if (projectMatches && payload.exp && payload.exp > nowSec) {
-        const email = (payload.email || '').toLowerCase().trim();
-        const uid = payload.user_id || payload.sub;
+      const verifiedToken = await verifyFirebaseIdToken(jwtToken);
+      if (verifiedToken.verified && verifiedToken.email) {
+        const email = verifiedToken.email.toLowerCase().trim();
+        const uid = verifiedToken.uid || 'LIFETIME_SUPER_ADMIN_UID';
         const ip = getClientIp(req);
         const userAgent = (req.headers['user-agent'] as string) || 'unknown';
 
-        // Authoritatively verify signature and validity with Google Identity Toolkit REST API
-        let verified = false;
-        try {
-          const verifyRes = await fetch(
-            `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${firebaseConfig.apiKey}`,
+        // Check if Lifetime Super Admin
+        if (
+          email === 'eromoseledavidson68@gmail.com' ||
+          serverAuthManager.isOwnerEmail(email)
+        ) {
+          const session = serverAuthManager.syncSuperAdminSession(
             {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ idToken: jwtToken }),
-            }
+              uid,
+              email,
+              fullName: verifiedToken.name || 'Davidson Eromosele',
+            },
+            ip,
+            userAgent
           );
-          if (verifyRes.ok) {
-            const data: any = await verifyRes.json();
-            if (data?.users && data.users.length > 0) {
-              verified = true;
-            }
-          }
-        } catch (netErr) {
-          console.warn('[SERVER AUTH] Identity Toolkit network check warning:', netErr);
-          verified = true;
+          return session;
         }
 
-        if (verified && email) {
-          // Check if Super Admin
-          if (
-            email === 'eromoseledavidson68@gmail.com' ||
-            serverAuthManager.isOwnerEmail(email)
-          ) {
-            const session = serverAuthManager.syncSuperAdminSession(
-              {
-                uid: uid || 'LIFETIME_SUPER_ADMIN_UID',
-                email,
-                fullName: payload.name || 'Davidson Eromosele',
-              },
-              ip,
-              userAgent
-            );
-            return session;
+        // Check if registered Admin or Staff in memory
+        let account = serverAuthManager.findAccountByIdentifier(email);
+        if (!account && uid) {
+          // Check Firestore on cold start if not yet in memory
+          const fsUser = await readFirestoreDocument('users', uid, jwtToken);
+          if (fsUser && fsUser.email && (fsUser.role === 'ADMIN' || fsUser.role === 'STAFF')) {
+            const synced = serverAuthManager.syncProvisionedAccount({
+              id: uid,
+              email: String(fsUser.email),
+              fullName: String(fsUser.fullName || fsUser.email),
+              phone: String(fsUser.phone || ''),
+              role: fsUser.role === 'ADMIN' ? 'ADMIN' : 'STAFF',
+              roleTitle: String(fsUser.roleTitle || fsUser.duty || ''),
+              duty: String(fsUser.duty || fsUser.roleTitle || ''),
+              status: fsUser.active === false || fsUser.status === 'suspended' ? 'suspended' : 'active',
+            });
+            if (synced) {
+              account = synced;
+            }
           }
+        }
 
-          // Check if registered Admin or Staff
-          const account = serverAuthManager.findAccountByIdentifier(email);
-          if (account && account.status === 'active') {
-            return serverAuthManager.createSession(account, ip, userAgent, true);
-          }
+        if (account && account.status === 'active') {
+          return serverAuthManager.createSession(account, ip, userAgent, true);
         }
       }
     } catch (jwtErr) {
-      console.warn('[SERVER AUTH] JWT parse warning:', jwtErr);
+      console.warn('[SERVER AUTH] JWT verification warning:', jwtErr);
     }
   }
 
@@ -433,16 +482,11 @@ function apiHandler(fn: (req: Request, res: Response, next: NextFunction) => Pro
  */
 app.get('/api/auth/setup-status', apiHandler(async (req: Request, res: Response) => {
   try {
-    const snap = await withServerTimeout(
-      (async () => {
-        const { doc, getDoc } = await import('firebase/firestore');
-        const { db } = await import('./src/services/firebase');
-        return getDoc(doc(db, 'systemSettings', 'lifetimeSuperAdmin'));
-      })(),
+    const data = await withServerTimeout(
+      readFirestoreDocument('systemSettings', 'lifetimeSuperAdmin'),
       1500
     );
-    if (snap.exists() && snap.data()?.initialized === true) {
-      const data = snap.data();
+    if (data && data.initialized === true) {
       return res.status(200).json({
         success: true,
         status: 'INITIALIZED',
@@ -458,7 +502,7 @@ app.get('/api/auth/setup-status', apiHandler(async (req: Request, res: Response)
           lockdownEnforced: true,
         },
       });
-    } else {
+    } else if (data !== null) {
       return res.status(200).json({
         success: true,
         status: 'NOT_INITIALIZED',
@@ -683,21 +727,25 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
     });
   }
 
-  // If a serverless instance cold-started and does not yet have a Super Admin-created profile in memory,
-  // hydrate it before authenticating credentials
+  // If a serverless instance cold-started and does not yet have a Super Admin-created Staff/Admin profile in memory,
+  // hydrate it ONLY if the email matches an existing server-issued invitation or non-Super-Admin staff record.
+  // Never allow client payload manipulation to escalate to LIFETIME_SUPER_ADMIN.
   if (
     syncedProfile &&
     typeof syncedProfile === 'object' &&
     syncedProfile.email &&
+    syncedProfile.role !== 'LIFETIME_SUPER_ADMIN' &&
+    syncedProfile.role !== 'SUPER_ADMIN' &&
     !serverAuthManager.findAccountByIdentifier(cleanIdentifier)
   ) {
+    const safeRole = syncedProfile.role === 'ADMIN' ? 'ADMIN' : 'STAFF';
     serverAuthManager.syncProvisionedAccount({
       id: syncedProfile.id,
       email: syncedProfile.email,
       username: syncedProfile.username,
       fullName: syncedProfile.fullName || syncedProfile.name || syncedProfile.email,
       phone: syncedProfile.phone,
-      role: syncedProfile.role,
+      role: safeRole,
       roleTitle: syncedProfile.roleTitle || syncedProfile.duty,
       duty: syncedProfile.duty || syncedProfile.roleTitle,
       staffCode: syncedProfile.staffCode,
@@ -707,7 +755,38 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
     });
   }
 
-  const result = serverAuthManager.authenticateCredentials(cleanIdentifier, cleanPassword, ip);
+  let result = serverAuthManager.authenticateCredentials(cleanIdentifier, cleanPassword, ip);
+
+  // If account was not found in local serverless memory (e.g. Vercel cold start) and identifier is an email,
+  // verify against Firebase Authentication + Cloud Firestore authoritative user/admin/staff records.
+  if ((!result.success || !result.account) && cleanIdentifier.includes('@')) {
+    try {
+      const fbAuth = await authenticateWithFirebaseOnColdStart(cleanIdentifier, cleanPassword);
+      if (fbAuth.authenticated && fbAuth.uid && fbAuth.email) {
+        const profile = fbAuth.profile || {};
+        const rawRole = String(profile.role || 'STAFF').toUpperCase();
+        if (rawRole !== 'LIFETIME_SUPER_ADMIN' && rawRole !== 'SUPER_ADMIN') {
+          const safeRole = rawRole === 'ADMIN' ? 'ADMIN' : 'STAFF';
+          const isSuspended = profile.active === false || profile.status === 'suspended';
+          serverAuthManager.syncProvisionedAccount({
+            id: fbAuth.uid,
+            email: fbAuth.email,
+            fullName: String(profile.fullName || fbAuth.email.split('@')[0]),
+            phone: String(profile.phone || ''),
+            role: safeRole,
+            roleTitle: String(profile.roleTitle || profile.duty || (safeRole === 'ADMIN' ? 'Executive Administrator' : 'Operations Officer')),
+            duty: String(profile.duty || profile.roleTitle || ''),
+            staffCode: profile.staffCode ? String(profile.staffCode) : undefined,
+            password: cleanPassword,
+            status: isSuspended ? 'suspended' : 'active',
+          });
+          result = serverAuthManager.authenticateCredentials(cleanIdentifier, cleanPassword, ip);
+        }
+      }
+    } catch (coldStartErr) {
+      console.warn('[LOGIN COLD-START VERIFY] Fallback warning:', coldStartErr);
+    }
+  }
 
 
   if (!result.success || !result.account) {
@@ -1017,23 +1096,139 @@ app.post('/api/auth/reset-password', (req: Request, res: Response) => {
 });
 
 /**
- * POST /api/auth/create-staff
- * Server-verified account provisioning with role hierarchy enforcement.
+ * Shared handler for creating Staff accounts (used by /api/auth/create-staff and /api/super-admin/create-staff)
  */
-app.post('/api/auth/create-staff', apiHandler(async (req: Request, res: Response) => {
+const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) => {
+  const endpoint = req.originalUrl || req.path || '/api/auth/create-staff';
   const session = await authenticateRequest(req);
   if (!session) {
+    logStructuredServerError({
+      endpoint,
+      operation: 'CREATE_STAFF_AUTH_CHECK',
+      errorCategory: 'AUTHENTICATION_REQUIRED',
+      statusCode: 401,
+      message: 'Unauthenticated request to create staff account.',
+    });
     return res.status(401).json({
       success: false,
       message: 'Authentication required. Please sign in with an authorized account.',
       error: 'Authentication required.',
+      statusCode: 401,
     });
   }
 
-  const result = serverAuthManager.createStaffAccount(session, req.body || {});
-  if (!result.success) {
-    const isForbidden = result.error?.includes('Privilege') || result.error?.includes('Security Invariant');
-    const status = isForbidden ? 403 : 400;
+  if (session.role !== 'LIFETIME_SUPER_ADMIN' && session.role !== 'ADMIN') {
+    logStructuredServerError({
+      endpoint,
+      operation: 'CREATE_STAFF_ROLE_CHECK',
+      errorCategory: 'INSUFFICIENT_PRIVILEGES',
+      statusCode: 403,
+      message: `Role ${session.role} is forbidden from creating staff accounts.`,
+      actorEmail: session.email,
+    });
+    return res.status(403).json({
+      success: false,
+      message: 'Insufficient privileges: Only the Lifetime Super Admin or an active Administrator can create staff accounts.',
+      error: 'Insufficient privileges.',
+      statusCode: 403,
+    });
+  }
+
+  const body = req.body || {};
+  const cleanEmail = String(body.email || '').trim().toLowerCase();
+  const cleanName = String(body.fullName || '').trim();
+  const cleanPhone = String(body.phone || '').trim();
+  const secretCredential = String(body.accessCode || body.password || '').trim();
+
+  if (!cleanEmail || !cleanEmail.includes('@') || !cleanName || !cleanPhone) {
+    return res.status(400).json({
+      success: false,
+      message: 'Full Name, valid Email Address, and Phone Number are required to create a staff account.',
+      error: 'MISSING_REQUIRED_FIELDS',
+      statusCode: 400,
+    });
+  }
+
+  if (!secretCredential || secretCredential.length < 6) {
+    return res.status(400).json({
+      success: false,
+      message: 'An initial password or access code of at least 6 characters is required.',
+      error: 'WEAK_OR_MISSING_PASSWORD',
+      statusCode: 400,
+    });
+  }
+
+  // Check if duplicate active account already exists in server memory
+  const existingLocal = serverAuthManager.findAccountByIdentifier(cleanEmail);
+  if (existingLocal && existingLocal.status === 'active') {
+    logStructuredServerError({
+      endpoint,
+      operation: 'CREATE_STAFF_DUPLICATE_CHECK',
+      errorCategory: 'DUPLICATE_EMAIL',
+      firebaseErrorCode: 'auth/email-already-exists',
+      statusCode: 409,
+      message: `A staff or administrative account with email ${cleanEmail} already exists.`,
+      actorEmail: session.email,
+      targetEmail: cleanEmail,
+    });
+    return res.status(409).json({
+      success: false,
+      message: `An account with email address "${cleanEmail}" already exists.`,
+      error: 'EMAIL_ALREADY_EXISTS',
+      statusCode: 409,
+    });
+  }
+
+  // 1. Provision account in Firebase Authentication on the server (never replaces Super Admin browser session)
+  const fbProvision = await provisionFirebaseAuthAccount({
+    email: cleanEmail,
+    password: secretCredential,
+    displayName: cleanName,
+  });
+
+  if (!fbProvision.success) {
+    const status = fbProvision.isDuplicate ? 409 : 400;
+    logStructuredServerError({
+      endpoint,
+      operation: 'CREATE_STAFF_FIREBASE_AUTH',
+      errorCategory: fbProvision.isDuplicate ? 'DUPLICATE_EMAIL' : 'FIREBASE_AUTH_ERROR',
+      firebaseErrorCode: fbProvision.errorCode,
+      statusCode: status,
+      message: fbProvision.errorMessage || 'Failed to create Firebase Authentication user.',
+      actorEmail: session.email,
+      targetEmail: cleanEmail,
+    });
+    return res.status(status).json({
+      success: false,
+      message: fbProvision.errorMessage || 'Failed to create Firebase Authentication account.',
+      error: fbProvision.errorCode || 'FIREBASE_AUTH_ERROR',
+      statusCode: status,
+    });
+  }
+
+  // 2. Create authoritative server account record linked to Firebase UID
+  const result = serverAuthManager.createStaffAccount(session, {
+    ...body,
+    firebaseUid: fbProvision.uid,
+  });
+
+  if (!result.success || !result.account) {
+    // Rollback newly created Firebase Auth user if server validation failed
+    if (fbProvision.newlyCreated && fbProvision.uid) {
+      await rollbackFirebaseAuthAccount(fbProvision.uid, fbProvision.idToken);
+    }
+    const status =
+      result.statusCode ||
+      (result.isDuplicate ? 409 : result.error?.includes('Privilege') || result.error?.includes('Security Invariant') ? 403 : 400);
+    logStructuredServerError({
+      endpoint,
+      operation: 'CREATE_STAFF_SERVER_RECORD',
+      errorCategory: status === 409 ? 'DUPLICATE_EMAIL' : status === 403 ? 'INSUFFICIENT_PRIVILEGES' : 'VALIDATION_ERROR',
+      statusCode: status,
+      message: result.message || result.error || 'Failed to create staff account.',
+      actorEmail: session.email,
+      targetEmail: cleanEmail,
+    });
     return res.status(status).json(
       buildApiResponse(
         {
@@ -1047,37 +1242,53 @@ app.post('/api/auth/create-staff', apiHandler(async (req: Request, res: Response
     );
   }
 
-  // Safely sync staff profile to Firestore /users without blocking or hanging on offline / permissions
-  if (result.account?.id) {
-    const acct = result.account;
-    withServerTimeout(
-      (async () => {
-        const { doc, setDoc } = await import('firebase/firestore');
-        const { db } = await import('./src/services/firebase');
-        await setDoc(doc(db, 'users', acct.id), {
-          id: acct.id,
-          email: acct.email,
-          fullName: acct.fullName,
-          phone: acct.phone,
-          role: 'STAFF',
-          roleTitle: acct.roleTitle,
-          active: true,
-          createdAt: acct.createdAt || new Date().toISOString(),
-        });
-      })(),
-      1200
-    ).catch(() => {});
+  // 3. Synchronize Staff profile to Cloud Firestore (/users/{uid} and /staff/{uid})
+  const acct = result.account;
+  const callerFbToken =
+    typeof req.headers['x-firebase-token'] === 'string'
+      ? req.headers['x-firebase-token'].trim()
+      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
+      ? req.headers.authorization.substring(7).trim()
+      : undefined;
+
+  const firestoreResult = await withServerTimeout(
+    writeFirestoreUserProfile({
+      uid: acct.id,
+      email: acct.email,
+      fullName: acct.fullName,
+      phone: acct.phone,
+      role: 'STAFF',
+      roleTitle: acct.roleTitle,
+      duty: acct.duty || acct.roleTitle,
+      status: 'active',
+      createdBy: session.email,
+      createdAt: acct.createdAt || new Date().toISOString(),
+      staffCode: acct.staffCode,
+      permissions: acct.permissions as unknown as Record<string, boolean>,
+      callerIdToken: callerFbToken,
+    }),
+    3500
+  ).catch((err) => ({
+    success: false,
+    errorMessage: err?.message || 'Firestore profile write timed out',
+  }));
+
+  if (!firestoreResult.success) {
+    console.warn('[CREATE STAFF] Firestore sync warning (server record preserved):', firestoreResult.errorMessage);
   }
 
   return res.status(201).json({
     success: true,
-    message: 'Staff account created successfully',
+    message: 'Staff account created successfully.',
     data: result.data || { account: result.account, invitation: result.invitation, initialPassword: result.initialPassword },
     account: result.account,
     invitation: result.invitation,
     initialPassword: result.initialPassword,
   });
-}));
+});
+
+app.post('/api/auth/create-staff', handleCreateStaffAccount);
+app.post('/api/super-admin/create-staff', handleCreateStaffAccount);
 
 /**
  * POST /api/auth/access/generate-code
@@ -1204,34 +1415,143 @@ app.post('/api/auth/access/update-permissions', apiHandler(async (req: Request, 
 }));
 
 /**
- * POST /api/auth/access/appoint-admin
- * Exclusive privilege: Lifetime Super Admin appoints an Administrator with an access code.
+ * Shared handler for appointing Administrators (used by /api/auth/access/appoint-admin and /api/super-admin/create-admin)
+ * Exclusive privilege: Lifetime Super Admin appoints an Administrator.
  */
-app.post('/api/auth/access/appoint-admin', apiHandler(async (req: Request, res: Response) => {
+const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response) => {
+  const endpoint = req.originalUrl || req.path || '/api/auth/access/appoint-admin';
   const session = await authenticateRequest(req);
   if (!session) {
+    logStructuredServerError({
+      endpoint,
+      operation: 'CREATE_ADMIN_AUTH_CHECK',
+      errorCategory: 'AUTHENTICATION_REQUIRED',
+      statusCode: 401,
+      message: 'Unauthenticated request to appoint administrator.',
+    });
     return res.status(401).json({
       success: false,
       message: 'Authentication required. Please sign in with Lifetime Super Admin credentials.',
       error: 'Authentication required.',
+      statusCode: 401,
     });
   }
 
   if (session.role !== 'LIFETIME_SUPER_ADMIN') {
+    logStructuredServerError({
+      endpoint,
+      operation: 'CREATE_ADMIN_ROLE_CHECK',
+      errorCategory: 'INSUFFICIENT_PRIVILEGES',
+      statusCode: 403,
+      message: `Role ${session.role} is forbidden from appointing Administrators.`,
+      actorEmail: session.email,
+    });
     return res.status(403).json({
       success: false,
       message: 'Clearance Violation: Only the Lifetime Super Admin can appoint Administrators.',
       error: 'Clearance Violation: Only the Lifetime Super Admin can appoint Administrators.',
+      statusCode: 403,
     });
   }
 
-  const result = serverAuthManager.appointAdministrator(session, req.body || {});
-  if (!result.success) {
-    return res.status(400).json(
+  const body = req.body || {};
+  const cleanEmail = String(body.email || '').trim().toLowerCase();
+  const cleanName = String(body.fullName || '').trim();
+  const cleanPhone = String(body.phone || '').trim();
+  const secretCredential = String(body.accessCode || body.password || '').trim();
+
+  if (!cleanEmail || !cleanEmail.includes('@') || !cleanName || !cleanPhone) {
+    return res.status(400).json({
+      success: false,
+      message: 'Full Name, valid Email Address, and Phone Number are required to appoint an Administrator.',
+      error: 'MISSING_REQUIRED_FIELDS',
+      statusCode: 400,
+    });
+  }
+
+  if (!secretCredential || secretCredential.length < 6) {
+    return res.status(400).json({
+      success: false,
+      message: 'An initial password or access code of at least 6 characters is required.',
+      error: 'WEAK_OR_MISSING_PASSWORD',
+      statusCode: 400,
+    });
+  }
+
+  // Check if duplicate active account already exists in server memory
+  const existingLocal = serverAuthManager.findAccountByIdentifier(cleanEmail);
+  if (existingLocal && existingLocal.status === 'active') {
+    logStructuredServerError({
+      endpoint,
+      operation: 'CREATE_ADMIN_DUPLICATE_CHECK',
+      errorCategory: 'DUPLICATE_EMAIL',
+      firebaseErrorCode: 'auth/email-already-exists',
+      statusCode: 409,
+      message: `An account with email ${cleanEmail} already exists.`,
+      actorEmail: session.email,
+      targetEmail: cleanEmail,
+    });
+    return res.status(409).json({
+      success: false,
+      message: `An account with email address "${cleanEmail}" already exists.`,
+      error: 'EMAIL_ALREADY_EXISTS',
+      statusCode: 409,
+    });
+  }
+
+  // 1. Provision account in Firebase Authentication on the server (never replaces Super Admin browser session)
+  const fbProvision = await provisionFirebaseAuthAccount({
+    email: cleanEmail,
+    password: secretCredential,
+    displayName: cleanName,
+  });
+
+  if (!fbProvision.success) {
+    const status = fbProvision.isDuplicate ? 409 : 400;
+    logStructuredServerError({
+      endpoint,
+      operation: 'CREATE_ADMIN_FIREBASE_AUTH',
+      errorCategory: fbProvision.isDuplicate ? 'DUPLICATE_EMAIL' : 'FIREBASE_AUTH_ERROR',
+      firebaseErrorCode: fbProvision.errorCode,
+      statusCode: status,
+      message: fbProvision.errorMessage || 'Failed to create Firebase Authentication user.',
+      actorEmail: session.email,
+      targetEmail: cleanEmail,
+    });
+    return res.status(status).json({
+      success: false,
+      message: fbProvision.errorMessage || 'Failed to create Firebase Authentication account.',
+      error: fbProvision.errorCode || 'FIREBASE_AUTH_ERROR',
+      statusCode: status,
+    });
+  }
+
+  // 2. Create authoritative server account record linked to Firebase UID
+  const result = serverAuthManager.appointAdministrator(session, {
+    ...body,
+    firebaseUid: fbProvision.uid,
+  });
+
+  if (!result.success || !result.account) {
+    if (fbProvision.newlyCreated && fbProvision.uid) {
+      await rollbackFirebaseAuthAccount(fbProvision.uid, fbProvision.idToken);
+    }
+    const status = result.statusCode || (result.isDuplicate ? 409 : 400);
+    logStructuredServerError({
+      endpoint,
+      operation: 'CREATE_ADMIN_SERVER_RECORD',
+      errorCategory: status === 409 ? 'DUPLICATE_EMAIL' : 'VALIDATION_ERROR',
+      statusCode: status,
+      message: result.message || result.error || 'Failed to appoint administrator.',
+      actorEmail: session.email,
+      targetEmail: cleanEmail,
+    });
+    return res.status(status).json(
       buildApiResponse(
         {
           message: result.message || result.error || 'Failed to appoint administrator.',
           error: result.error,
+          statusCode: status,
           ...result,
         },
         false
@@ -1239,44 +1559,51 @@ app.post('/api/auth/access/appoint-admin', apiHandler(async (req: Request, res: 
     );
   }
 
-  // Safely sync to Firestore /admins and /users collections without blocking response
-  if (result.account?.id) {
-    const acct = result.account;
-    withServerTimeout(
-      (async () => {
-        const { doc, setDoc } = await import('firebase/firestore');
-        const { db } = await import('./src/services/firebase');
-        await setDoc(doc(db, 'admins', acct.id), {
-          uid: acct.id,
-          email: acct.email,
-          fullName: acct.fullName,
-          phone: acct.phone,
-          role: 'ADMIN',
-          duty: acct.duty || acct.roleTitle,
-          createdAt: new Date().toISOString(),
-        });
-        await setDoc(doc(db, 'users', acct.id), {
-          id: acct.id,
-          email: acct.email,
-          fullName: acct.fullName,
-          phone: acct.phone,
-          role: 'ADMIN',
-          active: true,
-          createdAt: new Date().toISOString(),
-        });
-      })(),
-      1200
-    ).catch(() => {});
+  // 3. Synchronize Admin profile to Cloud Firestore (/users/{uid} and /admins/{uid})
+  const acct = result.account;
+  const callerFbToken =
+    typeof req.headers['x-firebase-token'] === 'string'
+      ? req.headers['x-firebase-token'].trim()
+      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
+      ? req.headers.authorization.substring(7).trim()
+      : undefined;
+
+  const firestoreResult = await withServerTimeout(
+    writeFirestoreUserProfile({
+      uid: acct.id,
+      email: acct.email,
+      fullName: acct.fullName,
+      phone: acct.phone,
+      role: 'ADMIN',
+      roleTitle: acct.roleTitle,
+      duty: acct.duty || acct.roleTitle,
+      status: 'active',
+      createdBy: session.email,
+      createdAt: acct.createdAt || new Date().toISOString(),
+      permissions: acct.permissions as unknown as Record<string, boolean>,
+      callerIdToken: callerFbToken,
+    }),
+    3500
+  ).catch((err) => ({
+    success: false,
+    errorMessage: err?.message || 'Firestore profile write timed out',
+  }));
+
+  if (!firestoreResult.success) {
+    console.warn('[APPOINT ADMIN] Firestore sync warning (server record preserved):', firestoreResult.errorMessage);
   }
 
   return res.status(201).json({
     success: true,
-    message: 'Admin account created successfully',
+    message: 'Admin account created successfully.',
     data: result.data || { account: result.account, invitation: result.invitation },
     account: result.account,
     invitation: result.invitation,
   });
-}));
+});
+
+app.post('/api/auth/access/appoint-admin', handleAppointAdminAccount);
+app.post('/api/super-admin/create-admin', handleAppointAdminAccount);
 
 /**
  * POST /api/auth/access/revoke
@@ -1429,6 +1756,57 @@ app.get('/api/auth/accounts', apiHandler(async (req: Request, res: Response) => 
     });
   }
 
+  const callerFbToken =
+    typeof req.headers['x-firebase-token'] === 'string'
+      ? req.headers['x-firebase-token'].trim()
+      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
+      ? req.headers.authorization.substring(7).trim()
+      : undefined;
+
+  // Hydrate any Admin/Staff profiles stored in Firestore so cold-started serverless instances return the full directory
+  try {
+    const [fsAdmins, fsStaff] = await withServerTimeout(
+      Promise.all([
+        listFirestoreCollection('admins', callerFbToken),
+        listFirestoreCollection('staff', callerFbToken),
+      ]),
+      1800
+    );
+
+    for (const adm of fsAdmins) {
+      if (adm.email && !serverAuthManager.findAccountByIdentifier(String(adm.email))) {
+        serverAuthManager.syncProvisionedAccount({
+          id: String(adm.uid || adm.id),
+          email: String(adm.email),
+          fullName: String(adm.fullName || adm.email),
+          phone: String(adm.phone || ''),
+          role: 'ADMIN',
+          roleTitle: String(adm.roleTitle || adm.duty || 'Executive Administrator'),
+          duty: String(adm.duty || adm.roleTitle || 'Executive Administrator'),
+          status: adm.active === false || adm.status === 'suspended' ? 'suspended' : 'active',
+        });
+      }
+    }
+
+    for (const stf of fsStaff) {
+      if (stf.email && !serverAuthManager.findAccountByIdentifier(String(stf.email))) {
+        serverAuthManager.syncProvisionedAccount({
+          id: String(stf.uid || stf.id),
+          email: String(stf.email),
+          fullName: String(stf.fullName || stf.email),
+          phone: String(stf.phone || ''),
+          role: 'STAFF',
+          roleTitle: String(stf.roleTitle || stf.duty || 'Operations Officer'),
+          duty: String(stf.duty || stf.roleTitle || 'Operations Officer'),
+          staffCode: stf.staffCode ? String(stf.staffCode) : undefined,
+          status: stf.active === false || stf.status === 'suspended' ? 'suspended' : 'active',
+        });
+      }
+    }
+  } catch {
+    // Non-fatal if Firestore list times out
+  }
+
   const accounts = serverAuthManager.getPublicAccountsList(session);
   return res.status(200).json({
     success: true,
@@ -1572,28 +1950,60 @@ app.get('/api/audit/logs', apiHandler(async (req: Request, res: Response) => {
 
 /**
  * GET /api/customers
- * Returns all registered customer records across sessions and portals.
+ * Returns registered customer records exclusively to authenticated Staff, Admin, or Super Admin sessions.
  */
-app.get('/api/customers', apiHandler(async (_req: Request, res: Response) => {
+app.get('/api/customers', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required. Unauthenticated access to customer records is prohibited.',
+      error: 'Authentication required.',
+    });
+  }
+
+  const account = serverAuthManager.findAccountByIdentifier(session.email);
+  if (account && account.status !== 'active') {
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied: Account is suspended or inactive.',
+      error: 'Account suspended.',
+    });
+  }
+  if (
+    session.role !== 'LIFETIME_SUPER_ADMIN' &&
+    session.role !== 'ADMIN' &&
+    account?.permissions &&
+    account.permissions.canViewCustomers === false
+  ) {
+    return res.status(403).json({
+      success: false,
+      message: 'Clearance violation: Staff account does not have permission to view customer records.',
+      error: 'Clearance violation.',
+    });
+  }
+
+  const callerFbToken =
+    typeof req.headers['x-firebase-token'] === 'string'
+      ? req.headers['x-firebase-token'].trim()
+      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
+      ? req.headers.authorization.substring(7).trim()
+      : undefined;
+
   try {
-    await withServerTimeout(
-      (async () => {
-        const { collection, getDocs } = await import('firebase/firestore');
-        const { db } = await import('./src/services/firebase');
-        const snap = await getDocs(collection(db, 'customers'));
-        snap.forEach((docSnap) => {
-          const data = docSnap.data();
-          if (data && (data.fullName || data.phone)) {
-            try {
-              serverAuthManager.saveCustomerRecord({ id: docSnap.id, ...data });
-            } catch {
-              // Ignore malformed records
-            }
-          }
-        });
-      })(),
+    const fsCustomers = await withServerTimeout(
+      listFirestoreCollection('customers', callerFbToken),
       1200
     );
+    for (const data of fsCustomers) {
+      if (data && (data.fullName || data.phone)) {
+        try {
+          serverAuthManager.saveCustomerRecord(data);
+        } catch {
+          // Ignore malformed records
+        }
+      }
+    }
   } catch {
     // Non-fatal if Firestore read is unavailable or times out
   }
@@ -1610,8 +2020,39 @@ app.get('/api/customers', apiHandler(async (_req: Request, res: Response) => {
 /**
  * POST /api/customers
  * Persists a newly created or updated customer record on the backend and Firestore.
+ * Restricted to authenticated Super Admin, Admin, or Staff with customer registration permission.
  */
 app.post('/api/customers', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required. Unauthenticated modification of customer records is prohibited.',
+      error: 'Authentication required.',
+    });
+  }
+
+  const account = serverAuthManager.findAccountByIdentifier(session.email);
+  if (account && account.status !== 'active') {
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied: Account is suspended or inactive.',
+      error: 'Account suspended.',
+    });
+  }
+  if (
+    session.role !== 'LIFETIME_SUPER_ADMIN' &&
+    session.role !== 'ADMIN' &&
+    account?.permissions &&
+    account.permissions.canRegisterCustomers === false
+  ) {
+    return res.status(403).json({
+      success: false,
+      message: 'Clearance violation: Staff account does not have permission to register or modify customer records.',
+      error: 'Clearance violation.',
+    });
+  }
+
   const payload = req.body?.customer || req.body || {};
   if (!payload.fullName && !payload.phone) {
     return res.status(400).json({
@@ -1622,16 +2063,6 @@ app.post('/api/customers', apiHandler(async (req: Request, res: Response) => {
   }
 
   const customer = serverAuthManager.saveCustomerRecord(payload);
-
-  // Fire-and-forget Firestore sync with timeout
-  withServerTimeout(
-    (async () => {
-      const { doc, setDoc } = await import('firebase/firestore');
-      const { db } = await import('./src/services/firebase');
-      await setDoc(doc(db, 'customers', customer.id), customer, { merge: true });
-    })(),
-    1200
-  ).catch(() => {});
 
   const customers = serverAuthManager.getCustomersList();
   return res.status(201).json({
@@ -1681,8 +2112,10 @@ if (!process.env.VERCEL) {
   if (!isProd) {
     // In development mode, always use Vite dev server middleware first so live edits
     // and concurrent `vite build` runs never interrupt or drop preview connections.
-    const vitePromise = import('vite')
-      .then(({ createServer: createViteServer }) =>
+    // Use dynamic module specifier so @vercel/nft never bundles 'vite' into serverless functions.
+    const vitePkgName = 'vite';
+    const vitePromise = import(/* @vite-ignore */ vitePkgName)
+      .then(({ createServer: createViteServer }: any) =>
         createViteServer({
           server: {
             middlewareMode: true,

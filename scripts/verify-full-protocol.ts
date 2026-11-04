@@ -377,7 +377,7 @@ async function runAcceptanceSuite() {
     }),
   });
   const dupData = await dupRes.json();
-  const dupOk = dupRes.status === 400 || dupData.message?.includes('already exists') || dupData.success === true;
+  const dupOk = dupRes.status === 409 || dupRes.status === 400 || dupData.message?.includes('already exists') || dupData.success === true;
   record(
     'Duplicate account',
     'Integrity',

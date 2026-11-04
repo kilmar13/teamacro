@@ -14,8 +14,13 @@ service cloud.firestore {
       return isSignedIn() && request.auth.uid == userId;
     }
 
+    function isUserActive() {
+      return !exists(/databases/$(database)/documents/users/$(request.auth.uid)) ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.active == true;
+    }
+
     function isSuperAdmin() {
-      return isSignedIn() && (
+      return isSignedIn() && isUserActive() && (
         (exists(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin) &&
          get(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin).data.ownerUid == request.auth.uid) ||
         (request.auth.token.email == 'eromoseledavidson68@gmail.com' && request.auth.token.email_verified == true)
@@ -23,9 +28,28 @@ service cloud.firestore {
     }
 
     function isAdmin() {
-      return isSignedIn() && (
+      return isSignedIn() && isUserActive() && (
         isSuperAdmin() ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isStaff() {
+      return isSignedIn() && isUserActive() &&
+        exists(/databases/$(database)/documents/staff/$(request.auth.uid));
+    }
+
+    function canStaffViewCustomers() {
+      return isStaff() && (
+        !('permissions' in get(/databases/$(database)/documents/staff/$(request.auth.uid)).data) ||
+        get(/databases/$(database)/documents/staff/$(request.auth.uid)).data.permissions.canViewCustomers == true
+      );
+    }
+
+    function canStaffRegisterCustomers() {
+      return isStaff() && (
+        !('permissions' in get(/databases/$(database)/documents/staff/$(request.auth.uid)).data) ||
+        get(/databases/$(database)/documents/staff/$(request.auth.uid)).data.permissions.canRegisterCustomers == true
       );
     }
 
@@ -57,12 +81,46 @@ service cloud.firestore {
 
     function isValidUser(data) {
       return data.keys().hasAll(['id', 'email', 'fullName', 'role', 'active']) &&
-        data.keys().hasOnly(['id', 'email', 'fullName', 'role', 'roleTitle', 'phone', 'active', 'createdAt', 'branchId']) &&
+        data.keys().hasOnly([
+          'id', 'uid', 'email', 'fullName', 'role', 'roleTitle', 'duty',
+          'phone', 'active', 'status', 'createdBy', 'createdAt', 'updatedAt',
+          'branchId', 'staffCode', 'permissions', 'assignedModules'
+        ]) &&
         data.id is string && data.id.size() <= 128 &&
         data.email is string && data.email.size() <= 128 &&
         data.fullName is string && data.fullName.size() <= 100 &&
         data.role in ['CUSTOMER', 'TELLER', 'COMPLIANCE_OFFICER', 'BRANCH_MANAGER', 'SUPER_ADMIN', 'ADMIN', 'STAFF'] &&
         data.active is bool;
+    }
+
+    function isValidAdminDoc(data) {
+      return data.keys().hasAll(['uid', 'email']) &&
+        data.keys().hasOnly([
+          'uid', 'id', 'email', 'fullName', 'phone', 'role', 'roleTitle',
+          'duty', 'status', 'active', 'createdBy', 'createdAt', 'updatedAt',
+          'permissions', 'assignedModules'
+        ]) &&
+        data.uid is string && data.uid.size() <= 128 &&
+        data.email is string && data.email.size() <= 128;
+    }
+
+    function isValidStaffDoc(data) {
+      return data.keys().hasAll(['uid', 'email']) &&
+        data.keys().hasOnly([
+          'uid', 'id', 'email', 'fullName', 'phone', 'role', 'roleTitle',
+          'duty', 'status', 'active', 'createdBy', 'createdAt', 'updatedAt',
+          'permissions', 'staffCode', 'branchId', 'assignedModules'
+        ]) &&
+        data.uid is string && data.uid.size() <= 128 &&
+        data.email is string && data.email.size() <= 128 &&
+        (!('role' in data) || data.role == 'STAFF');
+    }
+
+    function isValidCustomer(data) {
+      return data.keys().hasAll(['id', 'fullName', 'phone']) &&
+        data.id is string && data.id.size() <= 128 &&
+        data.fullName is string && data.fullName.size() <= 120 &&
+        data.phone is string && data.phone.size() <= 40;
     }
 
     function isValidAccount(data) {
@@ -107,11 +165,14 @@ service cloud.firestore {
 
     // =========================================================================
     // 0. SYSTEM SETTINGS & SINGLETON LIFETIME SUPER ADMIN ROOT LOCKDOWN
+    // Only the authorised Lifetime Super Admin can establish or manage root ownership.
     // =========================================================================
     match /systemSettings/{settingId} {
       allow get: if isValidId(settingId);
       allow list: if false;
       allow create: if settingId == 'lifetimeSuperAdmin' &&
+        isSignedIn() &&
+        incoming().ownerUid == request.auth.uid &&
         !exists(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin) &&
         isValidSystemSetting(incoming());
       allow update: if false;
@@ -120,56 +181,78 @@ service cloud.firestore {
 
     // =========================================================================
     // 1. USERS COLLECTION
+    // Admins cannot promote themselves or others to SUPER_ADMIN or ADMIN.
+    // Users cannot modify their own roles or active status.
     // =========================================================================
     match /users/{userId} {
       allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
       allow list: if isAdmin();
-      allow create: if isValidId(userId) && (
-        isAdmin() ||
-        (isOwner(userId) && isValidUser(incoming()) && incoming().role == 'CUSTOMER')
+      allow create: if isValidId(userId) && isValidUser(incoming()) && (
+        isSuperAdmin() ||
+        (isAdmin() && incoming().role in ['STAFF', 'CUSTOMER', 'TELLER', 'COMPLIANCE_OFFICER']) ||
+        (isOwner(userId) && incoming().id == request.auth.uid && incoming().role == 'CUSTOMER')
       );
-      allow update: if isValidId(userId) && (
-        isAdmin() ||
+      allow update: if isValidId(userId) && isValidUser(incoming()) && (
+        isSuperAdmin() ||
+        (
+          isAdmin() &&
+          existing().role in ['STAFF', 'CUSTOMER', 'TELLER', 'COMPLIANCE_OFFICER'] &&
+          incoming().role in ['STAFF', 'CUSTOMER', 'TELLER', 'COMPLIANCE_OFFICER']
+        ) ||
         (
           isOwner(userId) &&
-          isValidUser(incoming()) &&
           incoming().id == existing().id &&
           incoming().role == existing().role &&
+          incoming().active == existing().active &&
           incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'phone'])
         )
       );
-      allow delete: if isAdmin();
+      allow delete: if isValidId(userId) && isSuperAdmin();
     }
 
     // =========================================================================
     // 2. ADMINS & STAFF COLLECTIONS
+    // Only Lifetime Super Admin can appoint/modify Admins.
+    // Staff cannot create Admin, Super Admin, or Staff accounts.
     // =========================================================================
     match /admins/{adminId} {
-      allow read: if isAdmin();
-      allow write: if isAdmin() || (
-        isSignedIn() &&
-        request.auth.uid == adminId &&
-        exists(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin) &&
-        get(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin).data.ownerUid == request.auth.uid
-      );
+      allow get: if isValidId(adminId) && isAdmin();
+      allow list: if isAdmin();
+      allow create, update: if isValidId(adminId) && isSuperAdmin() && isValidAdminDoc(incoming());
+      allow delete: if isValidId(adminId) && isSuperAdmin();
     }
 
     match /staff/{staffId} {
-      allow read: if isAdmin();
-      allow write: if isAdmin();
+      allow get: if isValidId(staffId) && (isOwner(staffId) || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if isValidId(staffId) && isAdmin() && isValidStaffDoc(incoming());
+      allow delete: if isValidId(staffId) && isAdmin();
+    }
+
+    // =========================================================================
+    // 2.5. CUSTOMERS COLLECTION
+    // Unauthenticated visitors cannot read or modify customer records.
+    // Customers can only read their own record; Staff require assigned permissions.
+    // =========================================================================
+    match /customers/{customerId} {
+      allow get: if isValidId(customerId) && (isOwner(customerId) || isAdmin() || canStaffViewCustomers());
+      allow list: if isAdmin() || canStaffViewCustomers();
+      allow create, update: if isValidId(customerId) && isValidCustomer(incoming()) && (isAdmin() || canStaffRegisterCustomers());
+      allow delete: if isValidId(customerId) && isSuperAdmin();
     }
 
     // =========================================================================
     // 3. ACCOUNTS COLLECTION
+    // Customers cannot access another customer's account or modify balances.
     // =========================================================================
     match /accounts/{accountId} {
       allow get: if isValidId(accountId) && ((isSignedIn() && resource.data.userId == request.auth.uid) || isAdmin());
       allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
       allow create: if isValidId(accountId) && (
         isAdmin() ||
-        (isSignedIn() && incoming().userId == request.auth.uid && isValidAccount(incoming()))
+        (isSignedIn() && incoming().userId == request.auth.uid && incoming().balanceKobo == 0 && isValidAccount(incoming()))
       );
-      allow update: if isValidId(accountId) && isAdmin();
+      allow update: if isValidId(accountId) && isAdmin() && isValidAccount(incoming());
       allow delete: if false;
     }
 
@@ -181,7 +264,7 @@ service cloud.firestore {
       allow list: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
       allow create: if isValidId(transactionId) && (
         isAdmin() ||
-        (isSignedIn() && incoming().userId == request.auth.uid && isValidTransaction(incoming()))
+        (isSignedIn() && incoming().userId == request.auth.uid && incoming().status == 'PENDING' && isValidTransaction(incoming()))
       );
       allow update: if false;
       allow delete: if false;
@@ -194,8 +277,8 @@ service cloud.firestore {
       allow get: if isValidId(applicationId) && isAdmin();
       allow list: if isAdmin();
       allow create: if isValidId(applicationId) && isValidApplication(incoming()) && incoming().status == 'SUBMITTED';
-      allow update: if isValidId(applicationId) && isAdmin();
-      allow delete: if isAdmin();
+      allow update: if isValidId(applicationId) && isAdmin() && isValidApplication(incoming());
+      allow delete: if isValidId(applicationId) && isSuperAdmin();
     }
   }
 }

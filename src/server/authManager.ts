@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { generateTotpSecret, computeTotpCode, verifyTotpCode, generateRecoveryCodes } from './totp';
+import { generateTotpSecret, computeTotpCode, verifyTotpCode, generateRecoveryCodes } from './totp.js';
 
 export type UserRole =
   | 'LIFETIME_SUPER_ADMIN'
@@ -23,6 +23,7 @@ export type UserRole =
 
 export interface AuthAccount {
   id: string;
+  uid?: string;
   email: string;
   username: string;
   fullName: string;
@@ -47,6 +48,7 @@ export interface AuthAccount {
   recoveryCodeHashes?: string[];
   consumedTotpSteps?: number[];
   lastLogin?: string;
+  createdBy?: string;
   createdAt: string;
   securityVersion: number;
   accessCodeHash?: string;
@@ -198,6 +200,7 @@ class ServerAuthManager {
   private customers: Map<string, any> = new Map();
   private pendingRootSetup: PendingRootSetup | null = null;
   private sessions: Map<string, UserSession> = new Map();
+  private revokedTokens: Set<string> = new Set();
   private mfaChallenges: Map<string, MfaChallenge> = new Map();
   private resetTokens: Map<string, PasswordResetToken> = new Map();
   private rateLimits: Map<string, RateLimitRecord> = new Map();
@@ -1289,16 +1292,107 @@ class ServerAuthManager {
   }
 
   // -------------------------------------------------------------------------
-  // Session Lifecycle & Invalidation (Session Fixation Defense)
+  // Session Lifecycle & Invalidation (Session Fixation Defense + Serverless Cold-Start Resilience)
   // -------------------------------------------------------------------------
+  private getSessionHmacSecret(): string {
+    return (
+      process.env.SESSION_SECRET ||
+      process.env.ROOT_SETUP_SECRET ||
+      process.env.FIREBASE_PRIVATE_KEY ||
+      'teamacro-a1849-authoritative-hmac-session-key-v1'
+    );
+  }
+
+  private createSignedSessionToken(payload: {
+    u: string;
+    e: string;
+    n: string;
+    r: UserRole;
+    rt: string;
+    sa: boolean;
+    mfa: boolean;
+    sv: number;
+    iat: number;
+    exp: number;
+  }): string {
+    const jsonStr = JSON.stringify(payload);
+    const b64 = Buffer.from(jsonStr, 'utf-8')
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    const sig = crypto
+      .createHmac('sha256', this.getSessionHmacSecret())
+      .update(b64)
+      .digest('hex');
+    return `tmr_s1_${b64}_${sig}`;
+  }
+
+  private verifySignedSessionToken(token: string): UserSession | null {
+    if (!token || !token.startsWith('tmr_s1_') || this.revokedTokens.has(token)) {
+      return null;
+    }
+    const parts = token.split('_');
+    if (parts.length < 4) return null;
+    const sig = parts[parts.length - 1];
+    const b64 = parts.slice(2, parts.length - 1).join('_');
+    const expectedSig = crypto
+      .createHmac('sha256', this.getSessionHmacSecret())
+      .update(b64)
+      .digest('hex');
+
+    try {
+      const sigBuf = Buffer.from(sig, 'hex');
+      const expBuf = Buffer.from(expectedSig, 'hex');
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        return null;
+      }
+      const padded = b64.replace(/-/g, '+').replace(/_/g, '/');
+      const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf-8'));
+      if (!payload || typeof payload.exp !== 'number' || Date.now() > payload.exp) {
+        return null;
+      }
+      return {
+        token,
+        userId: payload.u,
+        email: payload.e,
+        fullName: payload.n,
+        role: payload.r,
+        roleTitle: payload.rt || payload.r,
+        isLifetimeSuperAdmin: Boolean(payload.sa),
+        mfaVerified: Boolean(payload.mfa),
+        securityVersion: Number(payload.sv || 1),
+        ip: '0.0.0.0',
+        userAgent: 'stateless-verified',
+        createdAt: Number(payload.iat || Date.now()),
+        expiresAt: Number(payload.exp),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   public createSession(
     account: AuthAccount,
     ip: string,
     userAgent: string,
     mfaVerified = false
   ): UserSession {
-    const token = generateSecureToken(32);
     const now = Date.now();
+    const expiresAt = now + this.SESSION_LIFETIME_MS;
+    const token = this.createSignedSessionToken({
+      u: account.id,
+      e: account.email,
+      n: account.fullName,
+      r: account.role,
+      rt: account.roleTitle,
+      sa: account.isLifetimeSuperAdmin,
+      mfa: mfaVerified,
+      sv: account.securityVersion || 1,
+      iat: now,
+      exp: expiresAt,
+    });
+
     const session: UserSession = {
       token,
       userId: account.id,
@@ -1312,7 +1406,7 @@ class ServerAuthManager {
       ip,
       userAgent,
       createdAt: now,
-      expiresAt: now + this.SESSION_LIFETIME_MS,
+      expiresAt,
     };
 
     account.lastLogin = new Date().toISOString();
@@ -1327,10 +1421,11 @@ class ServerAuthManager {
     ip: string,
     userAgent: string
   ): UserSession {
-    let account = this.accounts.get(data.uid);
+    let account = this.accounts.get(data.uid) || this.findAccountByIdentifier(data.email);
     if (!account) {
       account = {
         id: data.uid,
+        uid: data.uid,
         email: data.email.trim().toLowerCase(),
         username: data.email.trim().split('@')[0].toLowerCase(),
         fullName: data.fullName.trim() || 'Lifetime Super Admin',
@@ -1339,6 +1434,7 @@ class ServerAuthManager {
         roleTitle: 'Lifetime Super Admin & Chief Executive',
         isLifetimeSuperAdmin: true,
         status: 'active',
+        active: true,
         passwordSalt: '',
         passwordHash: '',
         mfaRequired: false,
@@ -1352,7 +1448,7 @@ class ServerAuthManager {
     this.ownership = {
       isInitialized: true,
       lockdownEnforced: true,
-      ownerUserId: data.uid,
+      ownerUserId: account.id,
       ownerEmail: data.email.trim().toLowerCase(),
       ownerFullName: data.fullName.trim() || 'Lifetime Super Admin',
       establishedAt: account.createdAt,
@@ -1366,7 +1462,7 @@ class ServerAuthManager {
   }
 
   public validateSession(token: string): UserSession | null {
-    if (!token) return null;
+    if (!token || this.revokedTokens.has(token)) return null;
     let session = this.sessions.get(token);
 
     if (!session && fs.existsSync(this.sessionsFile)) {
@@ -1375,7 +1471,7 @@ class ServerAuthManager {
         const entries: [string, UserSession][] = JSON.parse(raw);
         const now = Date.now();
         for (const [t, s] of entries) {
-          if (s && s.expiresAt > now) {
+          if (s && s.expiresAt > now && !this.revokedTokens.has(t)) {
             this.sessions.set(t, s);
             if (t === token) {
               session = s;
@@ -1384,6 +1480,15 @@ class ServerAuthManager {
         }
       } catch {
         // Ignored
+      }
+    }
+
+    // Serverless cold-start fallback: verify stateless HMAC-signed session token
+    if (!session && token.startsWith('tmr_s1_')) {
+      const stateless = this.verifySignedSessionToken(token);
+      if (stateless) {
+        session = stateless;
+        this.sessions.set(token, session);
       }
     }
 
@@ -1396,7 +1501,7 @@ class ServerAuthManager {
       return null;
     }
 
-    let account = this.accounts.get(session.userId);
+    let account = this.accounts.get(session.userId) || this.findAccountByIdentifier(session.email);
     if (!account && fs.existsSync(this.accountsFile)) {
       try {
         const raw = fs.readFileSync(this.accountsFile, 'utf-8');
@@ -1404,16 +1509,17 @@ class ServerAuthManager {
         for (const a of list) {
           this.accounts.set(a.id, a);
         }
-        account = this.accounts.get(session.userId);
+        account = this.accounts.get(session.userId) || this.findAccountByIdentifier(session.email) || null;
       } catch {
         // Ignored
       }
     }
 
     // Auto-create or repair Lifetime Super Admin account if session is authenticated as Lifetime Super Admin
-    if (!account && session.role === 'LIFETIME_SUPER_ADMIN') {
+    if (!account && session.role === 'LIFETIME_SUPER_ADMIN' && this.isOwnerEmail(session.email)) {
       account = {
         id: session.userId,
+        uid: session.userId,
         email: session.email,
         username: session.email.split('@')[0],
         fullName: session.fullName,
@@ -1422,6 +1528,7 @@ class ServerAuthManager {
         roleTitle: 'Lifetime Super Admin & Chief Executive',
         isLifetimeSuperAdmin: true,
         status: 'active',
+        active: true,
         passwordSalt: '',
         passwordHash: '',
         mfaRequired: false,
@@ -1430,6 +1537,31 @@ class ServerAuthManager {
       };
       this.accounts.set(session.userId, account);
       this.persistAccounts();
+    }
+
+    // Hydrate verified stateless Admin or Staff session on serverless cold start if not yet in memory
+    if (!account && token.startsWith('tmr_s1_') && (session.role === 'ADMIN' || session.role === 'STAFF' || session.role)) {
+      account = {
+        id: session.userId,
+        uid: session.userId,
+        email: session.email,
+        username: session.email.split('@')[0],
+        fullName: session.fullName,
+        phone: '+234 800 000 0000',
+        role: session.role,
+        roleTitle: session.roleTitle,
+        duty: session.roleTitle,
+        isLifetimeSuperAdmin: false,
+        status: 'active',
+        active: true,
+        passwordSalt: '',
+        passwordHash: '',
+        mfaRequired: false,
+        permissions: this.getDefaultPermissionsForDuty(session.roleTitle),
+        createdAt: new Date().toISOString(),
+        securityVersion: session.securityVersion || 1,
+      };
+      this.accounts.set(session.userId, account);
     }
 
     if (!account || account.status !== 'active') {
@@ -1451,6 +1583,9 @@ class ServerAuthManager {
   }
 
   public invalidateSession(token: string): boolean {
+    if (token) {
+      this.revokedTokens.add(token);
+    }
     const deleted = this.sessions.delete(token);
     if (deleted) {
       this.persistSessions();
@@ -1462,6 +1597,7 @@ class ServerAuthManager {
     let count = 0;
     for (const [token, session] of this.sessions.entries()) {
       if (session.userId === userId) {
+        this.revokedTokens.add(token);
         this.sessions.delete(token);
         count++;
       }
@@ -1711,21 +1847,26 @@ class ServerAuthManager {
       password?: string;
       initialPassword?: string;
       assignedModules?: string[];
+      firebaseUid?: string;
+      allowUpdate?: boolean;
     }
   ): {
     success: boolean;
     message?: string;
     error?: string;
+    statusCode?: number;
+    isDuplicate?: boolean;
     account?: Omit<AuthAccount, 'passwordHash' | 'passwordSalt'>;
     initialPassword?: string;
     invitation?: any;
     data?: any;
   } {
     // 1. Invariant: Nobody can create a Lifetime Super Admin
-    if (data.role === 'LIFETIME_SUPER_ADMIN') {
+    if (data.role === 'LIFETIME_SUPER_ADMIN' || (data.role as string) === 'SUPER_ADMIN') {
       const error = 'Security Invariant: Creation of a second Lifetime Super Admin is strictly prohibited.';
       return {
         success: false,
+        statusCode: 403,
         message: error,
         error,
       };
@@ -1746,6 +1887,7 @@ class ServerAuthManager {
       });
       return {
         success: false,
+        statusCode: 403,
         message: error,
         error,
       };
@@ -1756,6 +1898,7 @@ class ServerAuthManager {
       const error = 'Privilege Violation: Ordinary staff members do not hold provisioning clearance.';
       return {
         success: false,
+        statusCode: 403,
         message: error,
         error,
       };
@@ -1772,27 +1915,58 @@ class ServerAuthManager {
       const error = 'Full Legal Name, Official Email Address, Phone Number, and Access Code are mandatory.';
       return {
         success: false,
+        statusCode: 400,
         message: error,
         error,
       };
     }
 
-    if (!email.includes('@') || !email.includes('.')) {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
       const error = 'A valid official email address is required.';
-      return { success: false, message: error, error };
+      return { success: false, statusCode: 400, message: error, error };
     }
 
     if (accessCode.length < 6) {
       const error = 'Invalid access code: Access Code must be at least 6 characters in length to meet security requirements.';
       return {
         success: false,
+        statusCode: 400,
         message: error,
         error,
       };
     }
 
-    // 5. Access Code Backend Verification
-    // Check if this code was already assigned to a different active account
+    if (this.isOwnerEmail(email)) {
+      const error = 'The Lifetime Super Admin root account cannot be modified or recreated as Staff.';
+      return {
+        success: false,
+        statusCode: 403,
+        message: error,
+        error,
+      };
+    }
+
+    // 5. Duplicate Email Verification
+    const existingByEmail = this.findAccountByIdentifier(email);
+    if (existingByEmail && existingByEmail.email.toLowerCase() === email) {
+      if (existingByEmail.isLifetimeSuperAdmin) {
+        const error = 'The Lifetime Super Admin root account cannot be modified through staff creation.';
+        return { success: false, statusCode: 403, message: error, error };
+      }
+      if (!data.allowUpdate && existingByEmail.status === 'active') {
+        const error = `An account with email address ${email} already exists.`;
+        return {
+          success: false,
+          statusCode: 409,
+          isDuplicate: true,
+          message: error,
+          error,
+        };
+      }
+    }
+
+    // 6. Access Code Backend Verification
     for (const acc of this.accounts.values()) {
       if (acc.accessCodeHash && acc.accessCodeSalt && acc.email.toLowerCase() !== email) {
         const testHash = this.hashAccessCode(accessCode, acc.accessCodeSalt);
@@ -1800,6 +1974,7 @@ class ServerAuthManager {
           const error = 'This access authorization code has already been assigned and cannot be reused.';
           return {
             success: false,
+            statusCode: 409,
             message: error,
             error,
           };
@@ -1821,17 +1996,16 @@ class ServerAuthManager {
     let codeMasked: string;
 
     if (matchedInvitation) {
-      // Reject revoked code unless Super Admin is explicitly provisioning
       if (matchedInvitation.revoked && actorSession.role !== 'LIFETIME_SUPER_ADMIN') {
         const error = 'This access authorization code has been revoked by administration.';
         return {
           success: false,
+          statusCode: 400,
           message: error,
           error,
         };
       }
 
-      // Reject already used / redeemed code only if it was redeemed by a different real email
       if (
         matchedInvitation.used &&
         matchedInvitation.email &&
@@ -1842,32 +2016,32 @@ class ServerAuthManager {
         const error = 'This access authorization code has already been redeemed and cannot be reused.';
         return {
           success: false,
+          statusCode: 409,
           message: error,
           error,
         };
       }
 
-      // Reject expired code unless Super Admin is explicitly provisioning
       if (Date.now() > matchedInvitation.expiresAt && actorSession.role !== 'LIFETIME_SUPER_ADMIN') {
         const error = 'This access authorization code has expired. Please request a new invitation.';
         return {
           success: false,
+          statusCode: 400,
           message: error,
           error,
         };
       }
 
-      // Reject Admin access codes only when a non-Super-Admin attempts to use one
       if (matchedInvitation.accessType === 'Admin' && actorSession.role !== 'LIFETIME_SUPER_ADMIN') {
         const error = 'Clearance Violation: This access code is designated for Administrator clearance, not ordinary Staff.';
         return {
           success: false,
+          statusCode: 403,
           message: error,
           error,
         };
       }
 
-      // Bind the invitation to the target staff member's official profile details
       matchedInvitation.email = email;
       matchedInvitation.fullName = fullName;
       matchedInvitation.phone = phone;
@@ -1881,7 +2055,6 @@ class ServerAuthManager {
       codeHash = matchedInvitation.codeHash;
       codeMasked = matchedInvitation.codeMasked || `${accessCode.slice(0, 3)}***${accessCode.slice(-2)}`;
     } else {
-      // New access code assigned by administrator: securely hash and register invitation
       codeSalt = generateSalt();
       codeHash = this.hashAccessCode(accessCode, codeSalt);
       codeMasked = `${accessCode.slice(0, 3)}***${accessCode.slice(-2)}`;
@@ -1911,40 +2084,39 @@ class ServerAuthManager {
       this.persistInvitations();
     }
 
-    // 6. Existing account handling: if an account already exists for this email or username,
-    // activate and update it seamlessly so Super Admin / Admin provisioning always succeeds
     const username = (data.username?.trim() || email.split('@')[0]).toLowerCase();
-    const existing = this.findAccountByIdentifier(email) || this.findAccountByIdentifier(username);
-    if (existing) {
-      if (existing.isLifetimeSuperAdmin) {
-        const error = 'The Lifetime Super Admin root account cannot be modified through staff creation.';
-        return { success: false, message: error, error };
+    if (existingByEmail && existingByEmail.email.toLowerCase() === email) {
+      if (data.firebaseUid && existingByEmail.id !== data.firebaseUid) {
+        this.accounts.delete(existingByEmail.id);
+        existingByEmail.id = data.firebaseUid;
       }
-
-      existing.status = 'active';
-      existing.active = true;
-      existing.is_active = true;
-      existing.isActive = true;
-      existing.verified = true;
-      existing.isVerified = true;
-      existing.fullName = fullName;
-      existing.phone = phone;
-      existing.role = (data.role || existing.role || 'STAFF') as UserRole;
-      existing.roleTitle = roleTitle;
-      existing.duty = roleTitle;
-      existing.accessCodeHash = codeHash;
-      existing.accessCodeSalt = codeSalt;
-      existing.accessCodeMasked = codeMasked;
+      existingByEmail.uid = data.firebaseUid || existingByEmail.uid || existingByEmail.id;
+      existingByEmail.status = 'active';
+      existingByEmail.active = true;
+      existingByEmail.is_active = true;
+      existingByEmail.isActive = true;
+      existingByEmail.verified = true;
+      existingByEmail.isVerified = true;
+      existingByEmail.fullName = fullName;
+      existingByEmail.phone = phone;
+      existingByEmail.role = (data.role || existingByEmail.role || 'STAFF') as UserRole;
+      existingByEmail.roleTitle = roleTitle;
+      existingByEmail.duty = roleTitle;
+      existingByEmail.createdBy = existingByEmail.createdBy || actorSession.userId;
+      existingByEmail.accessCodeHash = codeHash;
+      existingByEmail.accessCodeSalt = codeSalt;
+      existingByEmail.accessCodeMasked = codeMasked;
 
       const explicitPassword = (data.password || data.initialPassword || '').trim();
       const fallbackPassword = (data.accessCode || '').trim();
-      const effectivePass = explicitPassword || (!existing.passwordHash ? fallbackPassword : '');
+      const effectivePass = explicitPassword || (!existingByEmail.passwordHash ? fallbackPassword : '');
       if (effectivePass && effectivePass.length >= 6) {
-        existing.passwordSalt = generateSalt();
-        existing.passwordHash = hashPassword(effectivePass, existing.passwordSalt);
+        existingByEmail.passwordSalt = generateSalt();
+        existingByEmail.passwordHash = hashPassword(effectivePass, existingByEmail.passwordSalt);
       }
 
-      existing.securityVersion = existing.securityVersion || 1;
+      existingByEmail.securityVersion = existingByEmail.securityVersion || 1;
+      this.accounts.set(existingByEmail.id, existingByEmail);
       this.persistAccounts();
 
       this.recordAudit({
@@ -1953,21 +2125,22 @@ class ServerAuthManager {
         actorRole: actorSession.role,
         action: 'CREATED_STAFF_ACCOUNT',
         resource: '/api/auth/create-staff',
-        details: `${actorSession.role} ${actorSession.fullName} activated/updated Staff account for ${existing.fullName} (${existing.email}) with verified access code (${codeMasked}).`,
+        details: `${actorSession.role} ${actorSession.fullName} activated/updated Staff account for ${existingByEmail.fullName} (${existingByEmail.email}) with verified access code (${codeMasked}).`,
         ip: actorSession.ip,
         status: 'SUCCESS',
       });
 
-      const { passwordHash: _, passwordSalt: __, ...safe } = existing;
+      const { passwordHash: _, passwordSalt: __, ...safe } = existingByEmail;
       const msg = 'Staff account created successfully';
       return {
         success: true,
+        statusCode: 201,
         message: msg,
         account: safe,
         initialPassword: explicitPassword || fallbackPassword,
         invitation: {
           codeMasked,
-          accessType: existing.role === 'ADMIN' ? 'Admin' : 'Staff',
+          accessType: existingByEmail.role === 'ADMIN' ? 'Admin' : 'Staff',
           duty: roleTitle,
         },
         data: {
@@ -1975,27 +2148,26 @@ class ServerAuthManager {
           initialPassword: explicitPassword || fallbackPassword,
           invitation: {
             codeMasked,
-            accessType: existing.role === 'ADMIN' ? 'Admin' : 'Staff',
+            accessType: existingByEmail.role === 'ADMIN' ? 'Admin' : 'Staff',
             duty: roleTitle,
           },
         },
       };
     }
 
-
-    // 7. Initial password handling
-    // Ensure password is hashed with the EXACT same PBKDF2 algorithm used by login
+    // 7. Initial password & Firebase UID linking
     const rawPassword = (data.password || data.initialPassword || data.accessCode || '').trim();
     const initialPass = rawPassword && rawPassword.length >= 6
       ? rawPassword
       : `Teamacro@${crypto.randomBytes(3).toString('hex')}!`;
 
     const passSalt = generateSalt();
-    const id = `STAFF_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-    const staffCode = `TMC-STF-${id.slice(-4)}`;
+    const id = data.firebaseUid || `STAFF_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    const staffCode = `TMC-STF-${id.slice(-4).toUpperCase()}`;
 
     const newAccount: AuthAccount = {
       id,
+      uid: id,
       email,
       username,
       fullName,
@@ -2019,6 +2191,7 @@ class ServerAuthManager {
       accessCodeMasked: codeMasked,
       permissions: this.getDefaultPermissionsForDuty(roleTitle),
       mfaRequired: false,
+      createdBy: actorSession.userId,
       createdAt: new Date().toISOString(),
       securityVersion: 1,
     };
@@ -2033,7 +2206,7 @@ class ServerAuthManager {
       actorRole: actorSession.role,
       action: 'CREATED_STAFF_ACCOUNT',
       resource: '/api/auth/create-staff',
-      details: `${actorSession.role} ${actorSession.fullName} provisioned Staff account for ${newAccount.fullName} (${newAccount.email}) with verified access code (${codeMasked}).`,
+      details: `${actorSession.role} ${actorSession.fullName} provisioned Staff account for ${newAccount.fullName} (${newAccount.email}) with UID ${id} and verified access code (${codeMasked}).`,
       ip: actorSession.ip,
       status: 'SUCCESS',
     });
@@ -2042,6 +2215,7 @@ class ServerAuthManager {
     const successMsg = 'Staff account created successfully';
     return {
       success: true,
+      statusCode: 201,
       message: successMsg,
       account: safe,
       initialPassword: initialPass,
@@ -2278,11 +2452,15 @@ class ServerAuthManager {
       password?: string;
       initialPassword?: string;
       assignedModules?: string[];
+      firebaseUid?: string;
+      allowUpdate?: boolean;
     }
   ): {
     success: boolean;
     message?: string;
     error?: string;
+    statusCode?: number;
+    isDuplicate?: boolean;
     invitation?: any;
     account?: any;
     initialPassword?: string;
@@ -2303,6 +2481,7 @@ class ServerAuthManager {
       });
       return {
         success: false,
+        statusCode: 403,
         message: error,
         error,
       };
@@ -2319,29 +2498,51 @@ class ServerAuthManager {
       const error = 'Full Legal Name, Official Email Address, Phone Number, and Access Code are mandatory.';
       return {
         success: false,
+        statusCode: 400,
         message: error,
         error,
       };
     }
 
-    if (!email.includes('@') || !email.includes('.')) {
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
       const error = 'A valid official email address is required.';
-      return { success: false, message: error, error };
+      return { success: false, statusCode: 400, message: error, error };
     }
 
     if (accessCode.length < 6) {
       const error = 'Access Code must be at least 6 characters in length to meet security requirements.';
       return {
         success: false,
+        statusCode: 400,
         message: error,
         error,
       };
     }
 
-    if (email === actorSession.email.toLowerCase()) {
+    if (email === actorSession.email.toLowerCase() || this.isOwnerEmail(email)) {
       const error = 'The Lifetime Super Admin root account cannot be appointed as an Administrator.';
       return {
         success: false,
+        statusCode: 403,
+        message: error,
+        error,
+      };
+    }
+
+    const existingAccount = this.findAccountByIdentifier(email);
+    if (
+      existingAccount &&
+      existingAccount.email.toLowerCase() === email &&
+      existingAccount.role === 'ADMIN' &&
+      existingAccount.status === 'active' &&
+      !data.allowUpdate
+    ) {
+      const error = `An active Administrator account with email address ${email} already exists.`;
+      return {
+        success: false,
+        statusCode: 409,
+        isDuplicate: true,
         message: error,
         error,
       };
@@ -2409,19 +2610,23 @@ class ServerAuthManager {
 
     this.persistInvitations();
 
-    // 4. Provision / reserve administrator account in accounts directory
-    // Ensure password is cryptographically hashed with the exact same PBKDF2 algorithm used by login
+    // 4. Provision / reserve administrator account in accounts directory linked to Firebase Auth UID
     const rawPassword = (data.password || data.initialPassword || data.accessCode || '').trim();
     const initialPass = rawPassword && rawPassword.length >= 6
       ? rawPassword
       : `Teamacro@${crypto.randomBytes(3).toString('hex')}!`;
 
-    let account = this.findAccountByIdentifier(email);
+    let account = existingAccount && existingAccount.email.toLowerCase() === email ? existingAccount : null;
     if (account) {
       if (account.isLifetimeSuperAdmin) {
         const error = 'Root Super Admin cannot be modified.';
-        return { success: false, message: error, error };
+        return { success: false, statusCode: 403, message: error, error };
       }
+      if (data.firebaseUid && account.id !== data.firebaseUid) {
+        this.accounts.delete(account.id);
+        account.id = data.firebaseUid;
+      }
+      account.uid = data.firebaseUid || account.uid || account.id;
       account.role = 'ADMIN';
       account.roleTitle = duty;
       account.duty = duty;
@@ -2433,6 +2638,7 @@ class ServerAuthManager {
       account.isVerified = true;
       account.fullName = fullName;
       account.phone = phone;
+      account.createdBy = account.createdBy || actorSession.userId;
       if (initialPass) {
         account.passwordSalt = generateSalt();
         account.passwordHash = hashPassword(initialPass, account.passwordSalt);
@@ -2441,12 +2647,14 @@ class ServerAuthManager {
       account.accessCodeSalt = salt;
       account.accessCodeMasked = masked;
       account.securityVersion = account.securityVersion || 1;
+      this.accounts.set(account.id, account);
     } else {
       const accSalt = generateSalt();
-      const accountId = `STAFF_ADM_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-      const staffCode = `TMC-ADM-${accountId.slice(-4)}`;
+      const accountId = data.firebaseUid || `STAFF_ADM_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+      const staffCode = `TMC-ADM-${accountId.slice(-4).toUpperCase()}`;
       account = {
         id: accountId,
+        uid: accountId,
         email,
         username: email.split('@')[0],
         fullName,
@@ -2470,6 +2678,7 @@ class ServerAuthManager {
         accessCodeMasked: masked,
         mfaRequired: false,
         permissions: this.getDefaultPermissionsForDuty(duty),
+        createdBy: actorSession.userId,
         createdAt: new Date().toISOString(),
         securityVersion: 1,
       };
@@ -2483,7 +2692,7 @@ class ServerAuthManager {
       actorRole: actorSession.role,
       action: 'APPOINTED_ADMINISTRATOR_WITH_CODE',
       resource: '/api/auth/access/appoint-admin',
-      details: `Lifetime Super Admin appointed ${fullName} (${email}) as Administrator with access authorization code.`,
+      details: `Lifetime Super Admin appointed ${fullName} (${email}) as Administrator with UID ${account.id} and access authorization code.`,
       ip: actorSession.ip,
       status: 'SUCCESS',
     });
@@ -2500,6 +2709,7 @@ class ServerAuthManager {
 
     const safeAccount = {
       id: account.id,
+      uid: account.uid || account.id,
       email: account.email,
       username: account.username,
       fullName: account.fullName,
@@ -2511,14 +2721,16 @@ class ServerAuthManager {
       staffCode: account.staffCode,
       status: account.status,
       active: account.active,
+      createdBy: account.createdBy,
       createdAt: account.createdAt,
       permissions: account.permissions,
     };
 
-    const msg = 'Administrator appointed successfully. Access authorization code provisioned and saved.';
+    const msg = 'Admin account created successfully';
 
     return {
       success: true,
+      statusCode: 201,
       message: msg,
       invitation: safeInvitation,
       account: safeAccount,
@@ -2965,11 +3177,11 @@ class ServerAuthManager {
       this.findAccountByIdentifier(cleanUsername);
 
     const role: UserRole =
-      data.role === 'LIFETIME_SUPER_ADMIN'
+      data.role === 'LIFETIME_SUPER_ADMIN' && this.isOwnerEmail(cleanEmail)
         ? 'LIFETIME_SUPER_ADMIN'
         : data.role === 'ADMIN'
         ? 'ADMIN'
-        : (data.role || 'STAFF');
+        : 'STAFF';
     const duty = data.duty || data.roleTitle || (role === 'ADMIN' ? 'Admin / General Branch Administrator' : 'Operations Staff');
     const rawPass = (data.password || data.accessCode || '').trim();
     const rawCode = (data.accessCode || '').trim();

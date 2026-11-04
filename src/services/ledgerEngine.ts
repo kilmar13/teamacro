@@ -1291,13 +1291,18 @@ export class LedgerEngine {
       `Successfully enrolled customer ${newCustomer.fullName} (${newCustomer.customerCode})`
     );
 
-    // Asynchronously persist to backend /api/customers if in browser environment
+    // Asynchronously persist to backend /api/customers if in browser environment with active session
     if (typeof window !== 'undefined' && typeof fetch === 'function') {
-      fetch('/api/customers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ customer: newCustomer }),
-      }).catch(() => {});
+      import('../utils/apiClient')
+        .then(({ safeApiFetch, getActiveSessionToken }) => {
+          if (getActiveSessionToken()) {
+            return safeApiFetch('/api/customers', {
+              method: 'POST',
+              body: { customer: newCustomer },
+            });
+          }
+        })
+        .catch(() => {});
     }
 
     return newCustomer;
@@ -1308,10 +1313,13 @@ export class LedgerEngine {
       return this.getCustomers();
     }
     try {
-      const res = await fetch('/api/customers', { credentials: 'include' });
-      if (!res.ok) return this.getCustomers();
-      const data = await res.json();
-      const serverCustomers: any[] = data?.customers || data?.data?.customers || [];
+      const { safeApiFetch, getActiveSessionToken } = await import('../utils/apiClient');
+      if (!getActiveSessionToken()) {
+        return this.getCustomers();
+      }
+      const res = await safeApiFetch('/api/customers', { method: 'GET' });
+      if (!res.success) return this.getCustomers();
+      const serverCustomers: any[] = res.customers || res.data?.customers || [];
       const localCustomers = this.getCustomers();
 
       // Also push any local customers that aren't on the server yet
@@ -1319,10 +1327,9 @@ export class LedgerEngine {
       for (const localCust of localCustomers) {
         const cleanLocalPhone = String(localCust.phone || '').replace(/\s+/g, '');
         if (cleanLocalPhone && !serverPhones.has(cleanLocalPhone)) {
-          fetch('/api/customers', {
+          safeApiFetch('/api/customers', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ customer: localCust }),
+            body: { customer: localCust },
           }).catch(() => {});
         }
       }
@@ -1392,11 +1399,16 @@ export class LedgerEngine {
     );
 
     if (typeof window !== 'undefined' && typeof fetch === 'function') {
-      fetch('/api/customers', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ customer: customers[idx] }),
-      }).catch(() => {});
+      import('../utils/apiClient')
+        .then(({ safeApiFetch, getActiveSessionToken }) => {
+          if (getActiveSessionToken()) {
+            return safeApiFetch('/api/customers', {
+              method: 'POST',
+              body: { customer: customers[idx] },
+            });
+          }
+        })
+        .catch(() => {});
     }
 
     return customers[idx];

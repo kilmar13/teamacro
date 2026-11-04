@@ -6,13 +6,13 @@
   "outputDirectory": "dist",
   "functions": {
     "api/index.ts": {
-      "includeFiles": "data/**"
+      "includeFiles": "{data/**,firebase-applet-config.json}"
     }
   },
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "/api"
+      "destination": "/api?__path=$1"
     },
     {
       "source": "/((?!api/|assets/|.*\\..*).*)",
@@ -20,3 +20,4 @@
     }
   ]
 }
+

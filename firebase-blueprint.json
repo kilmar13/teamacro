@@ -257,6 +257,78 @@
         }
       },
       "required": ["initialized", "ownerUid", "ownerEmail", "role", "setupVersion"]
+    },
+    "Staff": {
+      "title": "Staff",
+      "description": "Operational staff record with assigned duty and granular permission flags.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Staff user UID."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Staff corporate email address."
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Staff legal full name."
+        },
+        "phone": {
+          "type": "string",
+          "description": "Staff contact phone number."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["STAFF"],
+          "description": "Staff role."
+        },
+        "duty": {
+          "type": "string",
+          "description": "Assigned operational duty."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp."
+        }
+      },
+      "required": ["uid", "email", "fullName", "role"]
+    },
+    "Customer": {
+      "title": "Customer",
+      "description": "Registered TEAMACRO customer profile for Fixed Target, Daily Ajo, Everyhome Food, Leocash, and Loans.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Customer unique ID."
+        },
+        "customerCode": {
+          "type": "string",
+          "description": "TEAMACRO customer reference code."
+        },
+        "fullName": {
+          "type": "string",
+          "description": "Customer full legal name."
+        },
+        "phone": {
+          "type": "string",
+          "description": "Customer phone number."
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Customer email address."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "suspended", "dormant"],
+          "description": "Customer status."
+        }
+      },
+      "required": ["id", "fullName", "phone"]
     }
   },
   "firestore": {
@@ -270,7 +342,15 @@
     },
     "/admins/{adminId}": {
       "schema": { "$ref": "#/entities/Admin" },
-      "description": "Admin authorization mapping for trusted platform staff and administrators."
+      "description": "Admin authorization mapping for trusted platform administrators."
+    },
+    "/staff/{staffId}": {
+      "schema": { "$ref": "#/entities/Staff" },
+      "description": "Staff authorization mapping and operational duty records."
+    },
+    "/customers/{customerId}": {
+      "schema": { "$ref": "#/entities/Customer" },
+      "description": "Customer profile records across TEAMACRO financial programmes."
     },
     "/accounts/{accountId}": {
       "schema": { "$ref": "#/entities/Account" },

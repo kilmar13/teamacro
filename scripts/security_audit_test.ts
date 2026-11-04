@@ -33,8 +33,9 @@ async function runFullSecuritySuite() {
   // -------------------------------------------------------------------------
   // 1. Concurrency Race Test: Atomic Mutex on /supa-setup Root Initialization
   // -------------------------------------------------------------------------
-  const ownershipFile = path.resolve(process.cwd(), 'data/system_ownership.json');
-  const accountsFile = path.resolve(process.cwd(), 'data/auth_accounts.json');
+  const runtimeDataDir = (serverAuthManager as any).dataDir || '/tmp/teamacro-data';
+  const ownershipFile = path.join(runtimeDataDir, 'system_ownership.json');
+  const accountsFile = path.join(runtimeDataDir, 'auth_accounts.json');
   if (fs.existsSync(ownershipFile)) fs.unlinkSync(ownershipFile);
   if (fs.existsSync(accountsFile)) fs.unlinkSync(accountsFile);
 

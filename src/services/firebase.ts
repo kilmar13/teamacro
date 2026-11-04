@@ -10,7 +10,25 @@ import {
   getDocFromServer,
   Firestore,
 } from 'firebase/firestore';
-import firebaseConfig from '../../firebase-applet-config.json';
+import firebaseAppletConfig from '../../firebase-applet-config.json';
+
+const viteEnv: Record<string, string | undefined> =
+  typeof import.meta !== 'undefined' && (import.meta as any).env
+    ? ((import.meta as any).env as Record<string, string | undefined>)
+    : {};
+
+const firebaseConfig = {
+  ...firebaseAppletConfig,
+  projectId: viteEnv.VITE_FIREBASE_PROJECT_ID || firebaseAppletConfig.projectId,
+  appId: viteEnv.VITE_FIREBASE_APP_ID || firebaseAppletConfig.appId,
+  apiKey: viteEnv.VITE_FIREBASE_API_KEY || firebaseAppletConfig.apiKey,
+  authDomain: viteEnv.VITE_FIREBASE_AUTH_DOMAIN || firebaseAppletConfig.authDomain,
+  firestoreDatabaseId:
+    viteEnv.VITE_FIREBASE_FIRESTORE_DATABASE_ID || firebaseAppletConfig.firestoreDatabaseId,
+  storageBucket: viteEnv.VITE_FIREBASE_STORAGE_BUCKET || firebaseAppletConfig.storageBucket,
+  messagingSenderId:
+    viteEnv.VITE_FIREBASE_MESSAGING_SENDER_ID || firebaseAppletConfig.messagingSenderId,
+};
 
 // Silence Firestore internal network connection warnings in both browser and server environments
 try {
