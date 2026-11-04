@@ -33,6 +33,15 @@ export const SuperAdminLoginPage: React.FC<SuperAdminLoginPageProps> = ({
   const [loading, setLoading] = useState(false);
   const [lockoutTimer, setLockoutTimer] = useState<number | null>(null);
 
+  // MFA Challenge State (when MFA is enabled on the Super Admin account)
+  const [mfaChallenge, setMfaChallenge] = useState<{
+    tempToken: string;
+    maskedDestination: string;
+    user?: any;
+  } | null>(null);
+  const [mfaCode, setMfaCode] = useState('');
+  const [mfaLoading, setMfaLoading] = useState(false);
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     if (loading) return;
@@ -40,14 +49,28 @@ export const SuperAdminLoginPage: React.FC<SuperAdminLoginPageProps> = ({
     setLoading(true);
 
     try {
-      // Direct Firebase Authentication & Firestore singleton verification (MFA removed)
       const res: LoginResult = await authService.loginSuperAdmin(email.trim(), password);
 
-      if (!res.success || !res.user) {
+      if (!res.success) {
         setErrorMsg(normalizeError(res.error, 'Invalid credentials or account unauthorised.'));
         if (res.lockoutSeconds) {
           setLockoutTimer(res.lockoutSeconds);
         }
+        return;
+      }
+
+      if (res.requireMfa && res.tempToken) {
+        setMfaChallenge({
+          tempToken: res.tempToken,
+          maskedDestination: res.maskedDestination || 'registered authenticator application',
+          user: res.user,
+        });
+        setMfaCode('');
+        return;
+      }
+
+      if (!res.user) {
+        setErrorMsg('Invalid credentials or account unauthorised.');
         return;
       }
 
@@ -63,6 +86,31 @@ export const SuperAdminLoginPage: React.FC<SuperAdminLoginPageProps> = ({
       setErrorMsg(normalizeError(err, 'Authentication gateway connection failed.'));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleVerifyMfa = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (mfaLoading || !mfaChallenge?.tempToken) return;
+    setErrorMsg(null);
+    setMfaLoading(true);
+
+    try {
+      const res = await authService.verifyMfa(mfaChallenge.tempToken, mfaCode.trim());
+      if (!res.success || !res.user) {
+        setErrorMsg(normalizeError(res.error, 'Invalid MFA verification code.'));
+        return;
+      }
+      if (res.user.role !== 'LIFETIME_SUPER_ADMIN') {
+        setErrorMsg('Access Denied: This portal is strictly reserved for the Lifetime Super Admin.');
+        return;
+      }
+      onLoginSuccess(res.user);
+      onNavigate('/supa-admin');
+    } catch (err: any) {
+      setErrorMsg(normalizeError(err, 'MFA verification failed.'));
+    } finally {
+      setMfaLoading(false);
     }
   };
 
@@ -90,100 +138,171 @@ export const SuperAdminLoginPage: React.FC<SuperAdminLoginPageProps> = ({
         <div className="bg-[#0B1536] border border-[#1E2E64] rounded-md p-6 sm:p-8 shadow-2xl space-y-6 relative overflow-hidden">
           <div className="absolute top-0 left-0 right-0 h-1 bg-[#F9C928]" />
 
-          <form onSubmit={handleLogin} className="space-y-5">
-            <div className="text-center space-y-2">
-              <div className="w-12 h-12 rounded-xl bg-amber-400/10 border border-amber-400/30 text-[#F9C928] flex items-center justify-center mx-auto shadow-sm">
-                <KeyRound size={24} />
+          {mfaChallenge ? (
+            <form onSubmit={handleVerifyMfa} className="space-y-5">
+              <div className="text-center space-y-2">
+                <div className="w-12 h-12 rounded-xl bg-amber-400/10 border border-amber-400/30 text-[#F9C928] flex items-center justify-center mx-auto shadow-sm">
+                  <Lock size={24} />
+                </div>
+                <div className="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-widest bg-amber-400/20 text-[#F9C928] border border-amber-400/40">
+                  MULTI-FACTOR VERIFICATION
+                </div>
+                <h1 className="text-2xl font-black text-white">Verify Super Admin MFA</h1>
+                <p className="text-xs text-slate-400">
+                  Enter the 6-digit authenticator code or recovery code for {mfaChallenge.maskedDestination}.
+                </p>
               </div>
-              <div className="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-widest bg-amber-400/20 text-[#F9C928] border border-amber-400/40">
-                LIFETIME SUPER ADMIN GATEWAY
-              </div>
-              <h1 className="text-2xl font-black text-white">Super Admin Sign In</h1>
-              <p className="text-xs text-slate-400">
-                Executive management, root governance, and company ledger oversight.
-              </p>
-            </div>
 
-            {errorMsg && (
-              <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-800 text-rose-300 text-xs flex items-start gap-2.5">
-                <AlertCircle size={16} className="shrink-0 mt-0.5 text-rose-400" />
-                <span>{normalizeError(errorMsg)}</span>
-              </div>
-            )}
+              {errorMsg && (
+                <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-800 text-rose-300 text-xs flex items-start gap-2.5">
+                  <AlertCircle size={16} className="shrink-0 mt-0.5 text-rose-400" />
+                  <span>{normalizeError(errorMsg)}</span>
+                </div>
+              )}
 
-            {lockoutTimer && lockoutTimer > 0 && (
-              <div className="p-3.5 rounded-xl bg-amber-950/70 border border-amber-800 text-amber-300 text-xs flex items-center gap-2">
-                <ShieldAlert size={16} />
-                <span>Security lockout active. Please wait {lockoutTimer} seconds.</span>
-              </div>
-            )}
-
-            <div className="space-y-4">
               <div>
                 <label className="block text-xs font-bold text-slate-300 mb-1">
-                  Super Admin Email Address
+                  Authenticator or Recovery Code
                 </label>
                 <input
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="executive@teamacro.ng"
-                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#070F2C] border border-[#1E2E64] text-white text-sm focus:outline-none focus:border-[#F9C928] transition-colors"
+                  type="text"
+                  value={mfaCode}
+                  onChange={(e) => setMfaCode(e.target.value)}
+                  placeholder="6-digit code or recovery code"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-[#070F2C] border border-[#1E2E64] text-white text-sm font-mono tracking-widest text-center focus:outline-none focus:border-[#F9C928] transition-colors"
                   required
-                  disabled={loading || (lockoutTimer !== null && lockoutTimer > 0)}
+                  disabled={mfaLoading}
                 />
               </div>
 
-              <div>
-                <div className="flex justify-between items-center mb-1">
-                  <label className="text-xs font-bold text-slate-300">Master Password</label>
+              <div className="pt-2 space-y-2">
+                <button
+                  type="submit"
+                  disabled={mfaLoading}
+                  className="w-full py-3 px-4 rounded-xl bg-[#F9C928] hover:bg-[#e6b820] text-[#070F2C] font-extrabold text-sm tracking-wide flex items-center justify-center gap-2 transition-all shadow-md disabled:opacity-50 cursor-pointer"
+                >
+                  {mfaLoading ? (
+                    <>
+                      <RefreshCw size={16} className="animate-spin" />
+                      <span>Verifying MFA...</span>
+                    </>
+                  ) : (
+                    <>
+                      <ShieldCheck size={16} />
+                      <span>Complete Super Admin Sign In</span>
+                      <ArrowRight size={16} />
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setMfaChallenge(null);
+                    setMfaCode('');
+                    setErrorMsg(null);
+                  }}
+                  className="w-full py-2 text-xs text-slate-400 hover:text-white transition-colors cursor-pointer"
+                >
+                  ← Back to credentials
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form onSubmit={handleLogin} className="space-y-5">
+              <div className="text-center space-y-2">
+                <div className="w-12 h-12 rounded-xl bg-amber-400/10 border border-amber-400/30 text-[#F9C928] flex items-center justify-center mx-auto shadow-sm">
+                  <KeyRound size={24} />
                 </div>
-                <div className="relative">
+                <div className="inline-block px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-widest bg-amber-400/20 text-[#F9C928] border border-amber-400/40">
+                  LIFETIME SUPER ADMIN GATEWAY
+                </div>
+                <h1 className="text-2xl font-black text-white">Super Admin Sign In</h1>
+                <p className="text-xs text-slate-400">
+                  Executive management, root governance, and company ledger oversight.
+                </p>
+              </div>
+
+              {errorMsg && (
+                <div className="p-3.5 rounded-xl bg-rose-950/70 border border-rose-800 text-rose-300 text-xs flex items-start gap-2.5">
+                  <AlertCircle size={16} className="shrink-0 mt-0.5 text-rose-400" />
+                  <span>{normalizeError(errorMsg)}</span>
+                </div>
+              )}
+
+              {lockoutTimer && lockoutTimer > 0 && (
+                <div className="p-3.5 rounded-xl bg-amber-950/70 border border-amber-800 text-amber-300 text-xs flex items-center gap-2">
+                  <ShieldAlert size={16} />
+                  <span>Security lockout active. Please wait {lockoutTimer} seconds.</span>
+                </div>
+              )}
+
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-xs font-bold text-slate-300 mb-1">
+                    Super Admin Email Address
+                  </label>
                   <input
-                    type={showPassword ? 'text' : 'password'}
-                    value={password}
-                    onChange={(e) => setPassword(e.target.value)}
-                    placeholder="••••••••••••"
-                    className="w-full px-3.5 py-2.5 pr-10 rounded-xl bg-[#070F2C] border border-[#1E2E64] text-white text-sm focus:outline-none focus:border-[#F9C928] transition-colors"
+                    type="email"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    placeholder="executive@teamacro.ng"
+                    className="w-full px-3.5 py-2.5 rounded-xl bg-[#070F2C] border border-[#1E2E64] text-white text-sm focus:outline-none focus:border-[#F9C928] transition-colors"
                     required
                     disabled={loading || (lockoutTimer !== null && lockoutTimer > 0)}
                   />
-                  <button
-                    type="button"
-                    onClick={() => setShowPassword(!showPassword)}
-                    className="absolute right-3 top-2.5 text-slate-400 hover:text-white cursor-pointer"
-                  >
-                    {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
-                  </button>
+                </div>
+
+                <div>
+                  <div className="flex justify-between items-center mb-1">
+                    <label className="text-xs font-bold text-slate-300">Master Password</label>
+                  </div>
+                  <div className="relative">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="••••••••••••"
+                      className="w-full px-3.5 py-2.5 pr-10 rounded-xl bg-[#070F2C] border border-[#1E2E64] text-white text-sm focus:outline-none focus:border-[#F9C928] transition-colors"
+                      required
+                      disabled={loading || (lockoutTimer !== null && lockoutTimer > 0)}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword(!showPassword)}
+                      className="absolute right-3 top-2.5 text-slate-400 hover:text-white cursor-pointer"
+                    >
+                      {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                    </button>
+                  </div>
                 </div>
               </div>
-            </div>
 
-            <div className="pt-2">
-              <button
-                type="submit"
-                disabled={loading || (lockoutTimer !== null && lockoutTimer > 0)}
-                className="w-full py-3 px-4 rounded-xl bg-[#F9C928] hover:bg-[#e6b820] text-[#070F2C] font-extrabold text-sm tracking-wide flex items-center justify-center gap-2 transition-all shadow-md disabled:opacity-50 cursor-pointer"
-              >
-                {loading ? (
-                  <>
-                    <RefreshCw size={16} className="animate-spin" />
-                    <span>Authenticating Super Admin...</span>
-                  </>
-                ) : (
-                  <>
-                    <ShieldCheck size={16} />
-                    <span>Sign In to Super Admin</span>
-                    <ArrowRight size={16} />
-                  </>
-                )}
-              </button>
-            </div>
+              <div className="pt-2">
+                <button
+                  type="submit"
+                  disabled={loading || (lockoutTimer !== null && lockoutTimer > 0)}
+                  className="w-full py-3 px-4 rounded-xl bg-[#F9C928] hover:bg-[#e6b820] text-[#070F2C] font-extrabold text-sm tracking-wide flex items-center justify-center gap-2 transition-all shadow-md disabled:opacity-50 cursor-pointer"
+                >
+                  {loading ? (
+                    <>
+                      <RefreshCw size={16} className="animate-spin" />
+                      <span>Authenticating Super Admin...</span>
+                    </>
+                  ) : (
+                    <>
+                      <ShieldCheck size={16} />
+                      <span>Sign In to Super Admin</span>
+                      <ArrowRight size={16} />
+                    </>
+                  )}
+                </button>
+              </div>
 
-            <div className="pt-2 text-center text-[11px] text-slate-500">
-              Restricted to the Lifetime Super Admin account.
-            </div>
-          </form>
+              <div className="pt-2 text-center text-[11px] text-slate-500">
+                Restricted to the Lifetime Super Admin account.
+              </div>
+            </form>
+          )}
         </div>
       </main>
 

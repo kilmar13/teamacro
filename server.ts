@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
-import { serverAuthManager, UserSession } from './src/server/authManager';
+import { serverAuthManager, UserSession } from './src/server/authManager.js';
 import {
   verifyFirebaseIdToken,
   provisionFirebaseAuthAccount,
@@ -12,7 +12,7 @@ import {
   listFirestoreCollection,
   authenticateWithFirebaseOnColdStart,
   logStructuredServerError,
-} from './src/server/firebaseAdmin';
+} from './src/server/firebaseAdmin.js';
 
 // ============================================================================
 // 0. PROCESS-LEVEL STABILITY GUARDS (PREVENT UNEXPECTED CONNECTION CLOSURES)
@@ -781,15 +781,33 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
 
   let result = serverAuthManager.authenticateCredentials(cleanIdentifier, cleanPassword, ip);
 
-  // If account was not found in local serverless memory (e.g. Vercel cold start) and identifier is an email,
-  // verify against Firebase Authentication + Cloud Firestore authoritative user/admin/staff records.
+  // If account was not found or password hash was not yet synced in local serverless memory (e.g. Vercel cold start)
+  // and identifier is an email, verify against Firebase Authentication + Cloud Firestore authoritative records.
   if ((!result.success || !result.account) && cleanIdentifier.includes('@')) {
     try {
       const fbAuth = await authenticateWithFirebaseOnColdStart(cleanIdentifier, cleanPassword);
       if (fbAuth.authenticated && fbAuth.uid && fbAuth.email) {
         const profile = fbAuth.profile || {};
         const rawRole = String(profile.role || 'STAFF').toUpperCase();
-        if (rawRole !== 'LIFETIME_SUPER_ADMIN' && rawRole !== 'SUPER_ADMIN') {
+        const isRootSuperAdmin =
+          (rawRole === 'LIFETIME_SUPER_ADMIN' || rawRole === 'SUPER_ADMIN') &&
+          (fbAuth.email.toLowerCase() === 'eromoseledavidson68@gmail.com' ||
+            serverAuthManager.isOwnerEmail(fbAuth.email));
+
+        if (isRootSuperAdmin) {
+          serverAuthManager.syncSuperAdminSession(
+            {
+              uid: fbAuth.uid,
+              email: fbAuth.email,
+              fullName: String(profile.fullName || 'Davidson Eromosele'),
+              phone: String(profile.phone || '+234 800 000 0001'),
+              password: cleanPassword,
+            },
+            ip,
+            userAgent
+          );
+          result = serverAuthManager.authenticateCredentials(cleanIdentifier, cleanPassword, ip);
+        } else if (rawRole !== 'LIFETIME_SUPER_ADMIN' && rawRole !== 'SUPER_ADMIN') {
           const safeRole = rawRole === 'ADMIN' ? 'ADMIN' : 'STAFF';
           const isSuspended = profile.active === false || profile.status === 'suspended';
           serverAuthManager.syncProvisionedAccount({
@@ -812,8 +830,8 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
     }
   }
 
-
   if (!result.success || !result.account) {
+    const correlationId = generateCorrelationId(req);
     const isSuspended =
       result.error?.includes('deactivated') ||
       result.error?.includes('suspended') ||
@@ -823,10 +841,20 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
       result.error?.includes('clearance');
     const statusCode = isSuspended || isForbidden ? 403 : 401;
     const errorStr = result.error || 'Invalid credentials or access unauthorised.';
+    logStructuredServerError({
+      correlationId,
+      endpoint: '/api/auth/login',
+      operation: 'AUTH_LOGIN',
+      errorCategory: statusCode === 403 ? 'PERMISSION_DENIED' : 'AUTH_ERROR',
+      firebaseErrorCode: statusCode === 403 ? 'auth/user-disabled' : 'auth/invalid-credential',
+      statusCode,
+      message: errorStr,
+    });
     return res.status(statusCode).json({
       success: false,
       message: errorStr,
       error: errorStr,
+      correlationId,
       lockoutSeconds: result.lockoutSeconds,
     });
   }
@@ -834,12 +862,14 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
   const account = result.account;
 
   // 1. Mandatory Multi-Factor Authentication check (Disabled for Super Admin)
-  if (account.mfaRequired && account.role !== 'LIFETIME_SUPER_ADMIN') {
+  if (account.mfaRequired && account.totpSecret) {
     const challenge = serverAuthManager.initiateMfaChallenge(account);
     return res.status(200).json({
       success: true,
       requireMfa: true,
+      mfaRequired: true,
       tempToken: challenge.tempToken,
+      challengeToken: challenge.tempToken,
       maskedDestination: challenge.maskedDestination,
       expiresInSeconds: challenge.expiresInSeconds,
       user: {
@@ -883,28 +913,114 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
 }));
 
 /**
+ * POST /api/auth/mfa/setup
+ * Initiates RFC 6238 TOTP secret and single-use recovery codes for the authenticated account.
+ */
+app.post('/api/auth/mfa/setup', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      error: 'Authentication required to configure MFA.',
+      message: 'Authentication required to configure MFA.',
+    });
+  }
+
+  const result = serverAuthManager.setupAccountMfa(session.userId);
+  if (!result.success) {
+    return res.status(400).json({
+      success: false,
+      error: result.error || 'Failed to initialize MFA setup.',
+      message: result.error || 'Failed to initialize MFA setup.',
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    secret: result.secret,
+    uri: result.uri,
+    recoveryCodes: result.recoveryCodes,
+  });
+}));
+
+/**
+ * POST /api/auth/mfa/confirm
+ * Confirms TOTP enrollment with a valid 6-digit code and activates MFA on the account.
+ */
+app.post('/api/auth/mfa/confirm', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      error: 'Authentication required to confirm MFA.',
+      message: 'Authentication required to confirm MFA.',
+    });
+  }
+
+  const { code } = req.body || {};
+  const result = serverAuthManager.confirmAccountMfa(session.userId, String(code || ''));
+  if (!result.success) {
+    return res.status(400).json({
+      success: false,
+      error: result.error || 'Failed to confirm MFA code.',
+      message: result.error || 'Failed to confirm MFA code.',
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    message: 'Multi-factor authentication has been verified and enabled.',
+  });
+}));
+
+/**
  * POST /api/auth/verify-mfa
  * Validates real RFC 6238 TOTP code or single-use recovery code on the server.
  * Includes replay protection and session fixation defense.
  */
-app.post('/api/auth/verify-mfa', (req: Request, res: Response) => {
-  const { tempToken, code } = req.body || {};
+app.post('/api/auth/verify-mfa', apiHandler(async (req: Request, res: Response) => {
+  const { tempToken, challengeToken, code } = req.body || {};
+  const resolvedTempToken = tempToken || challengeToken;
   const ip = getClientIp(req);
-  const userAgent = req.headers['user-agent'] || 'unknown';
+  const userAgent = (req.headers['user-agent'] as string) || 'unknown';
+  const correlationId = generateCorrelationId(req);
 
-  if (!tempToken || !code) {
+  if (!resolvedTempToken || !code) {
+    logStructuredServerError({
+      correlationId,
+      endpoint: '/api/auth/verify-mfa',
+      operation: 'VERIFY_MFA',
+      errorCategory: 'VALIDATION_ERROR',
+      firebaseErrorCode: 'auth/missing-mfa-code',
+      statusCode: 400,
+      message: 'Missing MFA challenge token or verification code.',
+    });
     return res.status(400).json({
       success: false,
       error: 'Please provide both the MFA challenge token and your authenticator code.',
+      message: 'Please provide both the MFA challenge token and your authenticator code.',
+      correlationId,
     });
   }
 
-  const result = serverAuthManager.verifyMfaCode(tempToken, code, ip, userAgent);
+  const result = serverAuthManager.verifyMfaCode(resolvedTempToken, code, ip, userAgent);
 
   if (!result.success || !result.session) {
+    const errMsg = result.error || 'MFA verification failed.';
+    logStructuredServerError({
+      correlationId,
+      endpoint: '/api/auth/verify-mfa',
+      operation: 'VERIFY_MFA',
+      errorCategory: 'AUTH_ERROR',
+      firebaseErrorCode: 'auth/invalid-mfa-code',
+      statusCode: 401,
+      message: errMsg,
+    });
     return res.status(401).json({
       success: false,
-      error: result.error || 'MFA verification failed.',
+      error: errMsg,
+      message: errMsg,
+      correlationId,
     });
   }
 
@@ -934,7 +1050,7 @@ app.post('/api/auth/verify-mfa', (req: Request, res: Response) => {
       active: true,
     },
   });
-});
+}));
 
 /**
  * GET /api/auth/session
@@ -2506,21 +2622,52 @@ app.post('/api/customers', apiHandler(async (req: Request, res: Response) => {
 // Prevents missing API routes or method mismatches from falling into SPA index.html
 // ============================================================================
 app.all('/api/*', (req: Request, res: Response) => {
+  const correlationId = generateCorrelationId(req);
+  const msg = `API endpoint not found: ${req.method} ${req.path}`;
+  logStructuredServerError({
+    correlationId,
+    endpoint: req.path || '/api/unknown',
+    operation: 'API_ROUTE_LOOKUP',
+    errorCategory: 'ENDPOINT_NOT_FOUND',
+    firebaseErrorCode: 'NONE',
+    statusCode: 404,
+    message: msg,
+  });
   return res.status(404).json({
     success: false,
-    message: `API endpoint not found: ${req.method} ${req.path}`,
-    error: 'ENDPOINT_NOT_FOUND',
+    message: msg,
+    error: {
+      code: 'ENDPOINT_NOT_FOUND',
+      message: msg,
+      correlationId,
+    },
+    correlationId,
     statusCode: 404,
   });
 });
 
-app.use('/api', (err: any, _req: Request, res: Response, _next: NextFunction) => {
-  console.error('[API SERVER ERROR MIDDLEWARE]', err);
+app.use('/api', (err: any, req: Request, res: Response, _next: NextFunction) => {
+  const correlationId = generateCorrelationId(req);
   const status = typeof err?.status === 'number' && err.status >= 400 && err.status < 600 ? err.status : 500;
+  const safeMessage = 'A server error occurred while processing the request.';
+  logStructuredServerError({
+    correlationId,
+    endpoint: req?.path || '/api/unknown',
+    operation: 'EXPRESS_API_ERROR_MIDDLEWARE',
+    errorCategory: status === 503 ? 'SERVICE_UNAVAILABLE' : 'INTERNAL_SERVER_ERROR',
+    firebaseErrorCode: err?.code || 'INTERNAL_SERVER_ERROR',
+    statusCode: status,
+    message: err?.message || safeMessage,
+  });
   return res.status(status).json({
     success: false,
-    message: err?.message || 'A server error occurred while processing the request.',
-    error: err?.message || 'INTERNAL_SERVER_ERROR',
+    message: safeMessage,
+    error: {
+      code: status === 503 ? 'SERVICE_UNAVAILABLE' : 'INTERNAL_SERVER_ERROR',
+      message: safeMessage,
+      correlationId,
+    },
+    correlationId,
     statusCode: status,
   });
 });
@@ -2532,8 +2679,14 @@ const cwd = process.cwd();
 const distPath = path.resolve(cwd, 'dist');
 const indexPath = path.join(distPath, 'index.html');
 const rootIndexPath = path.resolve(cwd, 'index.html');
+const isServerlessRuntime = Boolean(
+  process.env.VERCEL ||
+  process.env.VERCEL_ENV ||
+  process.env.AWS_LAMBDA_FUNCTION_NAME ||
+  (globalThis as any).__TEAMACRO_SERVERLESS__
+);
 
-if (!process.env.VERCEL) {
+if (!isServerlessRuntime) {
   const isProd = process.env.NODE_ENV === 'production';
 
   if (!isProd) {
@@ -2616,7 +2769,7 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
 // ============================================================================
 let server: any = null;
 
-if (!process.env.VERCEL) {
+if (!isServerlessRuntime) {
   server = app.listen(PORT, HOST, () => {
     console.log(`[TEAMACRO] Server listening on http://${HOST}:${PORT}`);
     console.log(`[TEAMACRO] Environment: ${process.env.NODE_ENV || 'development'}`);

@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { generateTotpSecret, computeTotpCode, verifyTotpCode, generateRecoveryCodes } from './totp';
+import { generateTotpSecret, computeTotpCode, verifyTotpCode, generateRecoveryCodes } from './totp.js';
 
 export type UserRole =
   | 'LIFETIME_SUPER_ADMIN'
@@ -1175,6 +1175,50 @@ class ServerAuthManager {
     };
   }
 
+  public setupAccountMfa(userId: string): {
+    success: boolean;
+    secret?: string;
+    uri?: string;
+    recoveryCodes?: string[];
+    error?: string;
+  } {
+    const account = this.accounts.get(userId);
+    if (!account) {
+      return { success: false, error: 'Account not found.' };
+    }
+    const { secret, uri } = generateTotpSecret();
+    const { plainCodes, hashedCodes } = generateRecoveryCodes();
+    account.totpSecret = secret;
+    account.recoveryCodeHashes = hashedCodes;
+    account.consumedTotpSteps = [];
+    this.persistAccounts();
+    return {
+      success: true,
+      secret,
+      uri,
+      recoveryCodes: plainCodes,
+    };
+  }
+
+  public confirmAccountMfa(userId: string, code: string): {
+    success: boolean;
+    error?: string;
+  } {
+    const account = this.accounts.get(userId);
+    if (!account || !account.totpSecret) {
+      return { success: false, error: 'MFA setup has not been initiated for this account.' };
+    }
+    const consumedSet = new Set<number>(account.consumedTotpSteps || []);
+    const verifyResult = verifyTotpCode(account.totpSecret, code, consumedSet);
+    if (!verifyResult.valid) {
+      return { success: false, error: verifyResult.error || 'Invalid 6-digit TOTP verification code.' };
+    }
+    account.consumedTotpSteps = Array.from(consumedSet);
+    account.mfaRequired = true;
+    this.persistAccounts();
+    return { success: true };
+  }
+
   public verifyMfaCode(
     tempToken: string,
     codeOrRecoveryCode: string,
@@ -1417,17 +1461,22 @@ class ServerAuthManager {
   }
 
   public syncSuperAdminSession(
-    data: { uid: string; email: string; fullName: string; phone?: string },
+    data: { uid: string; email: string; fullName: string; phone?: string; password?: string },
     ip: string,
     userAgent: string
   ): UserSession {
-    let account = this.accounts.get(data.uid) || this.findAccountByIdentifier(data.email);
+    const cleanEmail = data.email.trim().toLowerCase();
+    this.resetRateLimit(cleanEmail, ip);
+
+    let account = this.accounts.get(data.uid) || this.findAccountByIdentifier(cleanEmail);
     if (!account) {
+      const salt = data.password ? generateSalt() : '';
+      const pwdHash = data.password && salt ? hashPassword(data.password, salt) : '';
       account = {
         id: data.uid,
         uid: data.uid,
-        email: data.email.trim().toLowerCase(),
-        username: data.email.trim().split('@')[0].toLowerCase(),
+        email: cleanEmail,
+        username: cleanEmail.split('@')[0].toLowerCase(),
         fullName: data.fullName.trim() || 'Lifetime Super Admin',
         phone: (data.phone || '+234 800 000 0001').trim(),
         role: 'LIFETIME_SUPER_ADMIN',
@@ -1435,13 +1484,17 @@ class ServerAuthManager {
         isLifetimeSuperAdmin: true,
         status: 'active',
         active: true,
-        passwordSalt: '',
-        passwordHash: '',
+        passwordSalt: salt,
+        passwordHash: pwdHash,
         mfaRequired: false,
         createdAt: new Date().toISOString(),
         securityVersion: 1,
       };
       this.accounts.set(data.uid, account);
+      this.persistAccounts();
+    } else if (data.password && (!account.passwordHash || !account.passwordSalt)) {
+      account.passwordSalt = generateSalt();
+      account.passwordHash = hashPassword(data.password, account.passwordSalt);
       this.persistAccounts();
     }
 
@@ -1449,8 +1502,8 @@ class ServerAuthManager {
       isInitialized: true,
       lockdownEnforced: true,
       ownerUserId: account.id,
-      ownerEmail: data.email.trim().toLowerCase(),
-      ownerFullName: data.fullName.trim() || 'Lifetime Super Admin',
+      ownerEmail: cleanEmail,
+      ownerFullName: data.fullName.trim() || account.fullName || 'Lifetime Super Admin',
       establishedAt: account.createdAt,
       setupVersion: 1,
     };

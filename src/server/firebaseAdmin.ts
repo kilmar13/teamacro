@@ -38,6 +38,8 @@ export interface StructuredErrorLog {
     | 'INSUFFICIENT_PRIVILEGES'
     | 'DUPLICATE_ACCOUNT'
     | 'DUPLICATE_EMAIL'
+    | 'ENDPOINT_NOT_FOUND'
+    | 'SERVICE_UNAVAILABLE'
     | 'FIREBASE_AUTH_ERROR'
     | 'FIRESTORE_ERROR'
     | 'INTERNAL_SERVER_ERROR';
@@ -1254,6 +1256,11 @@ export async function authenticateWithFirebaseOnColdStart(
 
     const profile = adminDoc || staffDoc || userDoc;
     if (profile) {
+      const isRootOwner =
+        cleanEmail === AUTHORIZED_SUPER_ADMIN_EMAIL ||
+        adminDoc?.role === 'LIFETIME_SUPER_ADMIN' ||
+        userDoc?.role === 'LIFETIME_SUPER_ADMIN' ||
+        userDoc?.role === 'SUPER_ADMIN';
       return {
         authenticated: true,
         uid,
@@ -1267,7 +1274,13 @@ export async function authenticateWithFirebaseOnColdStart(
           uid,
           email: cleanEmail,
           fullName: profile.fullName || data.displayName || cleanEmail.split('@')[0],
-          role: adminDoc ? 'ADMIN' : staffDoc ? 'STAFF' : userDoc?.role || 'STAFF',
+          role: isRootOwner
+            ? 'LIFETIME_SUPER_ADMIN'
+            : adminDoc
+            ? 'ADMIN'
+            : staffDoc
+            ? 'STAFF'
+            : userDoc?.role || 'STAFF',
         },
       };
     }

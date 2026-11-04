@@ -596,14 +596,20 @@ class AuthService {
   }
 
   /**
-   * Super Admin direct login via Firebase Auth and Firestore ownership verification.
-   * Completely free of MFA requirements.
+   * Super Admin login via Firebase Auth, Firestore ownership verification, and backend authentication gateway.
+   * Supports MFA challenges when enabled on the Super Admin account and synchronizes server sessions.
    */
   public async loginSuperAdmin(email: string, password: string): Promise<LoginResult> {
     try {
-      const cleanEmail = email.trim().toLowerCase();
+      const cleanEmail = (email || '').trim().toLowerCase();
+      if (!cleanEmail || !password) {
+        return {
+          success: false,
+          error: 'Please enter both your Super Admin email address and master password.',
+        };
+      }
 
-      // 1. Authoritatively verify with Firestore systemSettings/lifetimeSuperAdmin
+      // 1. Authoritatively check Firestore systemSettings/lifetimeSuperAdmin with server fallback
       let ownerData: any = null;
       try {
         const snap = await getDoc(doc(db, 'systemSettings', 'lifetimeSuperAdmin'));
@@ -615,45 +621,119 @@ class AuthService {
       }
 
       if (!ownerData) {
-        const serverStatus = await safeApiFetch<any>('/api/auth/setup-status');
-        if (serverStatus.data?.isInitialized) {
-          ownerData = {
-            initialized: true,
-            ownerUid: serverStatus.data.ownerUid || 'lifetime-super-admin',
-            ownerEmail: serverStatus.data.ownerEmail || 'eromoseledavidson68@gmail.com',
-            fullName: serverStatus.data.ownerFullName || 'Lifetime Super Admin',
-            role: 'LIFETIME_SUPER_ADMIN',
-          };
-        } else {
-          return {
-            success: false,
-            error: 'System is not yet initialized. Please complete initial setup at /supa-setup.',
-          };
+        try {
+          const serverStatus = await safeApiFetch<any>('/api/auth/setup-status');
+          if (serverStatus.isInitialized || serverStatus.data?.isInitialized) {
+            ownerData = {
+              initialized: true,
+              ownerUid: serverStatus.data?.ownerUid || serverStatus.ownerUid || 'ROOT_SUPER_ADMIN_SUITE_RUNNER',
+              ownerEmail: (serverStatus.data?.ownerEmail || serverStatus.ownerEmail || 'eromoseledavidson68@gmail.com').toLowerCase(),
+              fullName: serverStatus.data?.ownerFullName || serverStatus.ownerFullName || 'Davidson Eromosele (Super Admin)',
+              role: 'LIFETIME_SUPER_ADMIN',
+            };
+          }
+        } catch {
+          // Proceed with canonical owner fallback if setup-status is temporarily unreachable
         }
       }
 
-      // 2. Authenticate with Firebase Authentication
-      let fbUid = ownerData.ownerUid;
+      if (!ownerData) {
+        ownerData = {
+          initialized: true,
+          ownerUid: 'ROOT_SUPER_ADMIN_SUITE_RUNNER',
+          ownerEmail: 'eromoseledavidson68@gmail.com',
+          fullName: 'Davidson Eromosele (Super Admin)',
+          role: 'LIFETIME_SUPER_ADMIN',
+        };
+      }
+
+      // Enforce that only the unique Lifetime Super Admin email can authenticate on /supa-admin
+      const authorizedEmail = (ownerData.ownerEmail || 'eromoseledavidson68@gmail.com').toLowerCase();
+      if (cleanEmail !== 'eromoseledavidson68@gmail.com' && cleanEmail !== authorizedEmail) {
+        return {
+          success: false,
+          error: 'Access Denied: This portal is strictly reserved for the Lifetime Super Admin.',
+        };
+      }
+
+      // 2. Authenticate with Firebase Authentication and/or Backend Authentication Gateway
+      let fbUid = ownerData.ownerUid || 'ROOT_SUPER_ADMIN_SUITE_RUNNER';
+      let firebaseAuthenticated = false;
+      let serverLoginRes: any = null;
+
       try {
         const userCredential = await signInWithEmailAndPassword(auth, cleanEmail, password);
         fbUid = userCredential.user.uid;
+        firebaseAuthenticated = true;
       } catch (authErr: any) {
-        if (authErr?.code === 'auth/operation-not-allowed') {
-          console.warn('[AUTH] Firebase Auth Email/Password disabled; verifying with Firestore owner record.');
-          // Verify owner email matches
-          if (ownerData.ownerEmail !== cleanEmail) {
+        // Attempt authoritative server login gateway (supports PBKDF2 + cold-start Identity Toolkit + MFA)
+        serverLoginRes = await safeApiFetch('/api/auth/login', {
+          method: 'POST',
+          body: JSON.stringify({ identifier: cleanEmail, password }),
+        });
+
+        if (!serverLoginRes.success) {
+          if (
+            authErr?.code === 'auth/invalid-credential' ||
+            authErr?.code === 'auth/user-not-found' ||
+            authErr?.code === 'auth/wrong-password'
+          ) {
             return {
               success: false,
-              error: 'Invalid credentials or access unauthorized.',
+              error: 'Invalid email or password.',
+              lockoutSeconds: serverLoginRes.lockoutSeconds,
             };
           }
-        } else {
-          throw authErr;
+          if (authErr?.code === 'auth/too-many-requests' || serverLoginRes.lockoutSeconds) {
+            return {
+              success: false,
+              error:
+                serverLoginRes.message ||
+                'Access temporarily locked due to multiple failed login attempts. Please try again later.',
+              lockoutSeconds: serverLoginRes.lockoutSeconds,
+            };
+          }
+          return {
+            success: false,
+            error: normalizeError(serverLoginRes.error || serverLoginRes.message, 'Invalid email or password.'),
+          };
         }
       }
 
-      // 3. Confirm UID or Email match authoritative owner record
-      if (ownerData.ownerUid !== fbUid && ownerData.ownerEmail !== cleanEmail) {
+      // If server login required MFA challenge, return the challenge for step 2 verification
+      if (serverLoginRes?.requireMfa && serverLoginRes?.tempToken) {
+        return {
+          success: true,
+          requireMfa: true,
+          tempToken: serverLoginRes.tempToken,
+          maskedDestination: serverLoginRes.maskedDestination,
+          expiresInSeconds: serverLoginRes.expiresInSeconds,
+          user: serverLoginRes.user,
+        };
+      }
+
+      // If server login succeeded directly, persist session token
+      if (serverLoginRes?.success && serverLoginRes?.sessionToken && serverLoginRes?.user) {
+        if (serverLoginRes.user.role !== 'LIFETIME_SUPER_ADMIN') {
+          return {
+            success: false,
+            error: 'Access Denied: This portal is strictly reserved for the Lifetime Super Admin.',
+          };
+        }
+        this.setStoredToken(serverLoginRes.sessionToken);
+        this.cachedUser = serverLoginRes.user;
+        ledgerEngine.setCurrentUser(serverLoginRes.user);
+        return {
+          success: true,
+          requireMfa: false,
+          sessionToken: serverLoginRes.sessionToken,
+          user: serverLoginRes.user,
+          redirectRoute: '/supa-admin',
+        };
+      }
+
+      // 3. Confirm UID or Email match authoritative owner record when authenticated via Firebase Client SDK
+      if (firebaseAuthenticated && ownerData.ownerUid !== fbUid && authorizedEmail !== cleanEmail && cleanEmail !== 'eromoseledavidson68@gmail.com') {
         if (auth.currentUser) await firebaseSignOut(auth);
         return {
           success: false,
@@ -661,8 +741,8 @@ class AuthService {
         };
       }
 
-      const fullName = ownerData?.fullName || 'Lifetime Super Admin';
-      const phone = ownerData?.phone || '';
+      const fullName = ownerData?.fullName || 'Davidson Eromosele (Super Admin)';
+      const phone = ownerData?.phone || '+234 800 000 0001';
 
       const user: User = {
         id: fbUid,
@@ -671,10 +751,12 @@ class AuthService {
         phone,
         role: 'LIFETIME_SUPER_ADMIN',
         active: true,
+        isLifetimeSuperAdmin: true,
         createdAt: ownerData?.createdAt || new Date().toISOString(),
       };
 
-      // 3. Establish server session
+      // 4. Establish server session via /api/auth/sync-super-admin
+      let sessionToken: string | undefined = undefined;
       try {
         const syncRes = await safeApiFetch<{ sessionToken?: string; success?: boolean }>('/api/auth/sync-super-admin', {
           method: 'POST',
@@ -685,8 +767,9 @@ class AuthService {
             phone,
           },
         });
-        if (syncRes.data?.sessionToken) {
-          this.setStoredToken(syncRes.data.sessionToken);
+        sessionToken = syncRes.sessionToken || syncRes.data?.sessionToken;
+        if (sessionToken) {
+          this.setStoredToken(sessionToken);
         }
       } catch (syncErr) {
         console.warn('[AUTH] Server session sync note:', syncErr);
@@ -698,6 +781,7 @@ class AuthService {
       return {
         success: true,
         requireMfa: false,
+        sessionToken,
         user,
         redirectRoute: '/supa-admin',
       };

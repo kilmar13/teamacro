@@ -5,6 +5,7 @@
 
 import { normalizeError } from '../src/utils/errorNormalizer';
 import { safeApiFetch } from '../src/utils/apiClient';
+import { computeTotpCode } from '../src/server/totp';
 
 const BASE_URL = 'http://localhost:3000';
 
@@ -27,6 +28,28 @@ async function runAcceptanceSuite() {
   console.log('TEAMACRO SERVICES LTD — PROTOCOL & VERCEL ROUTE TEST SUITE');
   console.log('================================================================\n');
 
+  // 0a. Public /home loads
+  const homeRes = await fetch(`${BASE_URL}/home`);
+  const homeHtml = await homeRes.text();
+  const homeOk = homeRes.status === 200 && homeHtml.includes('<div id="root">');
+  record(
+    'Public /home loads',
+    'Frontend Routing',
+    homeOk ? 'PASS' : 'FAIL',
+    `GET /home -> Status ${homeRes.status} (${homeHtml.length} bytes)`
+  );
+
+  // 0b. /supa-admin login page loads
+  const supaPageRes = await fetch(`${BASE_URL}/supa-admin`);
+  const supaPageHtml = await supaPageRes.text();
+  const supaPageOk = supaPageRes.status === 200 && supaPageHtml.includes('<div id="root">');
+  record(
+    '/supa-admin login page loads',
+    'Frontend Routing',
+    supaPageOk ? 'PASS' : 'FAIL',
+    `GET /supa-admin -> Status ${supaPageRes.status} (${supaPageHtml.length} bytes)`
+  );
+
   // Authenticate Lifetime Super Admin
   const rootSyncRes = await fetch(`${BASE_URL}/api/auth/sync-super-admin`, {
     method: 'POST',
@@ -45,6 +68,38 @@ async function runAcceptanceSuite() {
     console.error('Cannot proceed without Super Admin token');
     process.exit(1);
   }
+
+  const supaCredsOk =
+    rootSyncRes.status === 200 &&
+    rootData.success === true &&
+    rootData.user?.email === 'eromoseledavidson68@gmail.com' &&
+    rootData.user?.role === 'LIFETIME_SUPER_ADMIN';
+  record(
+    'Valid Super Admin credentials are processed without server error',
+    'Super Admin Authentication',
+    supaCredsOk ? 'PASS' : 'FAIL',
+    `Status ${rootSyncRes.status}, email=${rootData.user?.email}, role=${rootData.user?.role}`
+  );
+
+  const supaDashRes = await fetch(`${BASE_URL}/api/auth/authorize-route`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${superAdminToken}`,
+    },
+    body: JSON.stringify({ route: '/supa-admin' }),
+  });
+  const supaDashData = await supaDashRes.json();
+  const supaDashOk =
+    supaDashRes.status === 200 &&
+    supaDashData.allowed === true &&
+    supaDashData.user?.role === 'LIFETIME_SUPER_ADMIN';
+  record(
+    'Existing Super Admin can access the dashboard',
+    'Super Admin Authorization',
+    supaDashOk ? 'PASS' : 'FAIL',
+    `POST /api/auth/authorize-route (/supa-admin) -> Status ${supaDashRes.status}, allowed=${supaDashData.allowed}`
+  );
 
   // 1. 201 Staff creation (Authorized Lifetime Super Admin)
   const testStaffEmail = `staff_protocol_${Date.now()}@teamacro.ng`;
@@ -157,6 +212,116 @@ async function runAcceptanceSuite() {
     'Authentication',
     adminLoginOk ? 'PASS' : 'FAIL',
     `Status ${adminLoginRes.status}, role=${adminLoginData.user?.role}, redirect=${adminLoginData.redirectRoute}`
+  );
+
+  // 4b. Admin cannot access Super Admin portal (/supa-admin)
+  const adminToSupaRes = await fetch(`${BASE_URL}/api/auth/authorize-route`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminSessionToken}`,
+    },
+    body: JSON.stringify({ route: '/supa-admin' }),
+  });
+  const adminToSupaData = await adminToSupaRes.json();
+  const adminToSupaOk = adminToSupaRes.status === 403 && adminToSupaData.allowed === false;
+  record(
+    'Admin cannot access Super Admin portal',
+    'Authorization',
+    adminToSupaOk ? 'PASS' : 'FAIL',
+    `Admin accessing /supa-admin -> Status ${adminToSupaRes.status}, allowed=${adminToSupaData.allowed}`
+  );
+
+  // 4c. Staff cannot access Super Admin portal (/supa-admin)
+  const staffToSupaRes = await fetch(`${BASE_URL}/api/auth/authorize-route`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${staffSessionToken}`,
+    },
+    body: JSON.stringify({ route: '/supa-admin' }),
+  });
+  const staffToSupaData = await staffToSupaRes.json();
+  const staffToSupaOk = staffToSupaRes.status === 403 && staffToSupaData.allowed === false;
+  record(
+    'Staff cannot access Super Admin portal',
+    'Authorization',
+    staffToSupaOk ? 'PASS' : 'FAIL',
+    `Staff accessing /supa-admin -> Status ${staffToSupaRes.status}, allowed=${staffToSupaData.allowed}`
+  );
+
+  // 4d. Invalid MFA codes rejected cleanly & Valid MFA completes authentication
+  const mfaSetupRes = await fetch(`${BASE_URL}/api/auth/mfa/setup`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminSessionToken}`,
+    },
+  });
+  const mfaSetupData = await mfaSetupRes.json();
+  const mfaSecret = mfaSetupData.secret;
+  const currentStep = Math.floor(Date.now() / 1000 / 30);
+  const setupTotpCode = computeTotpCode(mfaSecret, currentStep - 1);
+
+  const mfaConfirmRes = await fetch(`${BASE_URL}/api/auth/mfa/confirm`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${adminSessionToken}`,
+    },
+    body: JSON.stringify({ code: setupTotpCode }),
+  });
+  const mfaConfirmData = await mfaConfirmRes.json();
+
+  const mfaLoginTriggerRes = await fetch(`${BASE_URL}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      identifier: testAdminEmail,
+      password: adminPassword,
+    }),
+  });
+  const mfaLoginTriggerData = await mfaLoginTriggerRes.json();
+  const challengeToken = mfaLoginTriggerData.challengeToken;
+
+  const badMfaRes = await fetch(`${BASE_URL}/api/auth/verify-mfa`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      challengeToken,
+      code: '000000',
+    }),
+  });
+  const badMfaData = await badMfaRes.json();
+  const badMfaOk = badMfaRes.status === 401 && badMfaData.success === false;
+  record(
+    'Invalid MFA codes are rejected cleanly',
+    'MFA Security',
+    badMfaOk ? 'PASS' : 'FAIL',
+    `POST /api/auth/verify-mfa (bad code) -> Status ${badMfaRes.status}, message="${badMfaData.message}"`
+  );
+
+  const validTotpCode = computeTotpCode(mfaSecret, currentStep);
+  const goodMfaRes = await fetch(`${BASE_URL}/api/auth/verify-mfa`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      challengeToken,
+      code: validTotpCode,
+    }),
+  });
+  const goodMfaData = await goodMfaRes.json();
+  const goodMfaOk =
+    mfaConfirmData.success === true &&
+    mfaLoginTriggerData.mfaRequired === true &&
+    goodMfaRes.status === 200 &&
+    goodMfaData.success === true &&
+    Boolean(goodMfaData.sessionToken);
+  record(
+    'Valid MFA completes authentication',
+    'MFA Security',
+    goodMfaOk ? 'PASS' : 'FAIL',
+    `POST /api/auth/verify-mfa (valid TOTP) -> Status ${goodMfaRes.status}, session issued=${Boolean(goodMfaData.sessionToken)}`
   );
 
   // 5. 401 no token on Create Staff & Create Admin
@@ -650,18 +815,30 @@ async function runAcceptanceSuite() {
     `Payload role override ignored; server-authoritative token enforced. Status ${spoofRes.status}`
   );
 
-  // 22. Operator session remains intact after Staff & Admin creation
+  // 22. Operator session & Existing accounts and records remain intact
   const operatorCheck = await fetch(`${BASE_URL}/api/auth/session`, {
     headers: { Authorization: `Bearer ${superAdminToken}` },
   });
   const operatorData = await operatorCheck.json();
+  const accountsListRes = await fetch(`${BASE_URL}/api/auth/accounts`, {
+    headers: { Authorization: `Bearer ${superAdminToken}` },
+  });
+  const accountsListData = await accountsListRes.json();
+  const hasLifetimeSuperAdmin =
+    Array.isArray(accountsListData.accounts) &&
+    accountsListData.accounts.some(
+      (a: any) => a.email === 'eromoseledavidson68@gmail.com' && a.role === 'LIFETIME_SUPER_ADMIN'
+    );
   const operatorOk =
-    operatorCheck.status === 200 && operatorData.user?.role === 'LIFETIME_SUPER_ADMIN';
+    operatorCheck.status === 200 &&
+    operatorData.user?.role === 'LIFETIME_SUPER_ADMIN' &&
+    accountsListRes.status === 200 &&
+    hasLifetimeSuperAdmin;
   record(
-    'Operator session remains intact',
-    'Session Integrity',
+    'Existing accounts and records remain intact',
+    'System Integrity',
     operatorOk ? 'PASS' : 'FAIL',
-    `Operator session intact: user=${operatorData.user?.email}, role=${operatorData.user?.role}`
+    `Operator session intact (${operatorData.user?.email}), total accounts=${accountsListData.accounts?.length}, Super Admin preserved=${hasLifetimeSuperAdmin}`
   );
 
   console.log('\n================================================================');
