@@ -3,8 +3,6 @@
  * Bundled into /api/index.js during `npm run build` so Vercel Node.js ESM
  * runtime executes a single self-contained module with zero relative-import crashes.
  */
-process.env.VERCEL = '1';
-
 import app from '../../server';
 
 export default async function handler(req: any, res: any) {

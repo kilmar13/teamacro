@@ -16,10 +16,19 @@ async function buildVercelApi() {
     define: {
       'process.env.VERCEL': '"1"',
     },
-    external: ['vite', 'firebase-admin', 'firebase-admin/app', 'firebase-admin/auth', 'firebase-admin/firestore'],
+    external: [
+      'vite',
+      'express',
+      'dotenv',
+      'firebase-admin',
+      'firebase-admin/app',
+      'firebase-admin/auth',
+      'firebase-admin/firestore',
+    ],
     banner: {
       js: [
-        '// Auto-generated self-contained Vercel Serverless Function bundle for TEAMACRO SERVICES LTD',
+        '// Auto-generated self-contained Vercel Serverless Function bundle for TEAMACRO SERVICES LTD (v2)',
+        'process.env.VERCEL = "1";',
         'import { createRequire as __createRequire } from "node:module";',
         'const require = __createRequire(import.meta.url);',
       ].join('\n'),
