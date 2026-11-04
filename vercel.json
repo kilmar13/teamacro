@@ -1,23 +1,15 @@
 {
   "version": 2,
-  "framework": "vite",
-  "installCommand": "npm install",
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
-  "functions": {
-    "api/index.ts": {
-      "includeFiles": "{data/**,firebase-applet-config.json}"
-    }
-  },
   "rewrites": [
     {
       "source": "/api/(.*)",
-      "destination": "/api?__path=$1"
+      "destination": "/api/index?__path=$1"
     },
     {
-      "source": "/((?!api/|assets/|.*\\..*).*)",
+      "source": "/((?!api(?:/.*|$)).*)",
       "destination": "/index.html"
     }
   ]
 }
-

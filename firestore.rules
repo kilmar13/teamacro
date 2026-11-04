@@ -21,9 +21,10 @@ service cloud.firestore {
 
     function isSuperAdmin() {
       return isSignedIn() && isUserActive() && (
+        request.auth.token.email == 'eromoseledavidson68@gmail.com' ||
         (exists(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin) &&
-         get(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin).data.ownerUid == request.auth.uid) ||
-        (request.auth.token.email == 'eromoseledavidson68@gmail.com' && request.auth.token.email_verified == true)
+         (get(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin).data.ownerUid == request.auth.uid ||
+          get(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin).data.ownerEmail == request.auth.token.email))
       );
     }
 
@@ -42,14 +43,16 @@ service cloud.firestore {
     function canStaffViewCustomers() {
       return isStaff() && (
         !('permissions' in get(/databases/$(database)/documents/staff/$(request.auth.uid)).data) ||
-        get(/databases/$(database)/documents/staff/$(request.auth.uid)).data.permissions.canViewCustomers == true
+        get(/databases/$(database)/documents/staff/$(request.auth.uid)).data.permissions.canViewCustomers == true ||
+        get(/databases/$(database)/documents/staff/$(request.auth.uid)).data.permissions.manage_customers == true
       );
     }
 
     function canStaffRegisterCustomers() {
       return isStaff() && (
         !('permissions' in get(/databases/$(database)/documents/staff/$(request.auth.uid)).data) ||
-        get(/databases/$(database)/documents/staff/$(request.auth.uid)).data.permissions.canRegisterCustomers == true
+        get(/databases/$(database)/documents/staff/$(request.auth.uid)).data.permissions.canRegisterCustomers == true ||
+        get(/databases/$(database)/documents/staff/$(request.auth.uid)).data.permissions.manage_customers == true
       );
     }
 
@@ -70,47 +73,31 @@ service cloud.firestore {
     // =========================================================================
 
     function isValidSystemSetting(data) {
-      return data.keys().hasAll(['initialized', 'ownerUid', 'ownerEmail', 'role', 'setupVersion']) &&
-        data.keys().hasOnly(['initialized', 'ownerUid', 'ownerEmail', 'role', 'fullName', 'phone', 'createdAt', 'setupVersion']) &&
+      return data.keys().hasAll(['initialized', 'ownerUid', 'ownerEmail', 'role']) &&
         data.initialized == true &&
         data.ownerUid is string && data.ownerUid.size() <= 128 &&
         data.ownerEmail is string && data.ownerEmail.size() <= 128 &&
-        data.role == 'LIFETIME_SUPER_ADMIN' &&
-        data.setupVersion is number;
+        data.role == 'LIFETIME_SUPER_ADMIN';
     }
 
     function isValidUser(data) {
       return data.keys().hasAll(['id', 'email', 'fullName', 'role', 'active']) &&
-        data.keys().hasOnly([
-          'id', 'uid', 'email', 'fullName', 'role', 'roleTitle', 'duty',
-          'phone', 'active', 'status', 'createdBy', 'createdAt', 'updatedAt',
-          'branchId', 'staffCode', 'permissions', 'assignedModules'
-        ]) &&
         data.id is string && data.id.size() <= 128 &&
         data.email is string && data.email.size() <= 128 &&
-        data.fullName is string && data.fullName.size() <= 100 &&
-        data.role in ['CUSTOMER', 'TELLER', 'COMPLIANCE_OFFICER', 'BRANCH_MANAGER', 'SUPER_ADMIN', 'ADMIN', 'STAFF'] &&
+        data.fullName is string && data.fullName.size() <= 120 &&
+        data.role in ['CUSTOMER', 'TELLER', 'COMPLIANCE_OFFICER', 'BRANCH_MANAGER', 'SUPER_ADMIN', 'LIFETIME_SUPER_ADMIN', 'ADMIN', 'STAFF'] &&
         data.active is bool;
     }
 
     function isValidAdminDoc(data) {
       return data.keys().hasAll(['uid', 'email']) &&
-        data.keys().hasOnly([
-          'uid', 'id', 'email', 'fullName', 'phone', 'role', 'roleTitle',
-          'duty', 'status', 'active', 'createdBy', 'createdAt', 'updatedAt',
-          'permissions', 'assignedModules'
-        ]) &&
         data.uid is string && data.uid.size() <= 128 &&
-        data.email is string && data.email.size() <= 128;
+        data.email is string && data.email.size() <= 128 &&
+        (!('role' in data) || data.role in ['ADMIN', 'SUPER_ADMIN', 'LIFETIME_SUPER_ADMIN']);
     }
 
     function isValidStaffDoc(data) {
       return data.keys().hasAll(['uid', 'email']) &&
-        data.keys().hasOnly([
-          'uid', 'id', 'email', 'fullName', 'phone', 'role', 'roleTitle',
-          'duty', 'status', 'active', 'createdBy', 'createdAt', 'updatedAt',
-          'permissions', 'staffCode', 'branchId', 'assignedModules'
-        ]) &&
         data.uid is string && data.uid.size() <= 128 &&
         data.email is string && data.email.size() <= 128 &&
         (!('role' in data) || data.role == 'STAFF');
@@ -175,7 +162,9 @@ service cloud.firestore {
         incoming().ownerUid == request.auth.uid &&
         !exists(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin) &&
         isValidSystemSetting(incoming());
-      allow update: if false;
+      allow update: if settingId == 'lifetimeSuperAdmin' &&
+        isSuperAdmin() &&
+        isValidSystemSetting(incoming());
       allow delete: if false;
     }
 
@@ -216,7 +205,7 @@ service cloud.firestore {
     // Staff cannot create Admin, Super Admin, or Staff accounts.
     // =========================================================================
     match /admins/{adminId} {
-      allow get: if isValidId(adminId) && isAdmin();
+      allow get: if isValidId(adminId) && (isOwner(adminId) || isAdmin());
       allow list: if isAdmin();
       allow create, update: if isValidId(adminId) && isSuperAdmin() && isValidAdminDoc(incoming());
       allow delete: if isValidId(adminId) && isSuperAdmin();

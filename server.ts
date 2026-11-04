@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
-import { serverAuthManager, UserSession } from './src/server/authManager.js';
+import { serverAuthManager, UserSession } from './src/server/authManager';
 import {
   verifyFirebaseIdToken,
   provisionFirebaseAuthAccount,
@@ -12,7 +12,7 @@ import {
   listFirestoreCollection,
   authenticateWithFirebaseOnColdStart,
   logStructuredServerError,
-} from './src/server/firebaseAdmin.js';
+} from './src/server/firebaseAdmin';
 
 // ============================================================================
 // 0. PROCESS-LEVEL STABILITY GUARDS (PREVENT UNEXPECTED CONNECTION CLOSURES)

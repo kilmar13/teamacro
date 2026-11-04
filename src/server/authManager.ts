@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { generateTotpSecret, computeTotpCode, verifyTotpCode, generateRecoveryCodes } from './totp.js';
+import { generateTotpSecret, computeTotpCode, verifyTotpCode, generateRecoveryCodes } from './totp';
 
 export type UserRole =
   | 'LIFETIME_SUPER_ADMIN'
