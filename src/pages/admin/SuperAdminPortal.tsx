@@ -294,7 +294,11 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
             if (!existingIds.has(acc.id) && !existingEmails.has(acc.email.toLowerCase()) && acc.role !== 'CUSTOMER') {
               extra.push({
                 id: acc.id,
-                staffCode: acc.id.startsWith('STAFF_ADM_') ? `TMC-ADM-${acc.id.slice(-4)}` : `TMC-STF-${acc.id.slice(-4)}`,
+                staffCode:
+                  acc.staffCode ||
+                  (acc.role === 'ADMIN' || acc.id.startsWith('STAFF_ADM_')
+                    ? `TMC-ADM-${acc.id.slice(-4).toUpperCase()}`
+                    : `TMC-STF-${acc.id.slice(-4).toUpperCase()}`),
                 fullName: acc.fullName,
                 email: acc.email,
                 phone: acc.phone || '',
@@ -825,13 +829,15 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
   };
 
   // Handle Revoke Admin Role
-  const handleRevokeAdmin = (adminId: string, adminName: string) => {
-    if (!window.confirm(`Are you certain you wish to revoke Admin privileges from ${adminName}? Their role will be demoted to ordinary STAFF.`)) {
-      return;
-    }
+  const handleRevokeAdmin = async (adminId: string, adminName: string) => {
     setStaffActionMsg(null);
     try {
-      ledgerEngine.revokeAdminRole(adminId, currentActor);
+      await authService.revokeAdminRole(adminId);
+      try {
+        ledgerEngine.revokeAdminRole(adminId, currentActor);
+      } catch {
+        // Non-fatal if only on server
+      }
       setStaffActionMsg({
         type: 'success',
         text: `Admin privileges for ${adminName} have been revoked. Role demoted to ordinary Staff.`,
@@ -846,21 +852,30 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
   };
 
   // Handle Toggle Status (Active / Suspended)
-  const handleToggleStaffStatus = (staff: StaffUser) => {
+  const handleToggleStaffStatus = async (staff: StaffUser) => {
     if (staff.isLifetimeSuperAdmin) {
-      alert('The Lifetime Super Admin cannot be suspended or demoted.');
+      setStaffActionMsg({
+        type: 'error',
+        text: 'The Lifetime Super Admin cannot be suspended or demoted.',
+      });
       return;
     }
     const newStatus = staff.status === 'active' ? 'suspended' : 'active';
-    const verb = newStatus === 'active' ? 'reactivate' : 'suspend';
-    if (!window.confirm(`Are you sure you want to ${verb} ${staff.fullName}?`)) return;
 
     try {
-      if (staff.role === 'ADMIN') {
-        ledgerEngine.updateAdminStatus(staff.id, newStatus, currentActor);
-      } else {
-        ledgerEngine.updateStaffUser(staff.id, { status: newStatus }, currentActor);
+      await authService.toggleAccountStatus(staff.id, newStatus, staff.role);
+      try {
+        if (staff.role === 'ADMIN') {
+          ledgerEngine.updateAdminStatus(staff.id, newStatus, currentActor);
+        } else {
+          ledgerEngine.updateStaffUser(staff.id, { status: newStatus }, currentActor);
+        }
+      } catch {
+        // Non-fatal if account exists on server/Firestore
       }
+      setStaffDirectory((prev) =>
+        prev.map((s) => (s.id === staff.id ? { ...s, status: newStatus } : s))
+      );
       setStaffActionMsg({
         type: 'success',
         text: `Account for ${staff.fullName} has been set to ${newStatus.toUpperCase()}.`,

@@ -846,10 +846,21 @@ class AuthService {
    * Update Granular Account Permissions
    */
   public async updatePermissions(targetUserId: string, permissions: Record<string, boolean>): Promise<{ success: boolean; message?: string; error?: string }> {
+    await this.ensureSuperAdminSession();
     const res = await safeApiFetch('/api/auth/access/update-permissions', {
       method: 'POST',
       body: JSON.stringify({ targetUserId, permissions }),
     });
+
+    if (targetUserId) {
+      try {
+        await setDoc(doc(db, 'users', targetUserId), { permissions }, { merge: true }).catch(() => {});
+        await setDoc(doc(db, 'staff', targetUserId), { permissions }, { merge: true }).catch(() => {});
+        await setDoc(doc(db, 'admins', targetUserId), { permissions }, { merge: true }).catch(() => {});
+      } catch {
+        // Non-fatal
+      }
+    }
 
     if (!res.success) {
       return {
@@ -862,6 +873,80 @@ class AuthService {
     return {
       success: true,
       message: res.message || 'Permissions updated successfully.',
+    };
+  }
+
+  /**
+   * Toggle Account Status (Active / Suspended / Inactive) on Server & Firestore
+   */
+  public async toggleAccountStatus(
+    targetUserId: string,
+    status: 'active' | 'suspended' | 'inactive',
+    role?: string
+  ): Promise<{ success: boolean; message?: string; error?: string }> {
+    await this.ensureSuperAdminSession();
+    const res = await safeApiFetch('/api/auth/toggle-status', {
+      method: 'POST',
+      body: JSON.stringify({ targetUserId, status }),
+    });
+
+    if (targetUserId) {
+      const isActive = status === 'active';
+      try {
+        await setDoc(doc(db, 'users', targetUserId), { status, active: isActive }, { merge: true }).catch(() => {});
+        if (role === 'ADMIN') {
+          await setDoc(doc(db, 'admins', targetUserId), { status, active: isActive }, { merge: true }).catch(() => {});
+        } else {
+          await setDoc(doc(db, 'staff', targetUserId), { status, active: isActive }, { merge: true }).catch(() => {});
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    if (!res.success) {
+      return {
+        success: false,
+        message: res.message || res.error || 'Failed to update account status.',
+        error: res.error || res.message || 'Failed to update account status.',
+      };
+    }
+
+    return {
+      success: true,
+      message: res.message || 'Account status updated successfully.',
+    };
+  }
+
+  /**
+   * Revoke Admin Privileges on Server & Firestore
+   */
+  public async revokeAdminRole(targetUserId: string): Promise<{ success: boolean; message?: string; error?: string }> {
+    await this.ensureSuperAdminSession();
+    const res = await safeApiFetch('/api/auth/revoke-admin', {
+      method: 'POST',
+      body: JSON.stringify({ targetUserId }),
+    });
+
+    if (targetUserId) {
+      try {
+        await setDoc(doc(db, 'users', targetUserId), { role: 'STAFF', roleTitle: 'Field Officer' }, { merge: true }).catch(() => {});
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    if (!res.success) {
+      return {
+        success: false,
+        message: res.message || res.error || 'Failed to revoke administrator role.',
+        error: res.error || res.message || 'Failed to revoke administrator role.',
+      };
+    }
+
+    return {
+      success: true,
+      message: res.message || 'Administrator privileges revoked successfully.',
     };
   }
 

@@ -1378,6 +1378,65 @@ app.post('/api/auth/access/give-access', apiHandler(async (req: Request, res: Re
 }));
 
 /**
+ * Helper to extract caller Firebase ID token if present on request headers
+ */
+function extractCallerFirebaseToken(req: Request): string | undefined {
+  if (typeof req.headers['x-firebase-token'] === 'string' && req.headers['x-firebase-token'].trim()) {
+    return req.headers['x-firebase-token'].trim();
+  }
+  if (
+    req.headers.authorization?.startsWith('Bearer ') &&
+    req.headers.authorization.split('.').length === 3
+  ) {
+    return req.headers.authorization.substring(7).trim();
+  }
+  return undefined;
+}
+
+/**
+ * Hydrate an Admin or Staff account from Firestore into serverAuthManager if a stateless
+ * Vercel serverless instance cold-started and does not yet have the account in memory.
+ */
+async function ensureAccountHydratedFromFirestore(
+  targetUserId: string,
+  callerFbToken?: string
+): Promise<void> {
+  if (!targetUserId) return;
+  if (serverAuthManager.findAccountByIdentifier(targetUserId)) return;
+
+  try {
+    const [userDoc, adminDoc, staffDoc] = await withServerTimeout(
+      Promise.all([
+        readFirestoreDocument('users', targetUserId, callerFbToken),
+        readFirestoreDocument('admins', targetUserId, callerFbToken),
+        readFirestoreDocument('staff', targetUserId, callerFbToken),
+      ]),
+      2500
+    );
+    const merged = { ...(userDoc || {}), ...(staffDoc || {}), ...(adminDoc || {}) };
+    if (merged && merged.email) {
+      const role =
+        adminDoc || merged.role === 'ADMIN'
+          ? 'ADMIN'
+          : 'STAFF';
+      serverAuthManager.syncProvisionedAccount({
+        id: String(merged.uid || merged.id || targetUserId),
+        email: String(merged.email),
+        fullName: String(merged.fullName || merged.email),
+        phone: String(merged.phone || '+234 800 000 0000'),
+        role,
+        roleTitle: String(merged.roleTitle || merged.duty || (role === 'ADMIN' ? 'Executive Administrator' : 'Operations Officer')),
+        duty: String(merged.duty || merged.roleTitle || (role === 'ADMIN' ? 'Executive Administrator' : 'Operations Officer')),
+        staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
+        status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
+      });
+    }
+  } catch {
+    // Non-fatal if Firestore lookup times out
+  }
+}
+
+/**
  * POST /api/auth/access/update-permissions
  * Lifetime Super Admin configures granular permissions for an Admin or Staff account.
  */
@@ -1392,6 +1451,11 @@ app.post('/api/auth/access/update-permissions', apiHandler(async (req: Request, 
   }
 
   const { targetUserId, permissions } = req.body || {};
+  const callerFbToken = extractCallerFirebaseToken(req);
+  if (targetUserId) {
+    await ensureAccountHydratedFromFirestore(String(targetUserId), callerFbToken);
+  }
+
   const result = serverAuthManager.updateUserPermissions(session, targetUserId, permissions);
 
   if (!result.success) {
@@ -1400,6 +1464,28 @@ app.post('/api/auth/access/update-permissions', apiHandler(async (req: Request, 
       message: result.error || 'Failed to update permissions.',
       error: result.error,
     });
+  }
+
+  const updatedAcc = serverAuthManager.findAccountByIdentifier(String(targetUserId));
+  if (updatedAcc && (updatedAcc.role === 'ADMIN' || updatedAcc.role === 'STAFF')) {
+    await withServerTimeout(
+      writeFirestoreUserProfile({
+        uid: updatedAcc.id,
+        email: updatedAcc.email,
+        fullName: updatedAcc.fullName,
+        phone: updatedAcc.phone,
+        role: updatedAcc.role === 'ADMIN' ? 'ADMIN' : 'STAFF',
+        roleTitle: updatedAcc.roleTitle,
+        duty: updatedAcc.duty || updatedAcc.roleTitle,
+        status: updatedAcc.status === 'active' ? 'active' : 'suspended',
+        createdBy: updatedAcc.createdBy || session.email,
+        createdAt: updatedAcc.createdAt || new Date().toISOString(),
+        staffCode: updatedAcc.staffCode,
+        permissions: updatedAcc.permissions as unknown as Record<string, boolean>,
+        callerIdToken: callerFbToken,
+      }),
+      2500
+    ).catch(() => {});
   }
 
   return res.status(200).json(
@@ -1561,12 +1647,7 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
 
   // 3. Synchronize Admin profile to Cloud Firestore (/users/{uid} and /admins/{uid})
   const acct = result.account;
-  const callerFbToken =
-    typeof req.headers['x-firebase-token'] === 'string'
-      ? req.headers['x-firebase-token'].trim()
-      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
-      ? req.headers.authorization.substring(7).trim()
-      : undefined;
+  const callerFbToken = extractCallerFirebaseToken(req);
 
   const firestoreResult = await withServerTimeout(
     writeFirestoreUserProfile({
@@ -1580,6 +1661,7 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
       status: 'active',
       createdBy: session.email,
       createdAt: acct.createdAt || new Date().toISOString(),
+      staffCode: acct.staffCode,
       permissions: acct.permissions as unknown as Record<string, boolean>,
       callerIdToken: callerFbToken,
     }),
@@ -1756,12 +1838,7 @@ app.get('/api/auth/accounts', apiHandler(async (req: Request, res: Response) => 
     });
   }
 
-  const callerFbToken =
-    typeof req.headers['x-firebase-token'] === 'string'
-      ? req.headers['x-firebase-token'].trim()
-      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
-      ? req.headers.authorization.substring(7).trim()
-      : undefined;
+  const callerFbToken = extractCallerFirebaseToken(req);
 
   // Hydrate any Admin/Staff profiles stored in Firestore so cold-started serverless instances return the full directory
   try {
@@ -1783,6 +1860,7 @@ app.get('/api/auth/accounts', apiHandler(async (req: Request, res: Response) => 
           role: 'ADMIN',
           roleTitle: String(adm.roleTitle || adm.duty || 'Executive Administrator'),
           duty: String(adm.duty || adm.roleTitle || 'Executive Administrator'),
+          staffCode: adm.staffCode ? String(adm.staffCode) : undefined,
           status: adm.active === false || adm.status === 'suspended' ? 'suspended' : 'active',
         });
       }
@@ -1831,6 +1909,11 @@ app.post('/api/auth/revoke-admin', apiHandler(async (req: Request, res: Response
   }
 
   const { targetUserId } = req.body || {};
+  const callerFbToken = extractCallerFirebaseToken(req);
+  if (targetUserId) {
+    await ensureAccountHydratedFromFirestore(String(targetUserId), callerFbToken);
+  }
+
   const result = serverAuthManager.revokeAdminRole(session, targetUserId);
   if (!result.success) {
     return res.status(403).json({
@@ -1838,6 +1921,28 @@ app.post('/api/auth/revoke-admin', apiHandler(async (req: Request, res: Response
       message: result.error || 'Failed to revoke administrator role.',
       error: result.error,
     });
+  }
+
+  const updatedAcc = serverAuthManager.findAccountByIdentifier(String(targetUserId));
+  if (updatedAcc) {
+    await withServerTimeout(
+      writeFirestoreUserProfile({
+        uid: updatedAcc.id,
+        email: updatedAcc.email,
+        fullName: updatedAcc.fullName,
+        phone: updatedAcc.phone,
+        role: 'STAFF',
+        roleTitle: updatedAcc.roleTitle,
+        duty: updatedAcc.duty || updatedAcc.roleTitle,
+        status: updatedAcc.status === 'active' ? 'active' : 'suspended',
+        createdBy: updatedAcc.createdBy || session.email,
+        createdAt: updatedAcc.createdAt || new Date().toISOString(),
+        staffCode: updatedAcc.staffCode,
+        permissions: updatedAcc.permissions as unknown as Record<string, boolean>,
+        callerIdToken: callerFbToken,
+      }),
+      2500
+    ).catch(() => {});
   }
 
   return res.status(200).json(
@@ -1853,10 +1958,10 @@ app.post('/api/auth/revoke-admin', apiHandler(async (req: Request, res: Response
 }));
 
 /**
- * POST /api/auth/toggle-status
- * Server-verified account suspension/reactivation.
+ * Shared handler for server-verified account suspension/reactivation
+ * (used by POST /api/auth/toggle-status, POST /api/super-admin/toggle-status, PATCH /api/super-admin/accounts/:id/status)
  */
-app.post('/api/auth/toggle-status', apiHandler(async (req: Request, res: Response) => {
+const handleToggleAccountStatus = apiHandler(async (req: Request, res: Response) => {
   const session = await authenticateRequest(req);
   if (!session) {
     return res.status(401).json({
@@ -1866,14 +1971,49 @@ app.post('/api/auth/toggle-status', apiHandler(async (req: Request, res: Respons
     });
   }
 
-  const { targetUserId, status } = req.body || {};
-  const result = serverAuthManager.updateAccountStatus(session, targetUserId, status);
+  const targetUserId = req.params?.id || req.body?.targetUserId || req.body?.userId || req.body?.id;
+  const status = req.body?.status;
+
+  if (!targetUserId || !status) {
+    return res.status(400).json({
+      success: false,
+      message: 'targetUserId and status are required.',
+      error: 'MISSING_REQUIRED_FIELDS',
+    });
+  }
+
+  const callerFbToken = extractCallerFirebaseToken(req);
+  await ensureAccountHydratedFromFirestore(String(targetUserId), callerFbToken);
+
+  const result = serverAuthManager.updateAccountStatus(session, String(targetUserId), status);
   if (!result.success) {
     return res.status(403).json({
       success: false,
       message: result.error || 'Failed to update account status.',
       error: result.error,
     });
+  }
+
+  const updatedAcc = serverAuthManager.findAccountByIdentifier(String(targetUserId));
+  if (updatedAcc && (updatedAcc.role === 'ADMIN' || updatedAcc.role === 'STAFF')) {
+    await withServerTimeout(
+      writeFirestoreUserProfile({
+        uid: updatedAcc.id,
+        email: updatedAcc.email,
+        fullName: updatedAcc.fullName,
+        phone: updatedAcc.phone,
+        role: updatedAcc.role === 'ADMIN' ? 'ADMIN' : 'STAFF',
+        roleTitle: updatedAcc.roleTitle,
+        duty: updatedAcc.duty || updatedAcc.roleTitle,
+        status: updatedAcc.status === 'active' ? 'active' : 'suspended',
+        createdBy: updatedAcc.createdBy || session.email,
+        createdAt: updatedAcc.createdAt || new Date().toISOString(),
+        staffCode: updatedAcc.staffCode,
+        permissions: updatedAcc.permissions as unknown as Record<string, boolean>,
+        callerIdToken: callerFbToken,
+      }),
+      2500
+    ).catch(() => {});
   }
 
   return res.status(200).json(
@@ -1886,7 +2026,11 @@ app.post('/api/auth/toggle-status', apiHandler(async (req: Request, res: Respons
       true
     )
   );
-}));
+});
+
+app.post('/api/auth/toggle-status', handleToggleAccountStatus);
+app.post('/api/super-admin/toggle-status', handleToggleAccountStatus);
+app.patch('/api/super-admin/accounts/:id/status', handleToggleAccountStatus);
 
 /**
  * POST /api/financial/transfers/approve
