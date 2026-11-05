@@ -1,4 +1,4 @@
-import { initializeApp } from 'firebase/app';
+import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth } from 'firebase/auth';
 import {
   initializeFirestore,
@@ -55,8 +55,8 @@ if (typeof window !== 'undefined') {
   };
 }
 
-// Initialize Primary Firebase App
-const app = initializeApp(firebaseConfig);
+// Initialize or reuse the single Primary Firebase App instance
+const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 
 /**
  * Robust Firestore initialization:

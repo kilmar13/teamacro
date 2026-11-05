@@ -13,6 +13,7 @@ import {
   getFirestoreSystemOwnership,
   authenticateWithFirebaseOnColdStart,
   logStructuredServerError,
+  inspectFirebaseAdminEnvironment,
 } from './src/server/firebaseAdmin.js';
 
 // ============================================================================
@@ -47,53 +48,6 @@ function withServerTimeout<T>(promise: Promise<T>, timeoutMs = 1500): Promise<T>
 
 // Load environment variables from .env if present before resolving configuration
 dotenv.config();
-
-// Load Firebase configuration safely from environment variables or firebase-applet-config.json
-// without duplicating hardcoded API keys in server source code
-const firebaseConfig: {
-  projectId: string;
-  apiKey: string;
-  firestoreDatabaseId: string;
-  [key: string]: string;
-} = (() => {
-  let fileConfig: Record<string, string> = {};
-  try {
-    const cfgPath = path.resolve(process.cwd(), 'firebase-applet-config.json');
-    if (fs.existsSync(cfgPath)) {
-      fileConfig = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
-    }
-  } catch {
-    // Proceed with environment variables if config file cannot be read
-  }
-  return {
-    ...fileConfig,
-    projectId:
-      process.env.FIREBASE_PROJECT_ID ||
-      process.env.VITE_FIREBASE_PROJECT_ID ||
-      fileConfig.projectId ||
-      'teamacro-a1849',
-    appId:
-      process.env.FIREBASE_APP_ID ||
-      process.env.VITE_FIREBASE_APP_ID ||
-      fileConfig.appId ||
-      '1:419612802:web:82d48b940af93927734c9b',
-    apiKey:
-      process.env.FIREBASE_API_KEY ||
-      process.env.VITE_FIREBASE_API_KEY ||
-      fileConfig.apiKey ||
-      '',
-    authDomain:
-      process.env.FIREBASE_AUTH_DOMAIN ||
-      process.env.VITE_FIREBASE_AUTH_DOMAIN ||
-      fileConfig.authDomain ||
-      'teamacro-a1849.firebaseapp.com',
-    firestoreDatabaseId:
-      process.env.FIREBASE_FIRESTORE_DATABASE_ID ||
-      process.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID ||
-      fileConfig.firestoreDatabaseId ||
-      'ai-studio-teamacro-1c75b7f5-7b8e-4f90-9452-2820167e5d5a',
-  };
-})();
 
 const app = express();
 
@@ -413,12 +367,14 @@ app.get('/health', (_req: Request, res: Response) => {
 });
 
 app.get('/api/health', (_req: Request, res: Response) => {
+  const firebaseDiagnostics = inspectFirebaseAdminEnvironment();
   res.status(200).json({
     status: 'UP',
     service: 'TEAMACRO SERVICES LTD - Management Platform',
     rcNumber: 'RC-1589421',
     uptimeSeconds: Math.round(process.uptime()),
     timestamp: new Date().toISOString(),
+    firebaseAdmin: firebaseDiagnostics,
   });
 });
 

@@ -1444,6 +1444,7 @@ class ServerAuthManager {
     return (
       process.env.SESSION_SECRET ||
       process.env.ROOT_SETUP_SECRET ||
+      process.env.FIREBASE_SERVICE_ACCOUNT_KEY ||
       process.env.FIREBASE_PRIVATE_KEY ||
       'teamacro-a1849-authoritative-hmac-session-key-v1'
     );

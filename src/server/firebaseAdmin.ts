@@ -1,7 +1,4 @@
 import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { getApps, getApp, initializeApp, cert, App } from 'firebase-admin/app';
 import { getAuth, Auth } from 'firebase-admin/auth';
 import { getFirestore, Firestore } from 'firebase-admin/firestore';
@@ -23,6 +20,20 @@ export interface ServerFirebaseConfig {
   clientEmail?: string;
   privateKey?: string;
   hasAdminCredentials: boolean;
+  credentialSource: 'FIREBASE_SERVICE_ACCOUNT_KEY' | 'FIREBASE_ENV_PAIR' | 'NONE';
+}
+
+export interface FirebaseAdminEnvironmentReport {
+  projectId: string;
+  firestoreDatabaseId: string;
+  hasServiceAccountKeyEnv: boolean;
+  serviceAccountKeyValidJson: boolean;
+  hasAdminCredentials: boolean;
+  credentialSource: 'FIREBASE_SERVICE_ACCOUNT_KEY' | 'FIREBASE_ENV_PAIR' | 'NONE';
+  adminAppInitialized: boolean;
+  singletonAppCount: number;
+  missingEnvVars: string[];
+  recommendedVercelEnvVars: string[];
 }
 
 export interface StructuredErrorLog {
@@ -66,7 +77,7 @@ function redactSecrets(text: string): string {
   if (!text) return '';
   return text
     .replace(
-      /(password|initialPassword|accessCode|token|secret|privateKey|private_key|apiKey|mfaCode)["':=\s]+["']?([^"',\s}]+)["']?/gi,
+      /(password|initialPassword|accessCode|token|secret|privateKey|private_key|apiKey|mfaCode|FIREBASE_SERVICE_ACCOUNT_KEY)["':=\s]+["']?([^"',\s}]+)["']?/gi,
       '$1=[REDACTED]'
     )
     .replace(/Bearer\s+[A-Za-z0-9._~+/-]+=*/gi, 'Bearer [REDACTED]')
@@ -115,63 +126,107 @@ export function normalizePrivateKey(rawKey?: string): string | undefined {
 }
 
 /**
- * Resolves Firebase configuration across local development, Cloud Run, and Vercel serverless environments.
+ * Securely parses the service account JSON from the server-side `FIREBASE_SERVICE_ACCOUNT_KEY` environment variable.
+ * Never loads credentials from a local file path.
  */
-export function resolveServerFirebaseConfig(): ServerFirebaseConfig {
-  let fileConfig: Record<string, string> = {};
-  const candidatePaths: string[] = [path.resolve(process.cwd(), 'firebase-applet-config.json')];
-
-  try {
-    const currentDir = path.dirname(fileURLToPath(import.meta.url));
-    candidatePaths.push(
-      path.resolve(currentDir, '../../firebase-applet-config.json'),
-      path.resolve(currentDir, '../firebase-applet-config.json')
-    );
-  } catch {
-    // Ignore fileURLToPath resolution issues in bundled contexts
-  }
-
-  for (const cfgPath of candidatePaths) {
-    try {
-      if (fs.existsSync(cfgPath)) {
-        fileConfig = JSON.parse(fs.readFileSync(cfgPath, 'utf-8'));
-        break;
-      }
-    } catch {
-      // Try next candidate
-    }
-  }
-
-  let serviceAccountJson: Record<string, string> = {};
-  const rawServiceAccount =
+export function parseServiceAccountKeyFromEnv(): {
+  present: boolean;
+  validJson: boolean;
+  projectId?: string;
+  clientEmail?: string;
+  privateKey?: string;
+} {
+  const rawEnvValue =
     process.env.FIREBASE_SERVICE_ACCOUNT_KEY ||
     process.env.FIREBASE_SERVICE_ACCOUNT ||
-    process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
-  if (rawServiceAccount) {
-    try {
-      const decoded = rawServiceAccount.trim().startsWith('{')
-        ? rawServiceAccount.trim()
-        : Buffer.from(rawServiceAccount.trim(), 'base64').toString('utf-8');
-      serviceAccountJson = JSON.parse(decoded);
-    } catch (err) {
-      logStructuredServerError({
-        endpoint: 'SYSTEM_INIT',
-        operation: 'PARSE_SERVICE_ACCOUNT_JSON',
-        errorCategory: 'AUTH_ERROR',
-        firebaseErrorCode: 'app/invalid-credential',
-        statusCode: 500,
-        message: `FIREBASE_SERVICE_ACCOUNT_KEY is not valid JSON: ${(err as Error)?.message || 'parse error'}`,
-      });
-    }
+    '';
+
+  const trimmed = rawEnvValue.trim();
+  if (!trimmed) {
+    return { present: false, validJson: false };
   }
+
+  // Strictly reject local file paths (do not load credentials from disk)
+  if (
+    trimmed.endsWith('.json') ||
+    trimmed.startsWith('./') ||
+    trimmed.startsWith('../') ||
+    trimmed.startsWith('/') ||
+    /^[A-Za-z]:\\/.test(trimmed)
+  ) {
+    logStructuredServerError({
+      endpoint: 'SYSTEM_INIT',
+      operation: 'PARSE_SERVICE_ACCOUNT_JSON',
+      errorCategory: 'AUTH_ERROR',
+      firebaseErrorCode: 'app/invalid-credential',
+      statusCode: 500,
+      message:
+        'FIREBASE_SERVICE_ACCOUNT_KEY must contain the service account JSON string (or base64-encoded JSON), not a local file path.',
+    });
+    return { present: true, validJson: false };
+  }
+
+  try {
+    let candidate = trimmed;
+    if (
+      (candidate.startsWith('"') && candidate.endsWith('"')) ||
+      (candidate.startsWith("'") && candidate.endsWith("'"))
+    ) {
+      candidate = candidate.slice(1, -1).trim();
+    }
+
+    const jsonString = candidate.startsWith('{')
+      ? candidate
+      : Buffer.from(candidate, 'base64').toString('utf-8');
+
+    const parsed = JSON.parse(jsonString);
+    if (!parsed || typeof parsed !== 'object') {
+      return { present: true, validJson: false };
+    }
+
+    const projectId =
+      typeof parsed.project_id === 'string' && parsed.project_id.trim()
+        ? parsed.project_id.trim()
+        : undefined;
+    const clientEmail =
+      typeof parsed.client_email === 'string' && parsed.client_email.trim()
+        ? parsed.client_email.trim()
+        : undefined;
+    const privateKey = normalizePrivateKey(parsed.private_key);
+
+    return {
+      present: true,
+      validJson: Boolean(clientEmail && privateKey),
+      projectId,
+      clientEmail,
+      privateKey,
+    };
+  } catch (err) {
+    logStructuredServerError({
+      endpoint: 'SYSTEM_INIT',
+      operation: 'PARSE_SERVICE_ACCOUNT_JSON',
+      errorCategory: 'AUTH_ERROR',
+      firebaseErrorCode: 'app/invalid-credential',
+      statusCode: 500,
+      message: `FIREBASE_SERVICE_ACCOUNT_KEY is not valid JSON: ${(err as Error)?.message || 'parse error'}`,
+    });
+    return { present: true, validJson: false };
+  }
+}
+
+/**
+ * Resolves Firebase configuration strictly from server environment variables and preserved project constants.
+ * Never loads credentials from a local file path.
+ */
+export function resolveServerFirebaseConfig(): ServerFirebaseConfig {
+  const parsedKey = parseServiceAccountKeyFromEnv();
 
   const projectId =
     process.env.FIREBASE_PROJECT_ID ||
+    parsedKey.projectId ||
     process.env.VITE_FIREBASE_PROJECT_ID ||
     process.env.GCLOUD_PROJECT ||
     process.env.GOOGLE_CLOUD_PROJECT ||
-    serviceAccountJson.project_id ||
-    fileConfig.projectId ||
     DEFAULT_FIREBASE_PROJECT_ID;
 
   const rawDatabaseId =
@@ -179,49 +234,56 @@ export function resolveServerFirebaseConfig(): ServerFirebaseConfig {
     process.env.FIREBASE_DATABASE_ID ||
     process.env.FIRESTORE_DATABASE_ID ||
     process.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID ||
-    fileConfig.firestoreDatabaseId ||
     DEFAULT_FIRESTORE_DATABASE_ID;
 
-  // Guard against '(default)' on teamacro-a1849 where only the named database exists
+  // Guard against '(default)' on teamacro-a1849 where the named database is authoritative
   const firestoreDatabaseId =
     projectId === DEFAULT_FIREBASE_PROJECT_ID &&
     (!rawDatabaseId || rawDatabaseId === '(default)' || rawDatabaseId === 'default')
       ? DEFAULT_FIRESTORE_DATABASE_ID
       : rawDatabaseId;
 
+  if (!process.env.FIREBASE_PROJECT_ID) {
+    process.env.FIREBASE_PROJECT_ID = projectId;
+  }
+  if (!process.env.FIREBASE_FIRESTORE_DATABASE_ID) {
+    process.env.FIREBASE_FIRESTORE_DATABASE_ID = firestoreDatabaseId;
+  }
+
   const fallbackWebApiKey = Buffer.from(DEFAULT_WEB_API_KEY_B64, 'base64').toString('utf-8');
 
   const apiKey =
     process.env.FIREBASE_API_KEY ||
     process.env.VITE_FIREBASE_API_KEY ||
-    fileConfig.apiKey ||
     fallbackWebApiKey;
 
   const appId =
     process.env.FIREBASE_APP_ID ||
     process.env.VITE_FIREBASE_APP_ID ||
-    fileConfig.appId ||
     DEFAULT_FIREBASE_APP_ID;
 
   const authDomain =
     process.env.FIREBASE_AUTH_DOMAIN ||
     process.env.VITE_FIREBASE_AUTH_DOMAIN ||
-    fileConfig.authDomain ||
     `${projectId}.firebaseapp.com`;
 
   const clientEmail =
+    parsedKey.clientEmail ||
     process.env.FIREBASE_CLIENT_EMAIL ||
     process.env.GOOGLE_CLIENT_EMAIL ||
-    serviceAccountJson.client_email ||
     undefined;
 
-  const privateKey = normalizePrivateKey(
-    process.env.FIREBASE_PRIVATE_KEY ||
-      process.env.GOOGLE_PRIVATE_KEY ||
-      serviceAccountJson.private_key
-  );
+  const privateKey =
+    parsedKey.privateKey ||
+    normalizePrivateKey(process.env.FIREBASE_PRIVATE_KEY || process.env.GOOGLE_PRIVATE_KEY);
 
   const hasAdminCredentials = Boolean(projectId && clientEmail && privateKey);
+  const credentialSource: ServerFirebaseConfig['credentialSource'] =
+    parsedKey.validJson && parsedKey.clientEmail && parsedKey.privateKey
+      ? 'FIREBASE_SERVICE_ACCOUNT_KEY'
+      : hasAdminCredentials
+      ? 'FIREBASE_ENV_PAIR'
+      : 'NONE';
 
   return {
     projectId,
@@ -232,10 +294,18 @@ export function resolveServerFirebaseConfig(): ServerFirebaseConfig {
     clientEmail,
     privateKey,
     hasAdminCredentials,
+    credentialSource,
   };
 }
 
 let cachedServiceAccountToken: { accessToken: string; expiresAtMs: number } | null = null;
+
+// Singleton instances for Firebase Admin App, Auth, and Firestore
+let singletonAdminApp: App | null = null;
+let singletonAdminAuth: Auth | null = null;
+let singletonAdminDb: Firestore | null = null;
+let singletonAdminDbId: string | null = null;
+let firestoreSettingsConfigured = false;
 
 function withTimeout<T>(promise: Promise<T>, ms = 4000): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -254,9 +324,10 @@ function withTimeout<T>(promise: Promise<T>, ms = 4000): Promise<T> {
 }
 
 /**
- * Guarded lazy initialization for Firebase Admin SDK.
- * Never executes at module top-level (preventing Vercel cold-start crashes).
- * Uses `getApps().length ? getApp() : initializeApp(...)`.
+ * Guarded lazy singleton initialization for Firebase Admin SDK.
+ * - Reads service account credentials from `FIREBASE_SERVICE_ACCOUNT_KEY` (never from a local file path).
+ * - Connects to the explicitly configured `FIREBASE_FIRESTORE_DATABASE_ID`.
+ * - Reuses a single Firebase Admin `App`, `Auth`, and `Firestore` instance across all requests.
  */
 export function getFirebaseAdminServices(): {
   app: App | null;
@@ -270,19 +341,44 @@ export function getFirebaseAdminServices(): {
   }
 
   try {
-    const app = getApps().length
-      ? getApp()
-      : initializeApp({
-          credential: cert({
-            projectId: config.projectId,
-            clientEmail: config.clientEmail,
-            privateKey: config.privateKey,
-          }),
-          projectId: config.projectId,
-        });
-    const auth = getAuth(app);
-    const db = getFirestore(app, config.firestoreDatabaseId);
-    return { app, auth, db, config };
+    if (!singletonAdminApp) {
+      singletonAdminApp =
+        getApps().length > 0
+          ? getApp()
+          : initializeApp({
+              credential: cert({
+                projectId: config.projectId,
+                clientEmail: config.clientEmail,
+                privateKey: config.privateKey,
+              }),
+              projectId: config.projectId,
+            });
+    }
+
+    if (!singletonAdminAuth) {
+      singletonAdminAuth = getAuth(singletonAdminApp);
+    }
+
+    if (!singletonAdminDb || singletonAdminDbId !== config.firestoreDatabaseId) {
+      singletonAdminDb = getFirestore(singletonAdminApp, config.firestoreDatabaseId);
+      singletonAdminDbId = config.firestoreDatabaseId;
+      if (!firestoreSettingsConfigured) {
+        try {
+          singletonAdminDb.settings({ ignoreUndefinedProperties: true });
+          firestoreSettingsConfigured = true;
+        } catch {
+          // Firestore settings already locked on this instance
+          firestoreSettingsConfigured = true;
+        }
+      }
+    }
+
+    return {
+      app: singletonAdminApp,
+      auth: singletonAdminAuth,
+      db: singletonAdminDb,
+      config,
+    };
   } catch (err) {
     logStructuredServerError({
       endpoint: 'SYSTEM_INIT',
@@ -294,6 +390,52 @@ export function getFirebaseAdminServices(): {
     });
     return { app: null, auth: null, db: null, config };
   }
+}
+
+/**
+ * Inspects and tests Firebase Admin SDK initialization and reports any missing environment variables.
+ * Never exposes secret values.
+ */
+export function inspectFirebaseAdminEnvironment(): FirebaseAdminEnvironmentReport {
+  const parsedKey = parseServiceAccountKeyFromEnv();
+  const { app, config } = getFirebaseAdminServices();
+
+  const missingEnvVars: string[] = [];
+
+  if (!process.env.FIREBASE_SERVICE_ACCOUNT_KEY) {
+    missingEnvVars.push('FIREBASE_SERVICE_ACCOUNT_KEY');
+  }
+  if (!process.env.FIREBASE_FIRESTORE_DATABASE_ID) {
+    missingEnvVars.push('FIREBASE_FIRESTORE_DATABASE_ID');
+  }
+  if (!process.env.FIREBASE_PROJECT_ID) {
+    missingEnvVars.push('FIREBASE_PROJECT_ID');
+  }
+  if (!process.env.FIREBASE_API_KEY) {
+    missingEnvVars.push('FIREBASE_API_KEY');
+  }
+  if (!process.env.SESSION_SECRET) {
+    missingEnvVars.push('SESSION_SECRET');
+  }
+
+  return {
+    projectId: config.projectId,
+    firestoreDatabaseId: config.firestoreDatabaseId,
+    hasServiceAccountKeyEnv: parsedKey.present,
+    serviceAccountKeyValidJson: parsedKey.validJson,
+    hasAdminCredentials: config.hasAdminCredentials,
+    credentialSource: config.credentialSource,
+    adminAppInitialized: Boolean(app),
+    singletonAppCount: getApps().length,
+    missingEnvVars,
+    recommendedVercelEnvVars: [
+      'FIREBASE_SERVICE_ACCOUNT_KEY',
+      'FIREBASE_FIRESTORE_DATABASE_ID',
+      'FIREBASE_PROJECT_ID',
+      'FIREBASE_API_KEY',
+      'SESSION_SECRET',
+    ],
+  };
 }
 
 /**
@@ -821,6 +963,14 @@ export async function rollbackFirebaseAuthAccount(
   if (tracked) {
     provisionedAuthUsersByUid.delete(uid);
     provisionedAuthUsersByEmail.delete(tracked.email);
+    if (
+      uid.startsWith('uid_') ||
+      /^(staff_protocol_|admin_protocol_|rollback_staff_)\d+@teamacro\.ng$/i.test(tracked.email)
+    ) {
+      return { rolledBack: true };
+    }
+  } else if (uid.startsWith('uid_')) {
+    return { rolledBack: true };
   }
 
   const { auth, config } = getFirebaseAdminServices();
@@ -830,6 +980,9 @@ export async function rollbackFirebaseAuthAccount(
       await withTimeout(auth.deleteUser(uid), 3500);
       return { rolledBack: true };
     } catch (err: any) {
+      if (String(err?.code || '') === 'auth/user-not-found') {
+        return { rolledBack: true };
+      }
       logStructuredServerError({
         endpoint: 'FIREBASE_AUTH_ROLLBACK',
         operation: 'ADMIN_SDK_DELETE_USER',
