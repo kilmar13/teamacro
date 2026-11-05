@@ -50,15 +50,27 @@ async function runAcceptanceSuite() {
     `GET /supa-admin -> Status ${supaPageRes.status} (${supaPageHtml.length} bytes)`
   );
 
-  // Authenticate Lifetime Super Admin
+  // Verify forged UID with Super Admin email is rejected (email alone never grants LIFETIME_SUPER_ADMIN)
+  const forgedSyncRes = await fetch(`${BASE_URL}/api/auth/sync-super-admin`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      uid: 'FORGED_UID_NOT_IN_SYSTEM_OWNERSHIP',
+      email: 'eromoseledavidson68@gmail.com',
+      fullName: 'Forged Caller',
+    }),
+  });
+  const forgedRejectedOk = forgedSyncRes.status === 403;
+
+  // Authenticate Lifetime Super Admin using verified Firestore system_ownership UID (OWNER_ROOT_3YPAFKI2)
   const rootSyncRes = await fetch(`${BASE_URL}/api/auth/sync-super-admin`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      uid: 'ROOT_SUPER_ADMIN_SUITE_RUNNER',
+      uid: 'OWNER_ROOT_3YPAFKI2',
       email: 'eromoseledavidson68@gmail.com',
-      fullName: 'Davidson Eromosele (Super Admin)',
-      phone: '+2348000000000',
+      fullName: 'David Eromosele',
+      phone: '+234 800 000 0001',
     }),
   });
   const rootData = await rootSyncRes.json();
@@ -70,15 +82,17 @@ async function runAcceptanceSuite() {
   }
 
   const supaCredsOk =
+    forgedRejectedOk &&
     rootSyncRes.status === 200 &&
     rootData.success === true &&
+    rootData.user?.id === 'OWNER_ROOT_3YPAFKI2' &&
     rootData.user?.email === 'eromoseledavidson68@gmail.com' &&
     rootData.user?.role === 'LIFETIME_SUPER_ADMIN';
   record(
     'Valid Super Admin credentials are processed without server error',
     'Super Admin Authentication',
     supaCredsOk ? 'PASS' : 'FAIL',
-    `Status ${rootSyncRes.status}, email=${rootData.user?.email}, role=${rootData.user?.role}`
+    `Status ${rootSyncRes.status}, uid=${rootData.user?.id}, email=${rootData.user?.email}, role=${rootData.user?.role}, forgedUidStatus=${forgedSyncRes.status}`
   );
 
   const supaDashRes = await fetch(`${BASE_URL}/api/auth/authorize-route`, {

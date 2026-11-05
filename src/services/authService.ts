@@ -102,105 +102,37 @@ class AuthService {
    */
   public async login(identifier: string, password: string): Promise<LoginResult> {
     const cleanId = (identifier || '').trim().toLowerCase();
-    const localProfile = ledgerEngine.getStaffAndAdminDirectory().find(
-      (u: any) =>
-        u.email?.toLowerCase() === cleanId ||
-        u.email?.split('@')[0]?.toLowerCase() === cleanId ||
-        u.staffCode?.toLowerCase() === cleanId ||
-        u.id?.toLowerCase() === cleanId
-    );
+
+    if (!cleanId || !password) {
+      return {
+        success: false,
+        message: 'Please enter both your identifier and password.',
+        error: 'MISSING_CREDENTIALS',
+      };
+    }
 
     const res = await safeApiFetch('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({
-        identifier,
+        identifier: cleanId,
         password,
-        ...(localProfile ? { syncedProfile: localProfile } : {}),
       }),
     });
 
     if (!res.success) {
-      // Fallback: if identifier is an email address, verify against Firebase Auth + Firestore directly
-      if (cleanId.includes('@') && !res.lockoutSeconds) {
-        try {
-          const cred = await signInWithEmailAndPassword(auth, cleanId, password);
-          const fbUid = cred.user.uid;
-          const [adminSnap, staffSnap, userSnap] = await Promise.all([
-            getDoc(doc(db, 'admins', fbUid)).catch(() => null),
-            getDoc(doc(db, 'staff', fbUid)).catch(() => null),
-            getDoc(doc(db, 'users', fbUid)).catch(() => null),
-          ]);
+      const err = normalizeError(
+        res.error || res.message,
+        'Invalid credentials or access unauthorised.'
+      );
 
-          const adminData = adminSnap?.exists() ? adminSnap.data() : null;
-          const staffData = staffSnap?.exists() ? staffSnap.data() : null;
-          const userData = userSnap?.exists() ? userSnap.data() : null;
-          const merged = { ...(userData || {}), ...(staffData || {}), ...(adminData || {}) };
-
-          if (merged && (adminData || staffData || userData || cleanId === 'eromoseledavidson68@gmail.com')) {
-            if (merged.status === 'suspended' || merged.active === false) {
-              await firebaseSignOut(auth).catch(() => {});
-              return {
-                success: false,
-                message: 'Your account has been suspended. Please contact the Super Admin.',
-                error: 'ACCOUNT_SUSPENDED',
-              };
-            }
-
-            const resolvedRole: any =
-              cleanId === 'eromoseledavidson68@gmail.com'
-                ? 'LIFETIME_SUPER_ADMIN'
-                : adminData
-                ? 'ADMIN'
-                : staffData
-                ? 'STAFF'
-                : merged.role || 'STAFF';
-
-            const authenticatedUser: User = {
-              id: fbUid,
-              email: cleanId,
-              fullName: merged.fullName || cred.user.displayName || cleanId.split('@')[0],
-              phone: merged.phone || '',
-              role: resolvedRole,
-              roleTitle: merged.roleTitle || merged.duty || (resolvedRole === 'ADMIN' ? 'Branch Administrator' : 'Operations Staff'),
-              active: true,
-              createdAt: merged.createdAt || new Date().toISOString(),
-              isLifetimeSuperAdmin: resolvedRole === 'LIFETIME_SUPER_ADMIN',
-            };
-
-            this.cachedUser = authenticatedUser;
-            ledgerEngine.setCurrentUser(authenticatedUser);
-
-            const redirectRoute =
-              resolvedRole === 'LIFETIME_SUPER_ADMIN'
-                ? '/supa-admin'
-                : resolvedRole === 'ADMIN'
-                ? '/admin'
-                : '/staff';
-
-            return {
-              success: true,
-              requireMfa: false,
-              redirectRoute,
-              user: authenticatedUser,
-              message: 'Authentication successful.',
-            };
-          }
-        } catch {
-          // Fall through to standard error message
-        }
-      }
-
-      const err = normalizeError(res.error || res.message, 'Invalid credentials or access unauthorised.');
       return {
         success: false,
         message: err,
-        error: err,
+        error: res.error || err,
         lockoutSeconds: res.lockoutSeconds,
       };
     }
 
-
-    // Check for MFA requirement (Lifetime Super Admin)
     if (res.requireMfa) {
       return {
         success: true,
@@ -212,14 +144,17 @@ class AuthService {
       };
     }
 
-    // Session granted directly
-    if (res.sessionToken) {
-      this.setStoredToken(res.sessionToken);
+    if (!res.user || !res.sessionToken) {
+      return {
+        success: false,
+        message: 'Authentication could not be verified by the server.',
+        error: 'INVALID_SERVER_AUTH_RESPONSE',
+      };
     }
-    if (res.user) {
-      this.cachedUser = res.user;
-      ledgerEngine.setCurrentUser(res.user);
-    }
+
+    this.setStoredToken(res.sessionToken);
+    this.cachedUser = res.user;
+    ledgerEngine.setCurrentUser(res.user);
 
     return {
       success: true,
@@ -596,211 +531,48 @@ class AuthService {
   }
 
   /**
-   * Super Admin login via Firebase Auth, Firestore ownership verification, and backend authentication gateway.
-   * Supports MFA challenges when enabled on the Super Admin account and synchronizes server sessions.
+   * Super Admin login via authoritative backend authentication gateway (/api/auth/login).
+   * Enforces Firestore ownership verification, active account status, and MFA verification on the server.
    */
   public async loginSuperAdmin(email: string, password: string): Promise<LoginResult> {
-    try {
-      const cleanEmail = (email || '').trim().toLowerCase();
-      if (!cleanEmail || !password) {
-        return {
-          success: false,
-          error: 'Please enter both your Super Admin email address and master password.',
-        };
-      }
+    const cleanEmail = (email || '').trim().toLowerCase();
+    if (!cleanEmail || !password) {
+      return {
+        success: false,
+        error: 'Please enter both your Super Admin email address and master password.',
+        message: 'Please enter both your Super Admin email address and master password.',
+      };
+    }
 
-      // 1. Authoritatively check Firestore systemSettings/lifetimeSuperAdmin with server fallback
-      let ownerData: any = null;
-      try {
-        const snap = await getDoc(doc(db, 'systemSettings', 'lifetimeSuperAdmin'));
-        if (snap.exists() && snap.data()?.initialized === true) {
-          ownerData = snap.data();
-        }
-      } catch (firestoreErr) {
-        console.warn('[AUTH] Direct Firestore read note during login, checking server status:', firestoreErr);
-      }
+    const res = await this.login(cleanEmail, password);
+    if (!res.success) {
+      return res;
+    }
 
-      if (!ownerData) {
-        try {
-          const serverStatus = await safeApiFetch<any>('/api/auth/setup-status');
-          if (serverStatus.isInitialized || serverStatus.data?.isInitialized) {
-            ownerData = {
-              initialized: true,
-              ownerUid: serverStatus.data?.ownerUid || serverStatus.ownerUid || 'ROOT_SUPER_ADMIN_SUITE_RUNNER',
-              ownerEmail: (serverStatus.data?.ownerEmail || serverStatus.ownerEmail || 'eromoseledavidson68@gmail.com').toLowerCase(),
-              fullName: serverStatus.data?.ownerFullName || serverStatus.ownerFullName || 'Davidson Eromosele (Super Admin)',
-              role: 'LIFETIME_SUPER_ADMIN',
-            };
-          }
-        } catch {
-          // Proceed with canonical owner fallback if setup-status is temporarily unreachable
-        }
-      }
-
-      if (!ownerData) {
-        ownerData = {
-          initialized: true,
-          ownerUid: 'ROOT_SUPER_ADMIN_SUITE_RUNNER',
-          ownerEmail: 'eromoseledavidson68@gmail.com',
-          fullName: 'Davidson Eromosele (Super Admin)',
-          role: 'LIFETIME_SUPER_ADMIN',
-        };
-      }
-
-      // Enforce that only the unique Lifetime Super Admin email can authenticate on /supa-admin
-      const authorizedEmail = (ownerData.ownerEmail || 'eromoseledavidson68@gmail.com').toLowerCase();
-      if (cleanEmail !== 'eromoseledavidson68@gmail.com' && cleanEmail !== authorizedEmail) {
+    if (res.requireMfa && res.tempToken) {
+      if (res.user && res.user.role && res.user.role !== 'LIFETIME_SUPER_ADMIN') {
         return {
           success: false,
           error: 'Access Denied: This portal is strictly reserved for the Lifetime Super Admin.',
+          message: 'Access Denied: This portal is strictly reserved for the Lifetime Super Admin.',
         };
       }
+      return res;
+    }
 
-      // 2. Authenticate with Firebase Authentication and/or Backend Authentication Gateway
-      let fbUid = ownerData.ownerUid || 'ROOT_SUPER_ADMIN_SUITE_RUNNER';
-      let firebaseAuthenticated = false;
-      let serverLoginRes: any = null;
-
-      try {
-        const userCredential = await signInWithEmailAndPassword(auth, cleanEmail, password);
-        fbUid = userCredential.user.uid;
-        firebaseAuthenticated = true;
-      } catch (authErr: any) {
-        // Attempt authoritative server login gateway (supports PBKDF2 + cold-start Identity Toolkit + MFA)
-        serverLoginRes = await safeApiFetch('/api/auth/login', {
-          method: 'POST',
-          body: JSON.stringify({ identifier: cleanEmail, password }),
-        });
-
-        if (!serverLoginRes.success) {
-          if (
-            authErr?.code === 'auth/invalid-credential' ||
-            authErr?.code === 'auth/user-not-found' ||
-            authErr?.code === 'auth/wrong-password'
-          ) {
-            return {
-              success: false,
-              error: 'Invalid email or password.',
-              lockoutSeconds: serverLoginRes.lockoutSeconds,
-            };
-          }
-          if (authErr?.code === 'auth/too-many-requests' || serverLoginRes.lockoutSeconds) {
-            return {
-              success: false,
-              error:
-                serverLoginRes.message ||
-                'Access temporarily locked due to multiple failed login attempts. Please try again later.',
-              lockoutSeconds: serverLoginRes.lockoutSeconds,
-            };
-          }
-          return {
-            success: false,
-            error: normalizeError(serverLoginRes.error || serverLoginRes.message, 'Invalid email or password.'),
-          };
-        }
-      }
-
-      // If server login required MFA challenge, return the challenge for step 2 verification
-      if (serverLoginRes?.requireMfa && serverLoginRes?.tempToken) {
-        return {
-          success: true,
-          requireMfa: true,
-          tempToken: serverLoginRes.tempToken,
-          maskedDestination: serverLoginRes.maskedDestination,
-          expiresInSeconds: serverLoginRes.expiresInSeconds,
-          user: serverLoginRes.user,
-        };
-      }
-
-      // If server login succeeded directly, persist session token
-      if (serverLoginRes?.success && serverLoginRes?.sessionToken && serverLoginRes?.user) {
-        if (serverLoginRes.user.role !== 'LIFETIME_SUPER_ADMIN') {
-          return {
-            success: false,
-            error: 'Access Denied: This portal is strictly reserved for the Lifetime Super Admin.',
-          };
-        }
-        this.setStoredToken(serverLoginRes.sessionToken);
-        this.cachedUser = serverLoginRes.user;
-        ledgerEngine.setCurrentUser(serverLoginRes.user);
-        return {
-          success: true,
-          requireMfa: false,
-          sessionToken: serverLoginRes.sessionToken,
-          user: serverLoginRes.user,
-          redirectRoute: '/supa-admin',
-        };
-      }
-
-      // 3. Confirm UID or Email match authoritative owner record when authenticated via Firebase Client SDK
-      if (firebaseAuthenticated && ownerData.ownerUid !== fbUid && authorizedEmail !== cleanEmail && cleanEmail !== 'eromoseledavidson68@gmail.com') {
-        if (auth.currentUser) await firebaseSignOut(auth);
-        return {
-          success: false,
-          error: 'Access Denied: The authenticated credentials do not match the authorized Lifetime Super Admin.',
-        };
-      }
-
-      const fullName = ownerData?.fullName || 'Davidson Eromosele (Super Admin)';
-      const phone = ownerData?.phone || '+234 800 000 0001';
-
-      const user: User = {
-        id: fbUid,
-        email: cleanEmail,
-        fullName,
-        phone,
-        role: 'LIFETIME_SUPER_ADMIN',
-        active: true,
-        isLifetimeSuperAdmin: true,
-        createdAt: ownerData?.createdAt || new Date().toISOString(),
-      };
-
-      // 4. Establish server session via /api/auth/sync-super-admin
-      let sessionToken: string | undefined = undefined;
-      try {
-        const syncRes = await safeApiFetch<{ sessionToken?: string; success?: boolean }>('/api/auth/sync-super-admin', {
-          method: 'POST',
-          body: {
-            uid: fbUid,
-            email: cleanEmail,
-            fullName,
-            phone,
-          },
-        });
-        sessionToken = syncRes.sessionToken || syncRes.data?.sessionToken;
-        if (sessionToken) {
-          this.setStoredToken(sessionToken);
-        }
-      } catch (syncErr) {
-        console.warn('[AUTH] Server session sync note:', syncErr);
-      }
-
-      this.cachedUser = user;
-      ledgerEngine.setCurrentUser(user);
-
-      return {
-        success: true,
-        requireMfa: false,
-        sessionToken,
-        user,
-        redirectRoute: '/supa-admin',
-      };
-    } catch (err: any) {
-      let message = err?.message || 'Authentication failed.';
-      if (
-        err?.code === 'auth/invalid-credential' ||
-        err?.code === 'auth/user-not-found' ||
-        err?.code === 'auth/wrong-password'
-      ) {
-        message = 'Invalid email or password.';
-      } else if (err?.code === 'auth/too-many-requests') {
-        message = 'Access temporarily locked due to multiple failed login attempts. Please try again later.';
-      }
+    if (!res.user || res.user.role !== 'LIFETIME_SUPER_ADMIN') {
+      await this.logout();
       return {
         success: false,
-        error: message,
+        error: 'Access Denied: This portal is strictly reserved for the Lifetime Super Admin.',
+        message: 'Access Denied: This portal is strictly reserved for the Lifetime Super Admin.',
       };
     }
+
+    return {
+      ...res,
+      redirectRoute: '/supa-admin',
+    };
   }
 
   /**
@@ -1008,32 +780,41 @@ class AuthService {
   }
 
   /**
-   * Authoritatively ensure a valid Super Admin session token is active.
-   * If token is missing, expired, or invalid, automatically re-synchronizes with /api/auth/sync-super-admin.
+   * Authoritatively verify that an active server-validated session token is present.
+   * Never synthesizes or grants Super Admin privileges from hardcoded emails or browser storage.
    */
   public async ensureSuperAdminSession(force = false): Promise<string | null> {
     const existing = this.getStoredToken();
-    const current = ledgerEngine.getCurrentUser();
-    const fbUser = auth.currentUser;
-    const isSuper =
-      current?.role === 'LIFETIME_SUPER_ADMIN' ||
-      current?.role === 'SUPER_ADMIN' ||
-      current?.isLifetimeSuperAdmin ||
-      (fbUser && fbUser.email === 'eromoseledavidson68@gmail.com');
-
     if (!force && existing) {
       return existing;
     }
 
-    if (isSuper || !existing) {
+    try {
+      const sessionRes = await safeApiFetch<any>('/api/auth/session', {
+        method: 'GET',
+      });
+      if (sessionRes.success && sessionRes.authenticated && sessionRes.user) {
+        const srvToken = sessionRes.sessionToken || sessionRes.data?.sessionToken;
+        if (srvToken) {
+          this.setStoredToken(srvToken);
+          return srvToken;
+        }
+      }
+    } catch {
+      // Ignore session check error
+    }
+
+    const fbUser = auth.currentUser;
+    if (fbUser) {
       try {
+        const idToken = await fbUser.getIdToken();
         const syncRes = await safeApiFetch<{ sessionToken?: string; success?: boolean }>('/api/auth/sync-super-admin', {
           method: 'POST',
           body: {
-            uid: current?.id || fbUser?.uid || 'ROOT_SUPER_ADMIN',
-            email: current?.email || fbUser?.email || 'eromoseledavidson68@gmail.com',
-            fullName: current?.fullName || fbUser?.displayName || 'Davidson Eromosele',
-            phone: current?.phone || '',
+            uid: fbUser.uid,
+            email: fbUser.email || '',
+            fullName: fbUser.displayName || '',
+            idToken,
           },
         });
         const newToken = syncRes.sessionToken || syncRes.data?.sessionToken;

@@ -2,6 +2,13 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { generateTotpSecret, computeTotpCode, verifyTotpCode, generateRecoveryCodes } from './totp.js';
+import {
+  saveFirestoreSystemOwnership,
+  saveFirestoreInvitation,
+  saveFirestoreSessionHash,
+  revokeFirestoreSessionByHash,
+  saveFirestoreAuditLog,
+} from './firebaseAdmin.js';
 
 export type UserRole =
   | 'LIFETIME_SUPER_ADMIN'
@@ -201,6 +208,7 @@ class ServerAuthManager {
   private pendingRootSetup: PendingRootSetup | null = null;
   private sessions: Map<string, UserSession> = new Map();
   private revokedTokens: Set<string> = new Set();
+  private revokedTokenHashes: Set<string> = new Set();
   private mfaChallenges: Map<string, MfaChallenge> = new Map();
   private resetTokens: Map<string, PasswordResetToken> = new Map();
   private rateLimits: Map<string, RateLimitRecord> = new Map();
@@ -226,16 +234,29 @@ class ServerAuthManager {
     this.sessionsFile = path.join(this.dataDir, 'auth_sessions.json');
     this.customersFile = path.join(this.dataDir, 'customers.json');
 
-    this.ensureDataDirectory();
+    if (!this.isProductionMode()) {
+      this.ensureDataDirectory();
+    }
     this.loadStateFromStorage();
   }
 
+  public isProductionMode(): boolean {
+    return Boolean(process.env.VERCEL || process.env.NODE_ENV === 'production');
+  }
+
+  private hashSessionToken(token: string): string {
+    return crypto.createHash('sha256').update(token).digest('hex');
+  }
+
   private resolveWritableDataDir(): string {
+    const seedDir = path.resolve(process.cwd(), 'data');
+    if (this.isProductionMode()) {
+      return seedDir;
+    }
     if (process.env.TEAMACRO_DATA_DIR) {
       return path.resolve(process.env.TEAMACRO_DATA_DIR);
     }
 
-    const seedDir = path.resolve(process.cwd(), 'data');
     const runtimeDir = path.join('/tmp', 'teamacro-data');
 
     try {
@@ -309,8 +330,11 @@ class ServerAuthManager {
     }
   }
 
-  // Atomic file persistence using temporary file and rename (0o664 + appuser ownership ensures AI Studio GitHub sync service can always read/write workspace files)
+  // Atomic file persistence for local development only. Production relies exclusively on Cloud Firestore.
   private atomicSaveFile(filePath: string, data: any): void {
+    if (this.isProductionMode()) {
+      return;
+    }
     try {
       this.ensureDataDirectory();
       const tmpPath = `${filePath}.${Date.now()}.${Math.random().toString(36).substring(2, 6)}.tmp`;
@@ -330,33 +354,60 @@ class ServerAuthManager {
   }
 
   private loadStateFromStorage(): void {
-    // 1. Load System Ownership Singleton
+    // 1. Load System Ownership Singleton baseline (Firestore is authoritative at runtime)
     if (fs.existsSync(this.ownershipFile)) {
       try {
         const raw = fs.readFileSync(this.ownershipFile, 'utf-8');
-        this.ownership = JSON.parse(raw);
-        console.log(`[STORAGE] System ownership record loaded. Sealed: ${this.ownership.isInitialized}`);
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.ownerUserId === 'ROOT_SUPER_ADMIN_SUITE_RUNNER') {
+          parsed.ownerUserId = 'OWNER_ROOT_3YPAFKI2';
+          parsed.ownerFullName = 'David Eromosele';
+        }
+        this.ownership = parsed;
       } catch (e) {
         console.error('[STORAGE] Corrupt ownership file:', e);
       }
     }
 
-    // 2. Load Accounts
+    if (!this.ownership.isInitialized || !this.ownership.ownerUserId) {
+      this.ownership = {
+        isInitialized: true,
+        lockdownEnforced: true,
+        ownerUserId: 'OWNER_ROOT_3YPAFKI2',
+        ownerEmail: 'eromoseledavidson68@gmail.com',
+        ownerFullName: 'David Eromosele',
+        establishedAt: '2026-10-27T12:29:12.967Z',
+        setupVersion: 1,
+      };
+    }
+
+    // 2. Load Accounts (in production, only seed the verified root owner baseline; Admin/Staff come from Firestore)
     if (fs.existsSync(this.accountsFile)) {
       try {
         const raw = fs.readFileSync(this.accountsFile, 'utf-8');
         const list: AuthAccount[] = JSON.parse(raw);
         this.accounts.clear();
         for (const acc of list) {
-          this.accounts.set(acc.id, acc);
+          if (this.isProductionMode()) {
+            if (acc.id === 'OWNER_ROOT_3YPAFKI2' || acc.isLifetimeSuperAdmin) {
+              if (acc.id !== 'ROOT_SUPER_ADMIN_SUITE_RUNNER') {
+                this.accounts.set(acc.id, acc);
+              }
+            }
+          } else {
+            this.accounts.set(acc.id, acc);
+          }
         }
-        console.log(`[STORAGE] Loaded ${this.accounts.size} verified enterprise account(s).`);
       } catch (e) {
         console.error('[STORAGE] Corrupt accounts file:', e);
       }
     }
 
-    // 3. Load Access Invitations
+    if (this.isProductionMode()) {
+      return;
+    }
+
+    // 3. Load Access Invitations (local development only)
     if (fs.existsSync(this.invitationsFile)) {
       try {
         const raw = fs.readFileSync(this.invitationsFile, 'utf-8');
@@ -365,31 +416,12 @@ class ServerAuthManager {
         for (const inv of list) {
           this.invitations.set(inv.id, inv);
         }
-        console.log(`[STORAGE] Loaded ${this.invitations.size} access invitation(s).`);
       } catch (e) {
         console.error('[STORAGE] Corrupt invitations file:', e);
       }
     }
 
-    // 4. Load Active Sessions
-    if (fs.existsSync(this.sessionsFile)) {
-      try {
-        const raw = fs.readFileSync(this.sessionsFile, 'utf-8');
-        const entries: [string, UserSession][] = JSON.parse(raw);
-        const now = Date.now();
-        this.sessions.clear();
-        for (const [token, session] of entries) {
-          if (session && session.expiresAt > now) {
-            this.sessions.set(token, session);
-          }
-        }
-        console.log(`[STORAGE] Restored ${this.sessions.size} active session(s).`);
-      } catch (e) {
-        console.error('[STORAGE] Corrupt sessions file:', e);
-      }
-    }
-
-    // 5. Load Audit Logs
+    // 4. Load Audit Logs (local development only)
     if (fs.existsSync(this.auditFile)) {
       try {
         const raw = fs.readFileSync(this.auditFile, 'utf-8');
@@ -399,7 +431,7 @@ class ServerAuthManager {
       }
     }
 
-    // 6. Load Customer Records
+    // 5. Load Customer Records (local development only)
     if (fs.existsSync(this.customersFile)) {
       try {
         const raw = fs.readFileSync(this.customersFile, 'utf-8');
@@ -412,14 +444,47 @@ class ServerAuthManager {
             }
           }
         }
-        console.log(`[STORAGE] Loaded ${this.customers.size} customer record(s).`);
       } catch (e) {
         console.error('[STORAGE] Corrupt customers file:', e);
       }
     }
   }
 
+  public syncOwnershipRecord(record: Partial<SystemOwnershipRecord>): void {
+    if (!record) return;
+    if (record.isInitialized && record.ownerUserId) {
+      this.ownership = {
+        isInitialized: true,
+        lockdownEnforced: Boolean(record.lockdownEnforced ?? true),
+        ownerUserId: record.ownerUserId,
+        ownerEmail: record.ownerEmail || this.ownership.ownerEmail || 'eromoseledavidson68@gmail.com',
+        ownerFullName: record.ownerFullName || this.ownership.ownerFullName || 'David Eromosele',
+        establishedAt: record.establishedAt || this.ownership.establishedAt || '2026-10-27T12:29:12.967Z',
+        setupVersion: Number(record.setupVersion || this.ownership.setupVersion || 1),
+      };
+    }
+  }
+
+  public getOwnerUserId(): string {
+    return this.ownership.ownerUserId || 'OWNER_ROOT_3YPAFKI2';
+  }
+
+  public isVerifiedOwner(uid?: string | null, email?: string | null): boolean {
+    if (!uid || !email) return false;
+    if (!this.isOwnerEmail(email)) return false;
+    const cleanUid = uid.trim();
+    const canonicalOwnerUid = this.getOwnerUserId();
+    if (cleanUid === canonicalOwnerUid || cleanUid === 'OWNER_ROOT_3YPAFKI2') {
+      return true;
+    }
+    if (!this.isProductionMode() && cleanUid === 'ROOT_SUPER_ADMIN_SUITE_RUNNER') {
+      return true;
+    }
+    return false;
+  }
+
   private persistOwnership(): void {
+    saveFirestoreSystemOwnership(this.ownership).catch(() => {});
     this.atomicSaveFile(this.ownershipFile, this.ownership);
   }
 
@@ -430,12 +495,27 @@ class ServerAuthManager {
 
   private persistInvitations(): void {
     const list = Array.from(this.invitations.values());
+    for (const inv of list) {
+      const { codeHash, codeSalt, ...rest } = inv;
+      saveFirestoreInvitation({ ...rest, codeHash, codeSalt }).catch(() => {});
+    }
     this.atomicSaveFile(this.invitationsFile, list);
   }
 
   private persistSessions(): void {
-    const entries = Array.from(this.sessions.entries());
-    this.atomicSaveFile(this.sessionsFile, entries);
+    // Never write plaintext session tokens to disk or Firestore.
+    const hashedEntries = Array.from(this.sessions.entries()).map(([token, session]) => {
+      const tokenHash = this.hashSessionToken(token);
+      return [
+        tokenHash,
+        {
+          ...session,
+          token: '[REDACTED_HASHED]',
+          tokenHash,
+        },
+      ];
+    });
+    this.atomicSaveFile(this.sessionsFile, hashedEntries);
   }
 
   private persistCustomers(): void {
@@ -453,6 +533,7 @@ class ServerAuthManager {
     if (this.auditLogs.length > 500) {
       this.auditLogs = this.auditLogs.slice(0, 500);
     }
+    saveFirestoreAuditLog(record).catch(() => {});
     this.atomicSaveFile(this.auditFile, this.auditLogs);
   }
 
@@ -1141,6 +1222,27 @@ class ServerAuthManager {
       };
     }
 
+    // Strict Super Admin Ownership Verification against system_ownership
+    if (account.role === 'LIFETIME_SUPER_ADMIN' || account.isLifetimeSuperAdmin) {
+      const uidToCheck = account.uid || account.id;
+      if (!this.ownership.isInitialized || !this.isVerifiedOwner(uidToCheck, account.email)) {
+        this.recordAudit({
+          actorId: account.id,
+          actorName: account.fullName,
+          actorRole: account.role,
+          action: 'SUPER_ADMIN_OWNERSHIP_MISMATCH',
+          resource: '/api/auth/login',
+          details: `Rejected Super Admin login for ${account.email} (${uidToCheck}): UID does not match system_ownership record (${this.getOwnerUserId()}).`,
+          ip,
+          status: 'DENIED',
+        });
+        return {
+          success: false,
+          error: 'Access Denied: Account does not match the authoritative Lifetime Super Admin ownership record.',
+        };
+      }
+    }
+
     this.resetRateLimit(cleanIdentifier, ip);
     return { success: true, account };
   }
@@ -1455,6 +1557,18 @@ class ServerAuthManager {
 
     account.lastLogin = new Date().toISOString();
     this.sessions.set(token, session);
+    const tokenHash = this.hashSessionToken(token);
+    saveFirestoreSessionHash({
+      tokenHash,
+      userId: session.userId,
+      email: session.email,
+      role: session.role,
+      mfaVerified: session.mfaVerified,
+      createdAt: session.createdAt,
+      expiresAt: session.expiresAt,
+      lastSeenAt: now,
+      revoked: false,
+    }).catch(() => {});
     this.persistAccounts();
     this.persistSessions();
     return session;
@@ -1468,16 +1582,26 @@ class ServerAuthManager {
     const cleanEmail = data.email.trim().toLowerCase();
     this.resetRateLimit(cleanEmail, ip);
 
-    let account = this.accounts.get(data.uid) || this.findAccountByIdentifier(cleanEmail);
+    const canonicalUid = this.getOwnerUserId();
+    const effectiveUid =
+      data.uid === 'ROOT_SUPER_ADMIN_SUITE_RUNNER' && !this.isProductionMode()
+        ? canonicalUid
+        : data.uid || canonicalUid;
+
+    let account =
+      this.accounts.get(effectiveUid) ||
+      this.accounts.get(canonicalUid) ||
+      this.findAccountByIdentifier(cleanEmail);
+
     if (!account) {
       const salt = data.password ? generateSalt() : '';
       const pwdHash = data.password && salt ? hashPassword(data.password, salt) : '';
       account = {
-        id: data.uid,
-        uid: data.uid,
+        id: canonicalUid,
+        uid: canonicalUid,
         email: cleanEmail,
         username: cleanEmail.split('@')[0].toLowerCase(),
-        fullName: data.fullName.trim() || 'Lifetime Super Admin',
+        fullName: data.fullName.trim() || this.ownership.ownerFullName || 'David Eromosele',
         phone: (data.phone || '+234 800 000 0001').trim(),
         role: 'LIFETIME_SUPER_ADMIN',
         roleTitle: 'Lifetime Super Admin & Chief Executive',
@@ -1490,7 +1614,7 @@ class ServerAuthManager {
         createdAt: new Date().toISOString(),
         securityVersion: 1,
       };
-      this.accounts.set(data.uid, account);
+      this.accounts.set(canonicalUid, account);
       this.persistAccounts();
     } else if (data.password && (!account.passwordHash || !account.passwordSalt)) {
       account.passwordSalt = generateSalt();
@@ -1498,16 +1622,18 @@ class ServerAuthManager {
       this.persistAccounts();
     }
 
-    this.ownership = {
-      isInitialized: true,
-      lockdownEnforced: true,
-      ownerUserId: account.id,
-      ownerEmail: cleanEmail,
-      ownerFullName: data.fullName.trim() || account.fullName || 'Lifetime Super Admin',
-      establishedAt: account.createdAt,
-      setupVersion: 1,
-    };
-    this.atomicSaveFile(this.ownershipFile, this.ownership);
+    if (!this.ownership.isInitialized || !this.ownership.ownerUserId) {
+      this.ownership = {
+        isInitialized: true,
+        lockdownEnforced: true,
+        ownerUserId: canonicalUid,
+        ownerEmail: cleanEmail,
+        ownerFullName: data.fullName.trim() || account.fullName || 'David Eromosele',
+        establishedAt: account.createdAt,
+        setupVersion: 1,
+      };
+      this.persistOwnership();
+    }
 
     const session = this.createSession(account, ip, userAgent, true);
     this.persistSessions();
@@ -1516,25 +1642,10 @@ class ServerAuthManager {
 
   public validateSession(token: string): UserSession | null {
     if (!token || this.revokedTokens.has(token)) return null;
-    let session = this.sessions.get(token);
+    const tokenHash = this.hashSessionToken(token);
+    if (this.revokedTokenHashes.has(tokenHash)) return null;
 
-    if (!session && fs.existsSync(this.sessionsFile)) {
-      try {
-        const raw = fs.readFileSync(this.sessionsFile, 'utf-8');
-        const entries: [string, UserSession][] = JSON.parse(raw);
-        const now = Date.now();
-        for (const [t, s] of entries) {
-          if (s && s.expiresAt > now && !this.revokedTokens.has(t)) {
-            this.sessions.set(t, s);
-            if (t === token) {
-              session = s;
-            }
-          }
-        }
-      } catch {
-        // Ignored
-      }
-    }
+    let session = this.sessions.get(token);
 
     // Serverless cold-start fallback: verify stateless HMAC-signed session token
     if (!session && token.startsWith('tmr_s1_')) {
@@ -1555,21 +1666,13 @@ class ServerAuthManager {
     }
 
     let account = this.accounts.get(session.userId) || this.findAccountByIdentifier(session.email);
-    if (!account && fs.existsSync(this.accountsFile)) {
-      try {
-        const raw = fs.readFileSync(this.accountsFile, 'utf-8');
-        const list: AuthAccount[] = JSON.parse(raw);
-        for (const a of list) {
-          this.accounts.set(a.id, a);
-        }
-        account = this.accounts.get(session.userId) || this.findAccountByIdentifier(session.email) || null;
-      } catch {
-        // Ignored
-      }
-    }
 
-    // Auto-create or repair Lifetime Super Admin account if session is authenticated as Lifetime Super Admin
-    if (!account && session.role === 'LIFETIME_SUPER_ADMIN' && this.isOwnerEmail(session.email)) {
+    // Auto-hydrate Lifetime Super Admin account ONLY if session UID and email match verified ownership record
+    if (
+      !account &&
+      session.role === 'LIFETIME_SUPER_ADMIN' &&
+      this.isVerifiedOwner(session.userId, session.email)
+    ) {
       account = {
         id: session.userId,
         uid: session.userId,
@@ -1594,6 +1697,9 @@ class ServerAuthManager {
 
     // Hydrate verified stateless Admin or Staff session on serverless cold start if not yet in memory
     if (!account && token.startsWith('tmr_s1_') && (session.role === 'ADMIN' || session.role === 'STAFF' || session.role)) {
+      if (session.role === 'LIFETIME_SUPER_ADMIN') {
+        return null;
+      }
       account = {
         id: session.userId,
         uid: session.userId,
@@ -1638,6 +1744,9 @@ class ServerAuthManager {
   public invalidateSession(token: string): boolean {
     if (token) {
       this.revokedTokens.add(token);
+      const tokenHash = this.hashSessionToken(token);
+      this.revokedTokenHashes.add(tokenHash);
+      revokeFirestoreSessionByHash(tokenHash).catch(() => {});
     }
     const deleted = this.sessions.delete(token);
     if (deleted) {
@@ -1651,6 +1760,9 @@ class ServerAuthManager {
     for (const [token, session] of this.sessions.entries()) {
       if (session.userId === userId) {
         this.revokedTokens.add(token);
+        const tokenHash = this.hashSessionToken(token);
+        this.revokedTokenHashes.add(tokenHash);
+        revokeFirestoreSessionByHash(tokenHash).catch(() => {});
         this.sessions.delete(token);
         count++;
       }

@@ -144,7 +144,9 @@ export function resolveServerFirebaseConfig(): ServerFirebaseConfig {
 
   let serviceAccountJson: Record<string, string> = {};
   const rawServiceAccount =
-    process.env.FIREBASE_SERVICE_ACCOUNT_KEY || process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
+    process.env.FIREBASE_SERVICE_ACCOUNT_KEY ||
+    process.env.FIREBASE_SERVICE_ACCOUNT ||
+    process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON;
   if (rawServiceAccount) {
     try {
       const decoded = rawServiceAccount.trim().startsWith('{')
@@ -165,39 +167,58 @@ export function resolveServerFirebaseConfig(): ServerFirebaseConfig {
 
   const projectId =
     process.env.FIREBASE_PROJECT_ID ||
+    process.env.VITE_FIREBASE_PROJECT_ID ||
+    process.env.GCLOUD_PROJECT ||
+    process.env.GOOGLE_CLOUD_PROJECT ||
     serviceAccountJson.project_id ||
     fileConfig.projectId ||
     DEFAULT_FIREBASE_PROJECT_ID;
 
-  const firestoreDatabaseId =
+  const rawDatabaseId =
     process.env.FIREBASE_FIRESTORE_DATABASE_ID ||
+    process.env.FIREBASE_DATABASE_ID ||
+    process.env.FIRESTORE_DATABASE_ID ||
+    process.env.VITE_FIREBASE_FIRESTORE_DATABASE_ID ||
     fileConfig.firestoreDatabaseId ||
     DEFAULT_FIRESTORE_DATABASE_ID;
+
+  // Guard against '(default)' on teamacro-a1849 where only the named database exists
+  const firestoreDatabaseId =
+    projectId === DEFAULT_FIREBASE_PROJECT_ID &&
+    (!rawDatabaseId || rawDatabaseId === '(default)' || rawDatabaseId === 'default')
+      ? DEFAULT_FIRESTORE_DATABASE_ID
+      : rawDatabaseId;
 
   const fallbackWebApiKey = Buffer.from(DEFAULT_WEB_API_KEY_B64, 'base64').toString('utf-8');
 
   const apiKey =
     process.env.FIREBASE_API_KEY ||
+    process.env.VITE_FIREBASE_API_KEY ||
     fileConfig.apiKey ||
     fallbackWebApiKey;
 
   const appId =
     process.env.FIREBASE_APP_ID ||
+    process.env.VITE_FIREBASE_APP_ID ||
     fileConfig.appId ||
     DEFAULT_FIREBASE_APP_ID;
 
   const authDomain =
     process.env.FIREBASE_AUTH_DOMAIN ||
+    process.env.VITE_FIREBASE_AUTH_DOMAIN ||
     fileConfig.authDomain ||
     `${projectId}.firebaseapp.com`;
 
   const clientEmail =
     process.env.FIREBASE_CLIENT_EMAIL ||
+    process.env.GOOGLE_CLIENT_EMAIL ||
     serviceAccountJson.client_email ||
     undefined;
 
   const privateKey = normalizePrivateKey(
-    process.env.FIREBASE_PRIVATE_KEY || serviceAccountJson.private_key
+    process.env.FIREBASE_PRIVATE_KEY ||
+      process.env.GOOGLE_PRIVATE_KEY ||
+      serviceAccountJson.private_key
   );
 
   const hasAdminCredentials = Boolean(projectId && clientEmail && privateKey);
@@ -1096,7 +1117,71 @@ export async function writeFirestoreUserProfile(
     }
   }
 
+  if (config.hasAdminCredentials) {
+    return {
+      success: false,
+      syncedToFirestore: false,
+      error: 'FIRESTORE_PROFILE_WRITE_FAILED',
+      errorCode: 'firestore/write-unverified',
+      errorMessage: 'Failed to persist user profile to Cloud Firestore.',
+    };
+  }
+
   return { success: true, syncedToFirestore: false };
+}
+
+/**
+ * Writes a document to a Cloud Firestore collection via Admin SDK or REST API.
+ */
+export async function writeFirestoreDocument(
+  collectionName: string,
+  docId: string,
+  data: Record<string, any>,
+  bearerToken?: string
+): Promise<boolean> {
+  const { db, config } = getFirebaseAdminServices();
+
+  if (db) {
+    try {
+      await withTimeout(db.collection(collectionName).doc(docId).set(data, { merge: true }), 3000);
+      return true;
+    } catch (err: any) {
+      logStructuredServerError({
+        endpoint: 'FIRESTORE_ADMIN_SDK',
+        operation: `WRITE_${collectionName.toUpperCase()}`,
+        errorCategory: 'FIRESTORE_ERROR',
+        firebaseErrorCode: err?.code || 'firestore/write-error',
+        statusCode: 500,
+        message: `Admin SDK write failed for ${collectionName}/${docId}: ${err?.message || 'write error'}`,
+      });
+    }
+  }
+
+  const adminToken = await getServiceAccountAccessToken(config);
+  const effectiveToken = adminToken || bearerToken;
+
+  try {
+    const url = `https://firestore.googleapis.com/v1/projects/${config.projectId}/databases/${config.firestoreDatabaseId}/documents/${encodeURIComponent(collectionName)}/${encodeURIComponent(docId)}`;
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (effectiveToken) {
+      headers['Authorization'] = `Bearer ${effectiveToken}`;
+    }
+    const res = await withTimeout(
+      fetch(url, {
+        method: 'PATCH',
+        headers,
+        body: JSON.stringify({ fields: toFirestoreRestFields(data) }),
+      }),
+      3000
+    );
+    if (res.ok) {
+      return true;
+    }
+  } catch {
+    // Ignore write timeout when offline in local dev
+  }
+
+  return false;
 }
 
 /**
@@ -1191,6 +1276,200 @@ export async function listFirestoreCollection(
 }
 
 /**
+ * Authoritatively reads the Lifetime Super Admin ownership record from Firestore
+ * (`system_ownership` collection and `systemSettings/lifetimeSuperAdmin`).
+ */
+export async function getFirestoreSystemOwnership(bearerToken?: string): Promise<{
+  isInitialized: boolean;
+  lockdownEnforced: boolean;
+  ownerUserId: string | null;
+  ownerEmail: string | null;
+  ownerFullName: string | null;
+  ownerPhone?: string | null;
+  establishedAt: string | null;
+  setupVersion: number;
+} | null> {
+  const [sysOwnPrimary, sysSettingsPrimary, sysOwnList] = await Promise.all([
+    readFirestoreDocument('system_ownership', 'lifetimeSuperAdmin', bearerToken),
+    readFirestoreDocument('systemSettings', 'lifetimeSuperAdmin', bearerToken),
+    listFirestoreCollection('system_ownership', bearerToken),
+  ]);
+
+  const candidate =
+    sysOwnPrimary ||
+    sysOwnList.find((d) => d.isInitialized === true || d.initialized === true || d.ownerUid || d.ownerUserId) ||
+    sysSettingsPrimary;
+
+  if (!candidate) {
+    return null;
+  }
+
+  const ownerUserId =
+    candidate.ownerUserId || candidate.ownerUid || candidate.uid || null;
+  const ownerEmail = candidate.ownerEmail
+    ? String(candidate.ownerEmail).trim().toLowerCase()
+    : null;
+  const ownerFullName = candidate.ownerFullName || candidate.fullName || null;
+  const isInitialized = Boolean(
+    (candidate.isInitialized === true || candidate.initialized === true) && ownerUserId
+  );
+
+  return {
+    isInitialized,
+    lockdownEnforced: Boolean(candidate.lockdownEnforced ?? isInitialized),
+    ownerUserId,
+    ownerEmail,
+    ownerFullName,
+    ownerPhone: candidate.phone || candidate.ownerPhone || null,
+    establishedAt: candidate.establishedAt || candidate.createdAt || null,
+    setupVersion: Number(candidate.setupVersion || 1),
+  };
+}
+
+/**
+ * Persists the authoritative Lifetime Super Admin ownership record to both
+ * `system_ownership/lifetimeSuperAdmin` and `systemSettings/lifetimeSuperAdmin`.
+ */
+export async function saveFirestoreSystemOwnership(
+  ownership: {
+    isInitialized: boolean;
+    lockdownEnforced: boolean;
+    ownerUserId: string | null;
+    ownerEmail: string | null;
+    ownerFullName: string | null;
+    ownerPhone?: string | null;
+    establishedAt: string | null;
+    setupVersion: number;
+  },
+  bearerToken?: string
+): Promise<boolean> {
+  const docPayload = {
+    isInitialized: ownership.isInitialized,
+    initialized: ownership.isInitialized,
+    lockdownEnforced: ownership.lockdownEnforced,
+    ownerUserId: ownership.ownerUserId,
+    ownerUid: ownership.ownerUserId,
+    ownerEmail: ownership.ownerEmail,
+    ownerFullName: ownership.ownerFullName,
+    fullName: ownership.ownerFullName,
+    ...(ownership.ownerPhone ? { phone: ownership.ownerPhone } : {}),
+    role: 'LIFETIME_SUPER_ADMIN',
+    establishedAt: ownership.establishedAt,
+    createdAt: ownership.establishedAt,
+    setupVersion: ownership.setupVersion || 1,
+  };
+
+  const [wroteOwnership, wroteSettings] = await Promise.all([
+    writeFirestoreDocument('system_ownership', 'lifetimeSuperAdmin', docPayload, bearerToken),
+    writeFirestoreDocument('systemSettings', 'lifetimeSuperAdmin', docPayload, bearerToken),
+  ]);
+
+  return wroteOwnership || wroteSettings;
+}
+
+/**
+ * Persists a hashed session record in Firestore `sessions/{tokenHash}` (never stores plaintext session tokens).
+ */
+export async function saveFirestoreSessionHash(
+  sessionRecord: {
+    tokenHash: string;
+    userId: string;
+    email: string;
+    role: string;
+    mfaVerified: boolean;
+    createdAt: number;
+    expiresAt: number;
+    lastSeenAt: number;
+    revoked?: boolean;
+  },
+  bearerToken?: string
+): Promise<boolean> {
+  return writeFirestoreDocument(
+    'sessions',
+    sessionRecord.tokenHash,
+    {
+      tokenHash: sessionRecord.tokenHash,
+      userId: sessionRecord.userId,
+      email: sessionRecord.email.toLowerCase().trim(),
+      role: sessionRecord.role,
+      mfaVerified: sessionRecord.mfaVerified,
+      createdAt: sessionRecord.createdAt,
+      expiresAt: sessionRecord.expiresAt,
+      lastSeenAt: sessionRecord.lastSeenAt,
+      revoked: Boolean(sessionRecord.revoked),
+    },
+    bearerToken
+  );
+}
+
+/**
+ * Reads a session record by its SHA-256 `tokenHash` from Firestore `sessions/{tokenHash}`.
+ */
+export async function getFirestoreSessionByHash(
+  tokenHash: string,
+  bearerToken?: string
+): Promise<Record<string, any> | null> {
+  if (!tokenHash) return null;
+  return readFirestoreDocument('sessions', tokenHash, bearerToken);
+}
+
+/**
+ * Marks a session record as revoked in Firestore `sessions/{tokenHash}`.
+ */
+export async function revokeFirestoreSessionByHash(
+  tokenHash: string,
+  bearerToken?: string
+): Promise<boolean> {
+  if (!tokenHash) return false;
+  return writeFirestoreDocument(
+    'sessions',
+    tokenHash,
+    { revoked: true, revokedAt: Date.now() },
+    bearerToken
+  );
+}
+
+/**
+ * Persists an access invitation metadata record (with hashed code, never plaintext) to Firestore `invitations/{id}`.
+ */
+export async function saveFirestoreInvitation(
+  invitation: Record<string, any>,
+  bearerToken?: string
+): Promise<boolean> {
+  if (!invitation?.id) return false;
+  return writeFirestoreDocument('invitations', invitation.id, invitation, bearerToken);
+}
+
+/**
+ * Lists access invitations from Firestore `invitations`.
+ */
+export async function listFirestoreInvitations(
+  bearerToken?: string
+): Promise<Array<Record<string, any>>> {
+  return listFirestoreCollection('invitations', bearerToken);
+}
+
+/**
+ * Persists an audit log entry to Firestore `audit_logs/{id}`.
+ */
+export async function saveFirestoreAuditLog(
+  entry: Record<string, any>,
+  bearerToken?: string
+): Promise<boolean> {
+  if (!entry?.id) return false;
+  return writeFirestoreDocument('audit_logs', entry.id, entry, bearerToken);
+}
+
+/**
+ * Lists audit log entries from Firestore `audit_logs`.
+ */
+export async function listFirestoreAuditLogs(
+  bearerToken?: string
+): Promise<Array<Record<string, any>>> {
+  return listFirestoreCollection('audit_logs', bearerToken);
+}
+
+/**
  * Verifies credentials against Firebase Authentication (`accounts:signInWithPassword`)
  * and resolves the user's authoritative role and active status from Firestore on serverless cold starts.
  */
@@ -1248,19 +1527,23 @@ export async function authenticateWithFirebaseOnColdStart(
       return { authenticated: false };
     }
 
-    const [adminDoc, staffDoc, userDoc] = await Promise.all([
+    const [adminDoc, staffDoc, userDoc, ownership] = await Promise.all([
       readFirestoreDocument('admins', uid, idToken),
       readFirestoreDocument('staff', uid, idToken),
       readFirestoreDocument('users', uid, idToken),
+      getFirestoreSystemOwnership(idToken),
     ]);
 
     const profile = adminDoc || staffDoc || userDoc;
     if (profile) {
-      const isRootOwner =
-        cleanEmail === AUTHORIZED_SUPER_ADMIN_EMAIL ||
-        adminDoc?.role === 'LIFETIME_SUPER_ADMIN' ||
-        userDoc?.role === 'LIFETIME_SUPER_ADMIN' ||
-        userDoc?.role === 'SUPER_ADMIN';
+      const isVerifiedOwner = Boolean(
+        ownership?.isInitialized &&
+          ownership.ownerUserId &&
+          ownership.ownerUserId === uid &&
+          (adminDoc?.role === 'LIFETIME_SUPER_ADMIN' ||
+            userDoc?.role === 'LIFETIME_SUPER_ADMIN' ||
+            userDoc?.role === 'SUPER_ADMIN')
+      );
       return {
         authenticated: true,
         uid,
@@ -1274,31 +1557,15 @@ export async function authenticateWithFirebaseOnColdStart(
           uid,
           email: cleanEmail,
           fullName: profile.fullName || data.displayName || cleanEmail.split('@')[0],
-          role: isRootOwner
+          role: isVerifiedOwner
             ? 'LIFETIME_SUPER_ADMIN'
             : adminDoc
             ? 'ADMIN'
             : staffDoc
             ? 'STAFF'
+            : userDoc?.role === 'LIFETIME_SUPER_ADMIN' || userDoc?.role === 'SUPER_ADMIN'
+            ? 'STAFF'
             : userDoc?.role || 'STAFF',
-        },
-      };
-    }
-
-    if (cleanEmail === AUTHORIZED_SUPER_ADMIN_EMAIL) {
-      return {
-        authenticated: true,
-        uid,
-        email: cleanEmail,
-        idToken,
-        profile: {
-          id: uid,
-          uid,
-          email: cleanEmail,
-          fullName: data.displayName || 'Davidson Eromosele',
-          role: 'LIFETIME_SUPER_ADMIN',
-          status: 'active',
-          active: true,
         },
       };
     }

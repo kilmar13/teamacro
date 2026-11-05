@@ -10,6 +10,7 @@ import {
   writeFirestoreUserProfile,
   readFirestoreDocument,
   listFirestoreCollection,
+  getFirestoreSystemOwnership,
   authenticateWithFirebaseOnColdStart,
   logStructuredServerError,
 } from './src/server/firebaseAdmin.js';
@@ -281,16 +282,17 @@ async function authenticateRequest(req: Request): Promise<UserSession | null> {
         const ip = getClientIp(req);
         const userAgent = (req.headers['user-agent'] as string) || 'unknown';
 
-        // Check if Lifetime Super Admin
-        if (
-          email === 'eromoseledavidson68@gmail.com' ||
-          serverAuthManager.isOwnerEmail(email)
-        ) {
+        // Check if verified Lifetime Super Admin against authoritative ownership record
+        const fsOwnership = await getFirestoreSystemOwnership(jwtToken).catch(() => null);
+        if (fsOwnership?.isInitialized && fsOwnership.ownerUserId) {
+          serverAuthManager.syncOwnershipRecord(fsOwnership);
+        }
+        if (serverAuthManager.isVerifiedOwner(uid, email)) {
           const session = serverAuthManager.syncSuperAdminSession(
             {
               uid,
               email,
-              fullName: verifiedToken.name || 'Davidson Eromosele',
+              fullName: verifiedToken.name || fsOwnership?.ownerFullName || 'David Eromosele',
             },
             ip,
             userAgent
@@ -506,37 +508,29 @@ function apiHandler(fn: (req: Request, res: Response, next: NextFunction) => Pro
  */
 app.get('/api/auth/setup-status', apiHandler(async (req: Request, res: Response) => {
   try {
-    const data = await withServerTimeout(
-      readFirestoreDocument('systemSettings', 'lifetimeSuperAdmin'),
+    const fsOwnership = await withServerTimeout(
+      getFirestoreSystemOwnership(),
       1500
     );
-    if (data && data.initialized === true) {
+    if (fsOwnership && fsOwnership.isInitialized && fsOwnership.ownerUserId) {
+      serverAuthManager.syncOwnershipRecord(fsOwnership);
       return res.status(200).json({
         success: true,
         status: 'INITIALIZED',
         isInitialized: true,
         lockdownEnforced: true,
-        establishedAt: data.createdAt || null,
-        ownerEmail: data.ownerEmail || null,
-        ownerFullName: data.fullName || null,
+        establishedAt: fsOwnership.establishedAt || null,
+        ownerUid: fsOwnership.ownerUserId,
+        ownerEmail: fsOwnership.ownerEmail || null,
+        ownerFullName: fsOwnership.ownerFullName || null,
         message: 'INITIAL SETUP COMPLETED — ROOT REGISTRATION LOCKED',
         data: {
           status: 'INITIALIZED',
           isInitialized: true,
           lockdownEnforced: true,
-        },
-      });
-    } else if (data !== null) {
-      return res.status(200).json({
-        success: true,
-        status: 'NOT_INITIALIZED',
-        isInitialized: false,
-        lockdownEnforced: false,
-        message: 'Lifetime Super Admin has not yet been registered. Initial setup open.',
-        data: {
-          status: 'NOT_INITIALIZED',
-          isInitialized: false,
-          lockdownEnforced: false,
+          ownerUid: fsOwnership.ownerUserId,
+          ownerEmail: fsOwnership.ownerEmail || null,
+          ownerFullName: fsOwnership.ownerFullName || null,
         },
       });
     }
@@ -569,25 +563,47 @@ app.get('/api/auth/setup-status', apiHandler(async (req: Request, res: Response)
 
 /**
  * POST /api/auth/sync-super-admin
- * Authoritatively syncs verified Firebase Auth Super Admin credentials to server session.
- * Completely free of MFA requirements.
+ * Authoritatively syncs verified Lifetime Super Admin identity against Firestore system_ownership.
  */
 app.post('/api/auth/sync-super-admin', apiHandler(async (req: Request, res: Response) => {
-  const { uid, email, fullName, phone } = req.body || {};
+  const { uid, email, fullName, phone, idToken } = req.body || {};
+  const correlationId = generateCorrelationId(req);
   if (!uid || !email) {
     return res.status(400).json({
       success: false,
       message: 'UID and email required.',
       error: 'UID and email required.',
+      correlationId,
     });
   }
 
   const cleanEmail = String(email).trim().toLowerCase();
-  if (cleanEmail !== 'eromoseledavidson68@gmail.com' && !serverAuthManager.isOwnerEmail(cleanEmail)) {
+  const cleanUid = String(uid).trim();
+
+  try {
+    const fsOwnership = await withServerTimeout(getFirestoreSystemOwnership(idToken), 1500);
+    if (fsOwnership?.isInitialized && fsOwnership.ownerUserId) {
+      serverAuthManager.syncOwnershipRecord(fsOwnership);
+    }
+  } catch {
+    // Proceed with server ownership baseline if Firestore read times out
+  }
+
+  if (!serverAuthManager.isVerifiedOwner(cleanUid, cleanEmail)) {
+    logStructuredServerError({
+      correlationId,
+      endpoint: '/api/auth/sync-super-admin',
+      operation: 'SYNC_SUPER_ADMIN_OWNERSHIP_CHECK',
+      errorCategory: 'PERMISSION_DENIED',
+      firebaseErrorCode: 'auth/insufficient-permission',
+      statusCode: 403,
+      message: `Rejected sync-super-admin for email=${cleanEmail}, uid=${cleanUid}: does not match verified owner record.`,
+    });
     return res.status(403).json({
       success: false,
-      message: 'Clearance Violation: Only the Lifetime Super Admin can establish Super Admin privileges.',
+      message: 'Clearance Violation: Only the verified Lifetime Super Admin owner record can establish Super Admin privileges.',
       error: 'Clearance Violation',
+      correlationId,
     });
   }
 
@@ -595,7 +611,7 @@ app.post('/api/auth/sync-super-admin', apiHandler(async (req: Request, res: Resp
   const userAgent = req.headers['user-agent'] || 'unknown';
 
   const session = serverAuthManager.syncSuperAdminSession(
-    { uid, email: cleanEmail, fullName: fullName || 'Lifetime Super Admin', phone },
+    { uid: cleanUid, email: cleanEmail, fullName: fullName || 'David Eromosele', phone },
     ip,
     userAgent
   );
@@ -736,7 +752,7 @@ app.post('/api/auth/setup-root', async (req: Request, res: Response) => {
  * ZERO demo accounts, ZERO auto-fills.
  */
 app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
-  const { identifier, password, syncedProfile } = req.body || {};
+  const { identifier, password } = req.body || {};
   const ip = getClientIp(req);
   const userAgent = (req.headers['user-agent'] as string) || 'unknown';
 
@@ -751,32 +767,58 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
     });
   }
 
-  // If a serverless instance cold-started and does not yet have a Super Admin-created Staff/Admin profile in memory,
-  // hydrate it ONLY if the email matches an existing server-issued invitation or non-Super-Admin staff record.
-  // Never allow client payload manipulation to escalate to LIFETIME_SUPER_ADMIN.
-  if (
-    syncedProfile &&
-    typeof syncedProfile === 'object' &&
-    syncedProfile.email &&
-    syncedProfile.role !== 'LIFETIME_SUPER_ADMIN' &&
-    syncedProfile.role !== 'SUPER_ADMIN' &&
-    !serverAuthManager.findAccountByIdentifier(cleanIdentifier)
-  ) {
-    const safeRole = syncedProfile.role === 'ADMIN' ? 'ADMIN' : 'STAFF';
-    serverAuthManager.syncProvisionedAccount({
-      id: syncedProfile.id,
-      email: syncedProfile.email,
-      username: syncedProfile.username,
-      fullName: syncedProfile.fullName || syncedProfile.name || syncedProfile.email,
-      phone: syncedProfile.phone,
-      role: safeRole,
-      roleTitle: syncedProfile.roleTitle || syncedProfile.duty,
-      duty: syncedProfile.duty || syncedProfile.roleTitle,
-      staffCode: syncedProfile.staffCode,
-      password: syncedProfile.initialPassword || syncedProfile.password,
-      accessCode: syncedProfile.accessCode,
-      status: syncedProfile.status || (syncedProfile.active === false ? 'suspended' : 'active'),
-    });
+  // Synchronize authoritative ownership and cold-start Firestore accounts before credential check
+  try {
+    const fsOwnership = await withServerTimeout(getFirestoreSystemOwnership(), 1200);
+    if (fsOwnership?.isInitialized && fsOwnership.ownerUserId) {
+      serverAuthManager.syncOwnershipRecord(fsOwnership);
+    }
+  } catch {
+    // Non-fatal if Firestore ownership lookup times out
+  }
+
+  if (!serverAuthManager.findAccountByIdentifier(cleanIdentifier)) {
+    try {
+      const [fsAdmins, fsStaff] = await withServerTimeout(
+        Promise.all([
+          listFirestoreCollection('admins'),
+          listFirestoreCollection('staff'),
+        ]),
+        1500
+      );
+      for (const adm of fsAdmins) {
+        if (adm.email && String(adm.email).toLowerCase() === cleanIdentifier.toLowerCase()) {
+          serverAuthManager.syncProvisionedAccount({
+            id: String(adm.uid || adm.id),
+            email: String(adm.email),
+            fullName: String(adm.fullName || adm.email),
+            phone: String(adm.phone || ''),
+            role: 'ADMIN',
+            roleTitle: String(adm.roleTitle || adm.duty || 'Executive Administrator'),
+            duty: String(adm.duty || adm.roleTitle || 'Executive Administrator'),
+            staffCode: adm.staffCode ? String(adm.staffCode) : undefined,
+            status: adm.active === false || adm.status === 'suspended' ? 'suspended' : 'active',
+          });
+        }
+      }
+      for (const stf of fsStaff) {
+        if (stf.email && String(stf.email).toLowerCase() === cleanIdentifier.toLowerCase()) {
+          serverAuthManager.syncProvisionedAccount({
+            id: String(stf.uid || stf.id),
+            email: String(stf.email),
+            fullName: String(stf.fullName || stf.email),
+            phone: String(stf.phone || ''),
+            role: 'STAFF',
+            roleTitle: String(stf.roleTitle || stf.duty || 'Operations Officer'),
+            duty: String(stf.duty || stf.roleTitle || 'Operations Officer'),
+            staffCode: stf.staffCode ? String(stf.staffCode) : undefined,
+            status: stf.active === false || stf.status === 'suspended' ? 'suspended' : 'active',
+          });
+        }
+      }
+    } catch {
+      // Non-fatal if cold-start collection list times out
+    }
   }
 
   let result = serverAuthManager.authenticateCredentials(cleanIdentifier, cleanPassword, ip);
@@ -791,15 +833,14 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
         const rawRole = String(profile.role || 'STAFF').toUpperCase();
         const isRootSuperAdmin =
           (rawRole === 'LIFETIME_SUPER_ADMIN' || rawRole === 'SUPER_ADMIN') &&
-          (fbAuth.email.toLowerCase() === 'eromoseledavidson68@gmail.com' ||
-            serverAuthManager.isOwnerEmail(fbAuth.email));
+          serverAuthManager.isVerifiedOwner(fbAuth.uid, fbAuth.email);
 
         if (isRootSuperAdmin) {
           serverAuthManager.syncSuperAdminSession(
             {
               uid: fbAuth.uid,
               email: fbAuth.email,
-              fullName: String(profile.fullName || 'Davidson Eromosele'),
+              fullName: String(profile.fullName || 'David Eromosele'),
               phone: String(profile.phone || '+234 800 000 0001'),
               password: cleanPassword,
             },
