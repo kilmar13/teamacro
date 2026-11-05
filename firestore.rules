@@ -167,7 +167,17 @@ service cloud.firestore {
 
     match /system_ownership/{ownershipId} {
       allow get, list: if true;
-      allow create, update: if isSuperAdmin();
+      allow create: if isSuperAdmin() || (
+        ownershipId == 'lifetimeSuperAdmin' &&
+        isValidSystemSetting(incoming()) &&
+        (!exists(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin) ||
+         incoming().ownerUid == get(/databases/$(database)/documents/systemSettings/lifetimeSuperAdmin).data.ownerUid)
+      );
+      allow update: if isSuperAdmin() || (
+        ownershipId == 'lifetimeSuperAdmin' &&
+        isValidSystemSetting(incoming()) &&
+        incoming().ownerUid == existing().ownerUid
+      );
       allow delete: if false;
     }
 

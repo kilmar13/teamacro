@@ -329,12 +329,191 @@
         }
       },
       "required": ["id", "fullName", "phone"]
+    },
+    "SystemOwnership": {
+      "title": "SystemOwnership",
+      "description": "Authoritative singleton record defining the unique Lifetime Super Admin owner.",
+      "type": "object",
+      "properties": {
+        "isInitialized": {
+          "type": "boolean",
+          "description": "Whether the root ownership record is initialized."
+        },
+        "lockdownEnforced": {
+          "type": "boolean",
+          "description": "Whether initial root setup lockdown is enforced."
+        },
+        "ownerUserId": {
+          "type": "string",
+          "description": "Unique UID of the Lifetime Super Admin."
+        },
+        "ownerEmail": {
+          "type": "string",
+          "format": "email",
+          "description": "Official email of the Lifetime Super Admin."
+        },
+        "ownerFullName": {
+          "type": "string",
+          "description": "Full legal name of the Lifetime Super Admin."
+        },
+        "establishedAt": {
+          "type": "string",
+          "description": "ISO timestamp when ownership was established."
+        },
+        "setupVersion": {
+          "type": "number",
+          "description": "Ownership schema version."
+        }
+      },
+      "required": ["isInitialized", "ownerUserId", "ownerEmail"]
+    },
+    "Invitation": {
+      "title": "Invitation",
+      "description": "Hashed access code invitation metadata for Admin and Staff provisioning.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Invitation identifier."
+        },
+        "email": {
+          "type": "string",
+          "description": "Target recipient email."
+        },
+        "accessType": {
+          "type": "string",
+          "enum": ["Admin", "Staff"],
+          "description": "Target role category."
+        },
+        "duty": {
+          "type": "string",
+          "description": "Assigned operational responsibility."
+        },
+        "codeHash": {
+          "type": "string",
+          "description": "Salted SHA-256 hash of the access code."
+        },
+        "codeSalt": {
+          "type": "string",
+          "description": "Cryptographic salt for the access code hash."
+        },
+        "expiresAt": {
+          "type": "number",
+          "description": "Expiration epoch timestamp in milliseconds."
+        },
+        "used": {
+          "type": "boolean",
+          "description": "Whether the invitation has been redeemed."
+        },
+        "revoked": {
+          "type": "boolean",
+          "description": "Whether the invitation has been revoked."
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "ISO creation timestamp."
+        },
+        "createdBy": {
+          "type": "string",
+          "description": "Creator UID."
+        }
+      },
+      "required": ["id", "email", "accessType", "duty", "codeHash", "codeSalt"]
+    },
+    "AuditLog": {
+      "title": "AuditLog",
+      "description": "Immutable security and governance audit trail record.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Audit record identifier."
+        },
+        "actorId": {
+          "type": "string",
+          "description": "UID of the user performing the action."
+        },
+        "actorName": {
+          "type": "string",
+          "description": "Full name of the actor."
+        },
+        "actorRole": {
+          "type": "string",
+          "description": "Role of the actor at time of action."
+        },
+        "action": {
+          "type": "string",
+          "description": "Action code."
+        },
+        "resource": {
+          "type": "string",
+          "description": "Target API route or resource."
+        },
+        "details": {
+          "type": "string",
+          "description": "Redacted diagnostic details."
+        },
+        "timestamp": {
+          "type": "string",
+          "description": "ISO timestamp."
+        },
+        "status": {
+          "type": "string",
+          "enum": ["SUCCESS", "DENIED", "LOCKED", "FLAGGED"],
+          "description": "Outcome status."
+        }
+      },
+      "required": ["id", "actorId", "action", "resource", "timestamp", "status"]
+    },
+    "Session": {
+      "title": "Session",
+      "description": "Server-validated session metadata keyed by SHA-256 tokenHash (never plaintext token).",
+      "type": "object",
+      "properties": {
+        "tokenHash": {
+          "type": "string",
+          "description": "SHA-256 hash of the session token."
+        },
+        "userId": {
+          "type": "string",
+          "description": "Authenticated user UID."
+        },
+        "email": {
+          "type": "string",
+          "description": "Authenticated user email."
+        },
+        "role": {
+          "type": "string",
+          "description": "Authenticated role."
+        },
+        "mfaVerified": {
+          "type": "boolean",
+          "description": "Whether MFA was verified for this session."
+        },
+        "createdAt": {
+          "type": "number",
+          "description": "Creation epoch timestamp."
+        },
+        "expiresAt": {
+          "type": "number",
+          "description": "Expiration epoch timestamp."
+        },
+        "revoked": {
+          "type": "boolean",
+          "description": "Whether the session has been revoked."
+        }
+      },
+      "required": ["tokenHash", "userId", "email", "role", "expiresAt"]
     }
   },
   "firestore": {
     "/systemSettings/{settingId}": {
       "schema": { "$ref": "#/entities/SystemSetting" },
       "description": "Singleton configuration and root lockdown settings for the platform."
+    },
+    "/system_ownership/{ownershipId}": {
+      "schema": { "$ref": "#/entities/SystemOwnership" },
+      "description": "Authoritative singleton record for Lifetime Super Admin ownership."
     },
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/User" },
@@ -347,6 +526,18 @@
     "/staff/{staffId}": {
       "schema": { "$ref": "#/entities/Staff" },
       "description": "Staff authorization mapping and operational duty records."
+    },
+    "/invitations/{invitationId}": {
+      "schema": { "$ref": "#/entities/Invitation" },
+      "description": "Hashed access authorization invitations."
+    },
+    "/audit_logs/{auditId}": {
+      "schema": { "$ref": "#/entities/AuditLog" },
+      "description": "Immutable security and operational audit logs."
+    },
+    "/sessions/{sessionId}": {
+      "schema": { "$ref": "#/entities/Session" },
+      "description": "Hashed server session records."
     },
     "/customers/{customerId}": {
       "schema": { "$ref": "#/entities/Customer" },
