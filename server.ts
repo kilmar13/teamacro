@@ -14,6 +14,12 @@ import {
   authenticateWithFirebaseOnColdStart,
   logStructuredServerError,
   inspectFirebaseAdminEnvironment,
+  runDeepHealthDiagnostics,
+  getFirestoreSessionByHash,
+  revokeFirestoreSessionByHash,
+  listFirestoreInvitations,
+  saveFirestoreInvitation,
+  setFirebaseAuthUserDisabled,
 } from './src/server/firebaseAdmin.js';
 
 // ============================================================================
@@ -110,6 +116,7 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
   if (
     !req.url.startsWith('/api') &&
     (req.url.startsWith('/auth/') ||
+      req.url.startsWith('/admin/diagnostics') ||
       req.url.startsWith('/customers') ||
       req.url.startsWith('/financial/') ||
       req.url.startsWith('/audit/') ||
@@ -210,12 +217,30 @@ async function authenticateRequest(req: Request): Promise<UserSession | null> {
     }
   }
 
-  // 1. Check direct session token candidates (internal session hex tokens)
+  // 1. Check direct session token candidates (internal session hex tokens or signed tmr_s1_ tokens)
   const sessionCandidates = [customSessionToken, cookieToken, bearerToken].filter(
     (t) => t && t.split('.').length !== 3
   );
 
   for (const tok of sessionCandidates) {
+    const peeked = serverAuthManager.peekSessionToken(tok);
+    if (peeked) {
+      const tokenHash = serverAuthManager.getSessionTokenHash(tok);
+      try {
+        const fsSession = await withServerTimeout(getFirestoreSessionByHash(tokenHash), 1200);
+        if (fsSession && fsSession.revoked === true) {
+          serverAuthManager.markTokenRevokedInMemory(tok);
+          continue;
+        }
+      } catch {
+        // Non-fatal if Firestore session hash check times out
+      }
+
+      if (peeked.role !== 'LIFETIME_SUPER_ADMIN') {
+        await ensureAccountHydratedFromFirestore(peeked.userId, undefined, true);
+      }
+    }
+
     const session = serverAuthManager.validateSession(tok);
     if (session) {
       return session;
@@ -244,7 +269,7 @@ async function authenticateRequest(req: Request): Promise<UserSession | null> {
         if (serverAuthManager.isVerifiedOwner(uid, email)) {
           const session = serverAuthManager.syncSuperAdminSession(
             {
-              uid,
+              uid: fsOwnership?.ownerUserId || uid,
               email,
               fullName: verifiedToken.name || fsOwnership?.ownerFullName || 'David Eromosele',
             },
@@ -254,27 +279,11 @@ async function authenticateRequest(req: Request): Promise<UserSession | null> {
           return session;
         }
 
-        // Check if registered Admin or Staff in memory
-        let account = serverAuthManager.findAccountByIdentifier(email);
-        if (!account && uid) {
-          // Check Firestore on cold start if not yet in memory
-          const fsUser = await readFirestoreDocument('users', uid, jwtToken);
-          if (fsUser && fsUser.email && (fsUser.role === 'ADMIN' || fsUser.role === 'STAFF')) {
-            const synced = serverAuthManager.syncProvisionedAccount({
-              id: uid,
-              email: String(fsUser.email),
-              fullName: String(fsUser.fullName || fsUser.email),
-              phone: String(fsUser.phone || ''),
-              role: fsUser.role === 'ADMIN' ? 'ADMIN' : 'STAFF',
-              roleTitle: String(fsUser.roleTitle || fsUser.duty || ''),
-              duty: String(fsUser.duty || fsUser.roleTitle || ''),
-              status: fsUser.active === false || fsUser.status === 'suspended' ? 'suspended' : 'active',
-            });
-            if (synced) {
-              account = synced;
-            }
-          }
+        // Check if registered Admin or Staff in Firestore/memory
+        if (uid) {
+          await ensureAccountHydratedFromFirestore(uid, jwtToken, true);
         }
+        const account = serverAuthManager.findAccountByIdentifier(email);
 
         if (account && account.status === 'active') {
           return serverAuthManager.createSession(account, ip, userAgent, true);
@@ -283,12 +292,6 @@ async function authenticateRequest(req: Request): Promise<UserSession | null> {
     } catch (jwtErr) {
       console.warn('[SERVER AUTH] JWT verification warning:', jwtErr);
     }
-  }
-
-  // 3. Fallback: check any remaining session token
-  const genericToken = extractSessionToken(req);
-  if (genericToken) {
-    return serverAuthManager.validateSession(genericToken);
   }
 
   return null;
@@ -302,9 +305,13 @@ function getClientIp(req: Request): string {
   return req.socket.remoteAddress || '127.0.0.1';
 }
 
-function setSessionCookie(res: Response, token: string): void {
-  const isProd = process.env.NODE_ENV === 'production';
-  const secureFlag = isProd ? '; Secure' : '';
+function setSessionCookie(res: Response, token: string, req?: Request): void {
+  const isSecure =
+    process.env.NODE_ENV === 'production' ||
+    Boolean(process.env.VERCEL) ||
+    Boolean(req?.secure) ||
+    req?.headers?.['x-forwarded-proto'] === 'https';
+  const secureFlag = isSecure ? '; Secure' : '';
   res.setHeader(
     'Set-Cookie',
     `teamacro_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=7200${secureFlag}`
@@ -366,16 +373,54 @@ app.get('/health', (_req: Request, res: Response) => {
   });
 });
 
-app.get('/api/health', (_req: Request, res: Response) => {
-  const firebaseDiagnostics = inspectFirebaseAdminEnvironment();
-  res.status(200).json({
-    status: 'UP',
-    service: 'TEAMACRO SERVICES LTD - Management Platform',
-    rcNumber: 'RC-1589421',
-    uptimeSeconds: Math.round(process.uptime()),
-    timestamp: new Date().toISOString(),
-    firebaseAdmin: firebaseDiagnostics,
-  });
+app.get('/api/health', async (req: Request, res: Response) => {
+  try {
+    const forceRefresh = req.query.force === 'true' || req.query.refresh === 'true';
+    const simulateFailure = Boolean(req.headers['x-test-simulate-health-failure']);
+    const diag = await runDeepHealthDiagnostics(forceRefresh, simulateFailure);
+    const firebaseDiagnostics = inspectFirebaseAdminEnvironment();
+
+    return res.status(diag.httpStatus).json({
+      status: diag.status,
+      healthy: diag.healthy,
+      service: 'TEAMACRO SERVICES LTD - Management Platform',
+      rcNumber: 'RC-1589421',
+      uptimeSeconds: Math.round(process.uptime()),
+      timestamp: diag.timestamp,
+      latencyMs: diag.latencyMs,
+      checks: diag.checks,
+      environment: diag.environment,
+      firebaseAdmin: {
+        projectId: firebaseDiagnostics.projectId,
+        firestoreDatabaseId: firebaseDiagnostics.firestoreDatabaseId,
+        hasServiceAccountKeyEnv: firebaseDiagnostics.hasServiceAccountKeyEnv,
+        serviceAccountKeyValidJson: firebaseDiagnostics.serviceAccountKeyValidJson,
+        hasAdminCredentials: firebaseDiagnostics.hasAdminCredentials,
+        credentialSource: firebaseDiagnostics.credentialSource,
+        adminAppInitialized: firebaseDiagnostics.adminAppInitialized,
+        singletonAppCount: firebaseDiagnostics.singletonAppCount,
+        missingEnvVars: firebaseDiagnostics.missingEnvVars,
+      },
+    });
+  } catch (err: any) {
+    return res.status(503).json({
+      status: 'DOWN',
+      healthy: false,
+      service: 'TEAMACRO SERVICES LTD - Management Platform',
+      rcNumber: 'RC-1589421',
+      timestamp: new Date().toISOString(),
+      checks: {
+        backendResponding: true,
+        firebaseAdminInitialized: false,
+        serviceAccountCredentialsValid: false,
+        correctFirestoreDatabaseSelected: false,
+        firestoreConnectivity: false,
+        systemOwnershipReadable: false,
+        authServiceAvailable: false,
+      },
+      error: err?.message || 'Health check failed.',
+    });
+  }
 });
 
 app.get('/api/regulatory', (_req: Request, res: Response) => {
@@ -426,6 +471,9 @@ function generateCorrelationId(req?: Request): string {
 function apiHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<any> | any) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
+      if (req.headers['x-test-simulate-cold-start'] === 'true') {
+        serverAuthManager.simulateServerlessColdStart();
+      }
       await fn(req, res, next);
     } catch (err: any) {
       const correlationId = generateCorrelationId(req);
@@ -518,34 +566,208 @@ app.get('/api/auth/setup-status', apiHandler(async (req: Request, res: Response)
 }));
 
 /**
- * POST /api/auth/sync-super-admin
- * Authoritatively syncs verified Lifetime Super Admin identity against Firestore system_ownership.
+ * Protected Administrator-Only Diagnostic Endpoint
+ * Available at GET /api/admin/diagnostics and GET /api/auth/diagnostics
+ * Never exposes private keys, service-account JSON, passwords, or raw session tokens.
  */
-app.post('/api/auth/sync-super-admin', apiHandler(async (req: Request, res: Response) => {
-  const { uid, email, fullName, phone, idToken } = req.body || {};
+const handleAdminDiagnostics = apiHandler(async (req: Request, res: Response) => {
   const correlationId = generateCorrelationId(req);
-  if (!uid || !email) {
-    return res.status(400).json({
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
       success: false,
-      message: 'UID and email required.',
-      error: 'UID and email required.',
+      error: {
+        code: 'AUTHENTICATION_REQUIRED',
+        message: 'Authentication required to access administrative diagnostics.',
+        correlationId,
+      },
+      message: 'Authentication required to access administrative diagnostics.',
       correlationId,
+      statusCode: 401,
     });
   }
 
-  const cleanEmail = String(email).trim().toLowerCase();
-  const cleanUid = String(uid).trim();
-
-  try {
-    const fsOwnership = await withServerTimeout(getFirestoreSystemOwnership(idToken), 1500);
-    if (fsOwnership?.isInitialized && fsOwnership.ownerUserId) {
-      serverAuthManager.syncOwnershipRecord(fsOwnership);
-    }
-  } catch {
-    // Proceed with server ownership baseline if Firestore read times out
+  if (session.role !== 'LIFETIME_SUPER_ADMIN' && session.role !== 'ADMIN') {
+    return res.status(403).json({
+      success: false,
+      error: {
+        code: 'INSUFFICIENT_PRIVILEGES',
+        message: 'Administrative clearance required to view system diagnostics.',
+        correlationId,
+      },
+      message: 'Administrative clearance required to view system diagnostics.',
+      correlationId,
+      statusCode: 403,
+    });
   }
 
-  if (!serverAuthManager.isVerifiedOwner(cleanUid, cleanEmail)) {
+  const [healthDiag, ownership, usersList, adminsList, staffList, invitationsList] = await Promise.all([
+    runDeepHealthDiagnostics(true),
+    getFirestoreSystemOwnership().catch(() => null),
+    listFirestoreCollection('users').catch(() => []),
+    listFirestoreCollection('admins').catch(() => []),
+    listFirestoreCollection('staff').catch(() => []),
+    listFirestoreInvitations().catch(() => []),
+  ]);
+
+  const envReport = inspectFirebaseAdminEnvironment();
+
+  return res.status(healthDiag.httpStatus).json({
+    success: healthDiag.healthy,
+    status: healthDiag.status,
+    healthy: healthDiag.healthy,
+    correlationId,
+    timestamp: new Date().toISOString(),
+    checks: healthDiag.checks,
+    environment: envReport,
+    firestore: {
+      systemOwnership: {
+        isInitialized: Boolean(ownership?.isInitialized),
+        ownerUserId: ownership?.ownerUserId || null,
+        lockdownEnforced: Boolean(ownership?.lockdownEnforced),
+      },
+    },
+    firestoreCollections: {
+      usersCount: usersList.length,
+      adminsCount: adminsList.length,
+      staffCount: staffList.length,
+      invitationsCount: invitationsList.length,
+      systemOwnershipInitialized: Boolean(ownership?.isInitialized),
+      systemOwnershipLockdownEnforced: Boolean(ownership?.lockdownEnforced),
+    },
+  });
+});
+
+app.get('/api/admin/diagnostics', handleAdminDiagnostics);
+app.get('/api/auth/diagnostics', handleAdminDiagnostics);
+
+/**
+ * POST /api/auth/sync-super-admin
+ * Authoritatively verifies a Firebase ID token via Firebase Admin SDK and compares the verified UID
+ * against the authoritative `system_ownership` record in Firestore.
+ * Never trusts unverified browser-submitted UID or email values.
+ */
+app.post('/api/auth/sync-super-admin', apiHandler(async (req: Request, res: Response) => {
+  const { uid: bodyUid, email: bodyEmail, fullName, phone, idToken: bodyIdToken } = req.body || {};
+  const correlationId = generateCorrelationId(req);
+
+  const callerJwt = extractCallerFirebaseToken(req);
+  const effectiveIdToken = typeof bodyIdToken === 'string' && bodyIdToken.trim() ? bodyIdToken.trim() : callerJwt;
+
+  // Reject unverified requests that do not present a real Firebase ID token (JWT)
+  if (!effectiveIdToken || effectiveIdToken.split('.').length !== 3) {
+    const msg = 'A verified Firebase ID token is required to synchronize Super Admin session privileges.';
+    logStructuredServerError({
+      correlationId,
+      endpoint: '/api/auth/sync-super-admin',
+      operation: 'SYNC_SUPER_ADMIN_TOKEN_REQUIRED',
+      errorCategory: 'AUTHENTICATION_REQUIRED',
+      firebaseErrorCode: 'auth/missing-id-token',
+      statusCode: 401,
+      message: `Rejected unverified sync-super-admin request without Firebase ID token (submitted uid=${bodyUid || 'none'}, email=${bodyEmail || 'none'}).`,
+    });
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: 'FIREBASE_ID_TOKEN_REQUIRED',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      statusCode: 401,
+    });
+  }
+
+  // 1. Cryptographically verify the Firebase ID token using Firebase Admin SDK
+  const verifiedToken = await verifyFirebaseIdToken(effectiveIdToken);
+  if (!verifiedToken.valid || !verifiedToken.verified || !verifiedToken.uid) {
+    const msg = 'Invalid, expired, or unverified Firebase ID token.';
+    logStructuredServerError({
+      correlationId,
+      endpoint: '/api/auth/sync-super-admin',
+      operation: 'SYNC_SUPER_ADMIN_TOKEN_VERIFY',
+      errorCategory: 'AUTH_ERROR',
+      firebaseErrorCode: verifiedToken.errorCode || 'auth/invalid-id-token',
+      statusCode: 401,
+      message: `Firebase ID token verification failed: ${verifiedToken.errorCode || 'invalid token'}`,
+    });
+    return res.status(401).json({
+      success: false,
+      error: {
+        code: verifiedToken.errorCode || 'INVALID_FIREBASE_ID_TOKEN',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      statusCode: 401,
+    });
+  }
+
+  // 2. Read the authoritative system_ownership record from Firestore
+  let fsOwnership: Awaited<ReturnType<typeof getFirestoreSystemOwnership>> = null;
+  try {
+    fsOwnership = await withServerTimeout(getFirestoreSystemOwnership(effectiveIdToken), 2500);
+  } catch (err: any) {
+    logStructuredServerError({
+      correlationId,
+      endpoint: '/api/auth/sync-super-admin',
+      operation: 'SYNC_SUPER_ADMIN_FIRESTORE_OWNERSHIP_READ',
+      errorCategory: 'FIRESTORE_ERROR',
+      firebaseErrorCode: 'firestore/unavailable',
+      statusCode: 503,
+      message: `Failed reading system_ownership from Firestore: ${err?.message || 'timeout'}`,
+    });
+  }
+
+  if (!fsOwnership || !fsOwnership.isInitialized || !fsOwnership.ownerUserId) {
+    const msg = 'Unable to verify authoritative system_ownership record in Firestore. Super Admin access denied.';
+    logStructuredServerError({
+      correlationId,
+      endpoint: '/api/auth/sync-super-admin',
+      operation: 'SYNC_SUPER_ADMIN_OWNERSHIP_UNAVAILABLE',
+      errorCategory: 'SERVICE_UNAVAILABLE',
+      firebaseErrorCode: 'firestore/ownership-unverified',
+      statusCode: 503,
+      message: msg,
+    });
+    return res.status(503).json({
+      success: false,
+      error: {
+        code: 'OWNERSHIP_VERIFICATION_UNAVAILABLE',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      statusCode: 503,
+    });
+  }
+
+  serverAuthManager.syncOwnershipRecord(fsOwnership);
+
+  const verifiedUid = verifiedToken.uid.trim();
+  const verifiedEmail = (verifiedToken.email || '').trim().toLowerCase();
+  const submittedUid = typeof bodyUid === 'string' ? bodyUid.trim() : '';
+  const submittedEmail = typeof bodyEmail === 'string' ? bodyEmail.trim().toLowerCase() : '';
+
+  // Reject if browser-submitted UID/email contradicts the verified token or authoritative ownership
+  const uidContradicts =
+    Boolean(submittedUid) &&
+    submittedUid !== verifiedUid &&
+    submittedUid !== fsOwnership.ownerUserId;
+  const emailContradicts =
+    Boolean(submittedEmail) &&
+    Boolean(verifiedEmail) &&
+    submittedEmail !== verifiedEmail;
+
+  if (
+    uidContradicts ||
+    emailContradicts ||
+    !serverAuthManager.isVerifiedOwner(verifiedUid, verifiedEmail)
+  ) {
+    const msg = 'Clearance Violation: Verified Firebase identity does not match the authoritative Lifetime Super Admin ownership record.';
     logStructuredServerError({
       correlationId,
       endpoint: '/api/auth/sync-super-admin',
@@ -553,26 +775,65 @@ app.post('/api/auth/sync-super-admin', apiHandler(async (req: Request, res: Resp
       errorCategory: 'PERMISSION_DENIED',
       firebaseErrorCode: 'auth/insufficient-permission',
       statusCode: 403,
-      message: `Rejected sync-super-admin for email=${cleanEmail}, uid=${cleanUid}: does not match verified owner record.`,
+      message: `Rejected sync-super-admin for verifiedUid=${verifiedUid}, verifiedEmail=${verifiedEmail}, submittedUid=${submittedUid}: does not match ownerUserId=${fsOwnership.ownerUserId}.`,
     });
     return res.status(403).json({
       success: false,
-      message: 'Clearance Violation: Only the verified Lifetime Super Admin owner record can establish Super Admin privileges.',
-      error: 'Clearance Violation',
+      error: {
+        code: 'OWNERSHIP_MISMATCH',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
       correlationId,
+      statusCode: 403,
+    });
+  }
+
+  const canonicalOwnerUid = fsOwnership.ownerUserId;
+  const canonicalOwnerEmail = (fsOwnership.ownerEmail || verifiedEmail).toLowerCase().trim();
+  await ensureAccountHydratedFromFirestore(canonicalOwnerUid, effectiveIdToken, true);
+
+  const existingOwnerAccount = serverAuthManager.findAccountByIdentifier(canonicalOwnerUid) ||
+    serverAuthManager.findAccountByIdentifier(canonicalOwnerEmail);
+
+  // Maintain mandatory MFA verification if configured on the Super Admin account
+  if (existingOwnerAccount && existingOwnerAccount.mfaRequired && existingOwnerAccount.totpSecret) {
+    const challenge = serverAuthManager.initiateMfaChallenge(existingOwnerAccount);
+    return res.status(200).json({
+      success: true,
+      requireMfa: true,
+      mfaRequired: true,
+      tempToken: challenge.tempToken,
+      challengeToken: challenge.tempToken,
+      maskedDestination: challenge.maskedDestination,
+      expiresInSeconds: challenge.expiresInSeconds,
+      user: {
+        id: existingOwnerAccount.id,
+        fullName: existingOwnerAccount.fullName,
+        email: existingOwnerAccount.email,
+        role: existingOwnerAccount.role,
+        roleTitle: existingOwnerAccount.roleTitle,
+        isLifetimeSuperAdmin: true,
+      },
     });
   }
 
   const ip = getClientIp(req);
-  const userAgent = req.headers['user-agent'] || 'unknown';
+  const userAgent = (req.headers['user-agent'] as string) || 'unknown';
 
   const session = serverAuthManager.syncSuperAdminSession(
-    { uid: cleanUid, email: cleanEmail, fullName: fullName || 'David Eromosele', phone },
+    {
+      uid: canonicalOwnerUid,
+      email: canonicalOwnerEmail,
+      fullName: fullName || verifiedToken.fullName || fsOwnership.ownerFullName || 'David Eromosele',
+      phone: phone || fsOwnership.ownerPhone || undefined,
+    },
     ip,
     userAgent
   );
 
-  setSessionCookie(res, session.token);
+  setSessionCookie(res, session.token, req);
 
   const userData = {
     id: session.userId,
@@ -733,48 +994,96 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
     // Non-fatal if Firestore ownership lookup times out
   }
 
-  if (!serverAuthManager.findAccountByIdentifier(cleanIdentifier)) {
-    try {
-      const [fsAdmins, fsStaff] = await withServerTimeout(
-        Promise.all([
-          listFirestoreCollection('admins'),
-          listFirestoreCollection('staff'),
-        ]),
-        1500
-      );
-      for (const adm of fsAdmins) {
-        if (adm.email && String(adm.email).toLowerCase() === cleanIdentifier.toLowerCase()) {
-          serverAuthManager.syncProvisionedAccount({
-            id: String(adm.uid || adm.id),
-            email: String(adm.email),
-            fullName: String(adm.fullName || adm.email),
-            phone: String(adm.phone || ''),
-            role: 'ADMIN',
-            roleTitle: String(adm.roleTitle || adm.duty || 'Executive Administrator'),
-            duty: String(adm.duty || adm.roleTitle || 'Executive Administrator'),
-            staffCode: adm.staffCode ? String(adm.staffCode) : undefined,
-            status: adm.active === false || adm.status === 'suspended' ? 'suspended' : 'active',
-          });
-        }
-      }
-      for (const stf of fsStaff) {
-        if (stf.email && String(stf.email).toLowerCase() === cleanIdentifier.toLowerCase()) {
-          serverAuthManager.syncProvisionedAccount({
-            id: String(stf.uid || stf.id),
-            email: String(stf.email),
-            fullName: String(stf.fullName || stf.email),
-            phone: String(stf.phone || ''),
-            role: 'STAFF',
-            roleTitle: String(stf.roleTitle || stf.duty || 'Operations Officer'),
-            duty: String(stf.duty || stf.roleTitle || 'Operations Officer'),
-            staffCode: stf.staffCode ? String(stf.staffCode) : undefined,
-            status: stf.active === false || stf.status === 'suspended' ? 'suspended' : 'active',
-          });
-        }
-      }
-    } catch {
-      // Non-fatal if cold-start collection list times out
+  // Hydrate account and invitations from Firestore so stateless serverless instances always enforce latest status & credentials
+  try {
+    const [fsUsers, fsAdmins, fsStaff, fsInvitations] = await withServerTimeout(
+      Promise.all([
+        listFirestoreCollection('users'),
+        listFirestoreCollection('admins'),
+        listFirestoreCollection('staff'),
+        listFirestoreInvitations(),
+      ]),
+      1800
+    );
+    for (const inv of fsInvitations) {
+      serverAuthManager.upsertInvitationFromFirestore(inv);
     }
+    const userMap = new Map<string, Record<string, any>>();
+    for (const u of fsUsers) {
+      const uid = String(u.uid || u.id || '');
+      if (uid) userMap.set(uid, u);
+    }
+    for (const adm of fsAdmins) {
+      const uid = String(adm.uid || adm.id || '');
+      const merged = { ...(userMap.get(uid) || {}), ...adm };
+      if (merged.email && (
+        String(merged.email).toLowerCase() === cleanIdentifier.toLowerCase() ||
+        String(merged.staffCode || '').toLowerCase() === cleanIdentifier.toLowerCase() ||
+        uid === cleanIdentifier
+      )) {
+        const isRootOwner = serverAuthManager.isVerifiedOwner(uid, String(merged.email));
+        if (!isRootOwner) {
+          serverAuthManager.syncProvisionedAccount({
+            id: uid,
+            email: String(merged.email),
+            fullName: String(merged.fullName || merged.email),
+            phone: String(merged.phone || ''),
+            role: 'ADMIN',
+            roleTitle: String(merged.roleTitle || merged.duty || 'Executive Administrator'),
+            duty: String(merged.duty || merged.roleTitle || 'Executive Administrator'),
+            staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
+            status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
+            passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
+            passwordSalt: merged.passwordSalt ? String(merged.passwordSalt) : undefined,
+            accessCodeHash: merged.accessCodeHash ? String(merged.accessCodeHash) : undefined,
+            accessCodeSalt: merged.accessCodeSalt ? String(merged.accessCodeSalt) : undefined,
+            accessCodeMasked: merged.accessCodeMasked ? String(merged.accessCodeMasked) : undefined,
+            mfaRequired: typeof merged.mfaRequired === 'boolean' ? merged.mfaRequired : undefined,
+            totpSecret: merged.totpSecret ? String(merged.totpSecret) : undefined,
+            recoveryCodeHashes: Array.isArray(merged.recoveryCodeHashes) ? merged.recoveryCodeHashes : undefined,
+            consumedTotpSteps: Array.isArray(merged.consumedTotpSteps) ? merged.consumedTotpSteps : undefined,
+            securityVersion: typeof merged.securityVersion === 'number' ? merged.securityVersion : undefined,
+            permissions: merged.permissions && typeof merged.permissions === 'object' ? merged.permissions : undefined,
+            fromFirestore: true,
+          });
+        }
+      }
+    }
+    for (const stf of fsStaff) {
+      const uid = String(stf.uid || stf.id || '');
+      const merged = { ...(userMap.get(uid) || {}), ...stf };
+      if (merged.email && (
+        String(merged.email).toLowerCase() === cleanIdentifier.toLowerCase() ||
+        String(merged.staffCode || '').toLowerCase() === cleanIdentifier.toLowerCase() ||
+        uid === cleanIdentifier
+      )) {
+        serverAuthManager.syncProvisionedAccount({
+          id: uid,
+          email: String(merged.email),
+          fullName: String(merged.fullName || merged.email),
+          phone: String(merged.phone || ''),
+          role: 'STAFF',
+          roleTitle: String(merged.roleTitle || merged.duty || 'Operations Officer'),
+          duty: String(merged.duty || merged.roleTitle || 'Operations Officer'),
+          staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
+          status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
+          passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
+          passwordSalt: merged.passwordSalt ? String(merged.passwordSalt) : undefined,
+          accessCodeHash: merged.accessCodeHash ? String(merged.accessCodeHash) : undefined,
+          accessCodeSalt: merged.accessCodeSalt ? String(merged.accessCodeSalt) : undefined,
+          accessCodeMasked: merged.accessCodeMasked ? String(merged.accessCodeMasked) : undefined,
+          mfaRequired: typeof merged.mfaRequired === 'boolean' ? merged.mfaRequired : undefined,
+          totpSecret: merged.totpSecret ? String(merged.totpSecret) : undefined,
+          recoveryCodeHashes: Array.isArray(merged.recoveryCodeHashes) ? merged.recoveryCodeHashes : undefined,
+          consumedTotpSteps: Array.isArray(merged.consumedTotpSteps) ? merged.consumedTotpSteps : undefined,
+          securityVersion: typeof merged.securityVersion === 'number' ? merged.securityVersion : undefined,
+          permissions: merged.permissions && typeof merged.permissions === 'object' ? merged.permissions : undefined,
+          fromFirestore: true,
+        });
+      }
+    }
+  } catch {
+    // Non-fatal if cold-start collection list times out
   }
 
   let result = serverAuthManager.authenticateCredentials(cleanIdentifier, cleanPassword, ip);
@@ -923,6 +1232,9 @@ app.post('/api/auth/mfa/setup', apiHandler(async (req: Request, res: Response) =
     });
   }
 
+  const callerFbToken = extractCallerFirebaseToken(req);
+  await ensureAccountHydratedFromFirestore(session.userId, callerFbToken, true);
+
   const result = serverAuthManager.setupAccountMfa(session.userId);
   if (!result.success) {
     return res.status(400).json({
@@ -930,6 +1242,30 @@ app.post('/api/auth/mfa/setup', apiHandler(async (req: Request, res: Response) =
       error: result.error || 'Failed to initialize MFA setup.',
       message: result.error || 'Failed to initialize MFA setup.',
     });
+  }
+
+  const acc = serverAuthManager.findAccountByIdentifier(session.userId);
+  const authStorageFields = serverAuthManager.getAccountAuthStorageFields(session.userId) || {};
+  if (acc) {
+    await withServerTimeout(
+      writeFirestoreUserProfile({
+        uid: acc.id,
+        email: acc.email,
+        fullName: acc.fullName,
+        phone: acc.phone,
+        role: acc.role === 'LIFETIME_SUPER_ADMIN' ? 'LIFETIME_SUPER_ADMIN' : acc.role === 'ADMIN' ? 'ADMIN' : 'STAFF',
+        roleTitle: acc.roleTitle,
+        duty: acc.duty || acc.roleTitle,
+        status: acc.status === 'active' ? 'active' : 'suspended',
+        createdBy: acc.createdBy || session.userId,
+        createdAt: acc.createdAt || new Date().toISOString(),
+        staffCode: acc.staffCode,
+        permissions: acc.permissions as unknown as Record<string, boolean>,
+        ...authStorageFields,
+        callerIdToken: callerFbToken,
+      }),
+      2500
+    ).catch(() => {});
   }
 
   return res.status(200).json({
@@ -954,6 +1290,9 @@ app.post('/api/auth/mfa/confirm', apiHandler(async (req: Request, res: Response)
     });
   }
 
+  const callerFbToken = extractCallerFirebaseToken(req);
+  await ensureAccountHydratedFromFirestore(session.userId, callerFbToken, true);
+
   const { code } = req.body || {};
   const result = serverAuthManager.confirmAccountMfa(session.userId, String(code || ''));
   if (!result.success) {
@@ -962,6 +1301,30 @@ app.post('/api/auth/mfa/confirm', apiHandler(async (req: Request, res: Response)
       error: result.error || 'Failed to confirm MFA code.',
       message: result.error || 'Failed to confirm MFA code.',
     });
+  }
+
+  const acc = serverAuthManager.findAccountByIdentifier(session.userId);
+  const authStorageFields = serverAuthManager.getAccountAuthStorageFields(session.userId) || {};
+  if (acc) {
+    await withServerTimeout(
+      writeFirestoreUserProfile({
+        uid: acc.id,
+        email: acc.email,
+        fullName: acc.fullName,
+        phone: acc.phone,
+        role: acc.role === 'LIFETIME_SUPER_ADMIN' ? 'LIFETIME_SUPER_ADMIN' : acc.role === 'ADMIN' ? 'ADMIN' : 'STAFF',
+        roleTitle: acc.roleTitle,
+        duty: acc.duty || acc.roleTitle,
+        status: acc.status === 'active' ? 'active' : 'suspended',
+        createdBy: acc.createdBy || session.userId,
+        createdAt: acc.createdAt || new Date().toISOString(),
+        staffCode: acc.staffCode,
+        permissions: acc.permissions as unknown as Record<string, boolean>,
+        ...authStorageFields,
+        callerIdToken: callerFbToken,
+      }),
+      2500
+    ).catch(() => {});
   }
 
   return res.status(200).json({
@@ -998,6 +1361,11 @@ app.post('/api/auth/verify-mfa', apiHandler(async (req: Request, res: Response) 
       message: 'Please provide both the MFA challenge token and your authenticator code.',
       correlationId,
     });
+  }
+
+  const challengeUser = serverAuthManager.extractMfaChallengeUser(resolvedTempToken);
+  if (challengeUser?.userId) {
+    await ensureAccountHydratedFromFirestore(challengeUser.userId, undefined, true);
   }
 
   const result = serverAuthManager.verifyMfaCode(resolvedTempToken, code, ip, userAgent);
@@ -1170,17 +1538,19 @@ app.post('/api/auth/authorize-route', apiHandler(async (req: Request, res: Respo
  * POST /api/auth/logout
  * Explicitly terminates and invalidates the session token on the server.
  */
-app.post('/api/auth/logout', (req: Request, res: Response) => {
+app.post('/api/auth/logout', apiHandler(async (req: Request, res: Response) => {
   const token = extractSessionToken(req);
   if (token) {
     serverAuthManager.invalidateSession(token);
+    const tokenHash = serverAuthManager.getSessionTokenHash(token);
+    await withServerTimeout(revokeFirestoreSessionByHash(tokenHash), 1500).catch(() => {});
   }
   clearSessionCookie(res);
   return res.status(200).json({
     success: true,
     message: 'Session successfully revoked on the authentication gateway.',
   });
-});
+}));
 
 /**
  * POST /api/auth/forgot-password
@@ -1390,6 +1760,10 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
     });
   }
 
+  // Hydrate invitations from Firestore so access codes generated on another serverless instance are recognized
+  const callerFbToken = extractCallerFirebaseToken(req);
+  await hydrateInvitationsFromFirestore(callerFbToken);
+
   // Check if duplicate active account already exists in server memory
   const existingLocal = serverAuthManager.findAccountByIdentifier(cleanEmail);
   if (existingLocal && existingLocal.status === 'active') {
@@ -1491,9 +1865,9 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
 
   // 3. Synchronize Staff profile to Cloud Firestore (/users/{uid} and /staff/{uid})
   const acct = result.account;
-  const callerFbToken = extractCallerFirebaseToken(req);
   const simulateFirestoreFailure = req.headers['x-test-simulate-firestore-failure'] === 'true';
   const accessCodeSaltedHash = serverAuthManager.getAccountAccessCodeSaltedHash(acct.id);
+  const authStorageFields = serverAuthManager.getAccountAuthStorageFields(acct.id) || {};
 
   const firestoreResult = await withServerTimeout(
     writeFirestoreUserProfile({
@@ -1510,6 +1884,7 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
       accessCodeHash: accessCodeSaltedHash,
       staffCode: acct.staffCode,
       permissions: acct.permissions as unknown as Record<string, boolean>,
+      ...authStorageFields,
       callerIdToken: callerFbToken,
       simulateFailure: simulateFirestoreFailure,
     }),
@@ -1597,6 +1972,10 @@ app.post('/api/auth/access/generate-code', apiHandler(async (req: Request, res: 
     });
   }
 
+  if (result.invitation) {
+    await withServerTimeout(saveFirestoreInvitation(result.invitation as any), 2000).catch(() => {});
+  }
+
   return res.status(200).json(
     buildApiResponse(
       {
@@ -1671,15 +2050,31 @@ function extractCallerFirebaseToken(req: Request): string | undefined {
 }
 
 /**
+ * Hydrate access code invitations from Firestore into serverAuthManager so codes generated
+ * on one serverless instance can be verified, redeemed, or used on any other instance.
+ */
+async function hydrateInvitationsFromFirestore(callerFbToken?: string): Promise<void> {
+  try {
+    const docs = await withServerTimeout(listFirestoreInvitations(callerFbToken), 1800);
+    for (const doc of docs) {
+      serverAuthManager.upsertInvitationFromFirestore(doc);
+    }
+  } catch {
+    // Non-fatal if Firestore invitation fetch times out
+  }
+}
+
+/**
  * Hydrate an Admin or Staff account from Firestore into serverAuthManager if a stateless
- * Vercel serverless instance cold-started and does not yet have the account in memory.
+ * Vercel serverless instance cold-started or if forceRefresh is requested.
  */
 async function ensureAccountHydratedFromFirestore(
   targetUserId: string,
-  callerFbToken?: string
+  callerFbToken?: string,
+  forceRefresh = false
 ): Promise<void> {
   if (!targetUserId) return;
-  if (serverAuthManager.findAccountByIdentifier(targetUserId)) return;
+  if (!forceRefresh && serverAuthManager.findAccountByIdentifier(targetUserId)) return;
 
   try {
     const [userDoc, adminDoc, staffDoc] = await withServerTimeout(
@@ -1692,12 +2087,16 @@ async function ensureAccountHydratedFromFirestore(
     );
     const merged = { ...(userDoc || {}), ...(staffDoc || {}), ...(adminDoc || {}) };
     if (merged && merged.email) {
+      const uid = String(merged.uid || merged.id || targetUserId);
+      if (serverAuthManager.isVerifiedOwner(uid, String(merged.email))) {
+        return;
+      }
       const role =
         adminDoc || merged.role === 'ADMIN'
           ? 'ADMIN'
           : 'STAFF';
       serverAuthManager.syncProvisionedAccount({
-        id: String(merged.uid || merged.id || targetUserId),
+        id: uid,
         email: String(merged.email),
         fullName: String(merged.fullName || merged.email),
         phone: String(merged.phone || '+234 800 000 0000'),
@@ -1706,6 +2105,18 @@ async function ensureAccountHydratedFromFirestore(
         duty: String(merged.duty || merged.roleTitle || (role === 'ADMIN' ? 'Executive Administrator' : 'Operations Officer')),
         staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
         status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
+        passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
+        passwordSalt: merged.passwordSalt ? String(merged.passwordSalt) : undefined,
+        accessCodeHash: merged.accessCodeHash ? String(merged.accessCodeHash) : undefined,
+        accessCodeSalt: merged.accessCodeSalt ? String(merged.accessCodeSalt) : undefined,
+        accessCodeMasked: merged.accessCodeMasked ? String(merged.accessCodeMasked) : undefined,
+        mfaRequired: typeof merged.mfaRequired === 'boolean' ? merged.mfaRequired : undefined,
+        totpSecret: merged.totpSecret ? String(merged.totpSecret) : undefined,
+        recoveryCodeHashes: Array.isArray(merged.recoveryCodeHashes) ? merged.recoveryCodeHashes : undefined,
+        consumedTotpSteps: Array.isArray(merged.consumedTotpSteps) ? merged.consumedTotpSteps : undefined,
+        securityVersion: typeof merged.securityVersion === 'number' ? merged.securityVersion : undefined,
+        permissions: merged.permissions && typeof merged.permissions === 'object' ? merged.permissions : undefined,
+        fromFirestore: true,
       });
     }
   } catch {
@@ -1912,6 +2323,10 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
     });
   }
 
+  // Hydrate invitations from Firestore so access codes generated on another serverless instance are recognized
+  const callerFbToken = extractCallerFirebaseToken(req);
+  await hydrateInvitationsFromFirestore(callerFbToken);
+
   // Check if duplicate active account already exists in server memory
   const existingLocal = serverAuthManager.findAccountByIdentifier(cleanEmail);
   if (existingLocal && existingLocal.status === 'active') {
@@ -2008,9 +2423,9 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
 
   // 3. Synchronize Admin profile to Cloud Firestore (/users/{uid} and /admins/{uid})
   const acct = result.account;
-  const callerFbToken = extractCallerFirebaseToken(req);
   const simulateFirestoreFailure = req.headers['x-test-simulate-firestore-failure'] === 'true';
   const accessCodeSaltedHash = serverAuthManager.getAccountAccessCodeSaltedHash(acct.id);
+  const authStorageFields = serverAuthManager.getAccountAuthStorageFields(acct.id) || {};
 
   const firestoreResult = await withServerTimeout(
     writeFirestoreUserProfile({
@@ -2027,6 +2442,7 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
       accessCodeHash: accessCodeSaltedHash,
       staffCode: acct.staffCode,
       permissions: acct.permissions as unknown as Record<string, boolean>,
+      ...authStorageFields,
       callerIdToken: callerFbToken,
       simulateFailure: simulateFirestoreFailure,
     }),
@@ -2080,6 +2496,7 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
   });
 });
 
+app.post('/api/auth/create-admin', handleAppointAdminAccount);
 app.post('/api/auth/access/appoint-admin', handleAppointAdminAccount);
 app.post('/api/super-admin/create-admin', handleAppointAdminAccount);
 
@@ -2106,6 +2523,7 @@ app.post('/api/auth/access/revoke', apiHandler(async (req: Request, res: Respons
     });
   }
 
+  await hydrateInvitationsFromFirestore(extractCallerFirebaseToken(req));
   const result = serverAuthManager.revokeAccessCode(session, invitationId);
   if (!result.success) {
     return res.status(400).json({
@@ -2141,6 +2559,7 @@ app.post('/api/auth/access/verify-code', apiHandler(async (req: Request, res: Re
     });
   }
 
+  await hydrateInvitationsFromFirestore(extractCallerFirebaseToken(req));
   const result = serverAuthManager.verifyAccessCode(email, code);
   if (!result.success) {
     return res.status(400).json({
@@ -2176,6 +2595,7 @@ app.post('/api/auth/access/redeem-code', apiHandler(async (req: Request, res: Re
     });
   }
 
+  await hydrateInvitationsFromFirestore(extractCallerFirebaseToken(req));
   const result = serverAuthManager.redeemAccessCode(email, code, newPassword, fullName, phone);
   if (!result.success) {
     return res.status(400).json({
@@ -2211,6 +2631,7 @@ app.get('/api/auth/access/invitations', apiHandler(async (req: Request, res: Res
     });
   }
 
+  await hydrateInvitationsFromFirestore(extractCallerFirebaseToken(req));
   const invitations = serverAuthManager.getAccessInvitations(session);
   return res.status(200).json({
     success: true,
@@ -2392,24 +2813,29 @@ const handleToggleAccountStatus = apiHandler(async (req: Request, res: Response)
 
   const updatedAcc = serverAuthManager.findAccountByIdentifier(String(targetUserId));
   if (updatedAcc && (updatedAcc.role === 'ADMIN' || updatedAcc.role === 'STAFF')) {
-    await withServerTimeout(
-      writeFirestoreUserProfile({
-        uid: updatedAcc.id,
-        email: updatedAcc.email,
-        fullName: updatedAcc.fullName,
-        phone: updatedAcc.phone,
-        role: updatedAcc.role === 'ADMIN' ? 'ADMIN' : 'STAFF',
-        roleTitle: updatedAcc.roleTitle,
-        duty: updatedAcc.duty || updatedAcc.roleTitle,
-        status: updatedAcc.status === 'active' ? 'active' : 'suspended',
-        createdBy: updatedAcc.createdBy || session.email,
-        createdAt: updatedAcc.createdAt || new Date().toISOString(),
-        staffCode: updatedAcc.staffCode,
-        permissions: updatedAcc.permissions as unknown as Record<string, boolean>,
-        callerIdToken: callerFbToken,
-      }),
-      2500
-    ).catch(() => {});
+    const authStorageFields = serverAuthManager.getAccountAuthStorageFields(updatedAcc.id) || {};
+    await Promise.all([
+      setFirebaseAuthUserDisabled(updatedAcc.id, updatedAcc.status !== 'active').catch(() => {}),
+      withServerTimeout(
+        writeFirestoreUserProfile({
+          uid: updatedAcc.id,
+          email: updatedAcc.email,
+          fullName: updatedAcc.fullName,
+          phone: updatedAcc.phone,
+          role: updatedAcc.role === 'ADMIN' ? 'ADMIN' : 'STAFF',
+          roleTitle: updatedAcc.roleTitle,
+          duty: updatedAcc.duty || updatedAcc.roleTitle,
+          status: updatedAcc.status === 'active' ? 'active' : 'suspended',
+          createdBy: updatedAcc.createdBy || session.email,
+          createdAt: updatedAcc.createdAt || new Date().toISOString(),
+          staffCode: updatedAcc.staffCode,
+          permissions: updatedAcc.permissions as unknown as Record<string, boolean>,
+          ...authStorageFields,
+          callerIdToken: callerFbToken,
+        }),
+        2500
+      ).catch(() => {}),
+    ]);
   }
 
   return res.status(200).json(

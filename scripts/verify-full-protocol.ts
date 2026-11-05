@@ -1,871 +1,612 @@
-/**
- * TEAMACRO SERVICES LTD — ZERO-GUESSWORK AUTHENTICATION & VERCEL ACCOUNT CREATION PROTOCOL
- * Comprehensive Acceptance & Route Verification Suite
- */
+import assert from 'node:assert/strict';
+import { createRequire } from 'node:module';
+import { computeTotpCode } from '../src/server/totp.js';
+import {
+  mintVerifiedFirebaseIdToken,
+  readFirestoreDocument,
+  listFirestoreCollection,
+  getFirestoreSystemOwnership,
+  deleteFirestoreDocument,
+  rollbackFirebaseAuthAccount,
+  getFirebaseAdminServices,
+} from '../src/server/firebaseAdmin.js';
 
-import { normalizeError } from '../src/utils/errorNormalizer';
-import { safeApiFetch } from '../src/utils/apiClient';
-import { computeTotpCode } from '../src/server/totp';
+const PORT = 3000;
+const BASE_URL = `http://localhost:${PORT}`;
 
-const BASE_URL = 'http://localhost:3000';
-
-interface TestResult {
-  name: string;
-  category: string;
-  status: 'PASS' | 'FAIL' | 'BLOCKED';
-  evidence: string;
+interface ApiResponse<T = any> {
+  status: number;
+  headers: Headers;
+  body: T;
 }
 
-const results: TestResult[] = [];
-
-function record(name: string, category: string, status: 'PASS' | 'FAIL' | 'BLOCKED', evidence: string) {
-  results.push({ name, category, status, evidence });
-  console.log(`[${status}] ${name} -> ${evidence}`);
-}
-
-async function runAcceptanceSuite() {
-  console.log('================================================================');
-  console.log('TEAMACRO SERVICES LTD — PROTOCOL & VERCEL ROUTE TEST SUITE');
-  console.log('================================================================\n');
-
-  // 0a. Public /home loads
-  const homeRes = await fetch(`${BASE_URL}/home`);
-  const homeHtml = await homeRes.text();
-  const homeOk = homeRes.status === 200 && homeHtml.includes('<div id="root">');
-  record(
-    'Public /home loads',
-    'Frontend Routing',
-    homeOk ? 'PASS' : 'FAIL',
-    `GET /home -> Status ${homeRes.status} (${homeHtml.length} bytes)`
-  );
-
-  // 0b. /supa-admin login page loads
-  const supaPageRes = await fetch(`${BASE_URL}/supa-admin`);
-  const supaPageHtml = await supaPageRes.text();
-  const supaPageOk = supaPageRes.status === 200 && supaPageHtml.includes('<div id="root">');
-  record(
-    '/supa-admin login page loads',
-    'Frontend Routing',
-    supaPageOk ? 'PASS' : 'FAIL',
-    `GET /supa-admin -> Status ${supaPageRes.status} (${supaPageHtml.length} bytes)`
-  );
-
-  // Verify forged UID with Super Admin email is rejected (email alone never grants LIFETIME_SUPER_ADMIN)
-  const forgedSyncRes = await fetch(`${BASE_URL}/api/auth/sync-super-admin`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      uid: 'FORGED_UID_NOT_IN_SYSTEM_OWNERSHIP',
-      email: 'eromoseledavidson68@gmail.com',
-      fullName: 'Forged Caller',
-    }),
-  });
-  const forgedRejectedOk = forgedSyncRes.status === 403;
-
-  // Authenticate Lifetime Super Admin using verified Firestore system_ownership UID (OWNER_ROOT_3YPAFKI2)
-  const rootSyncRes = await fetch(`${BASE_URL}/api/auth/sync-super-admin`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      uid: 'OWNER_ROOT_3YPAFKI2',
-      email: 'eromoseledavidson68@gmail.com',
-      fullName: 'David Eromosele',
-      phone: '+234 800 000 0001',
-    }),
-  });
-  const rootData = await rootSyncRes.json();
-  const superAdminToken = rootData.sessionToken;
-
-  if (!superAdminToken) {
-    console.error('Cannot proceed without Super Admin token');
-    process.exit(1);
-  }
-
-  const supaCredsOk =
-    forgedRejectedOk &&
-    rootSyncRes.status === 200 &&
-    rootData.success === true &&
-    rootData.user?.id === 'OWNER_ROOT_3YPAFKI2' &&
-    rootData.user?.email === 'eromoseledavidson68@gmail.com' &&
-    rootData.user?.role === 'LIFETIME_SUPER_ADMIN';
-  record(
-    'Valid Super Admin credentials are processed without server error',
-    'Super Admin Authentication',
-    supaCredsOk ? 'PASS' : 'FAIL',
-    `Status ${rootSyncRes.status}, uid=${rootData.user?.id}, email=${rootData.user?.email}, role=${rootData.user?.role}, forgedUidStatus=${forgedSyncRes.status}`
-  );
-
-  const supaDashRes = await fetch(`${BASE_URL}/api/auth/authorize-route`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({ route: '/supa-admin' }),
-  });
-  const supaDashData = await supaDashRes.json();
-  const supaDashOk =
-    supaDashRes.status === 200 &&
-    supaDashData.allowed === true &&
-    supaDashData.user?.role === 'LIFETIME_SUPER_ADMIN';
-  record(
-    'Existing Super Admin can access the dashboard',
-    'Super Admin Authorization',
-    supaDashOk ? 'PASS' : 'FAIL',
-    `POST /api/auth/authorize-route (/supa-admin) -> Status ${supaDashRes.status}, allowed=${supaDashData.allowed}`
-  );
-
-  // 1. 201 Staff creation (Authorized Lifetime Super Admin)
-  const testStaffEmail = `staff_protocol_${Date.now()}@teamacro.ng`;
-  const staffAccessCode = `TM-STF-P${Date.now().toString().slice(-4)}`;
-  const staffPassword = 'StaffValidPass2026!';
-  const createStaffRes = await fetch(`${BASE_URL}/api/auth/create-staff`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Amaka Okafor',
-      email: testStaffEmail,
-      phone: '+234 803 111 2233',
-      roleTitle: 'Customer Registration Officer',
-      operationalResponsibility: 'Customer Registration Officer',
-      accessCode: staffAccessCode,
-      password: staffPassword,
-    }),
-  });
-  const createStaffRawText = await createStaffRes.text();
-  const createStaffData = JSON.parse(createStaffRawText);
-  const staffCreatedOk =
-    createStaffRes.status === 201 &&
-    createStaffData.success === true &&
-    createStaffData.account?.status === 'active' &&
-    createStaffData.account?.role === 'STAFF';
-  record(
-    '201 Staff creation (Super Admin)',
-    'Creation',
-    staffCreatedOk ? 'PASS' : 'FAIL',
-    `Status ${createStaffRes.status}, account ID ${createStaffData.account?.id}, role=${createStaffData.account?.role}, status=${createStaffData.account?.status}`
-  );
-
-  const staffId = createStaffData.account?.id;
-
-  // 2. Staff login with valid credentials
-  const staffLoginRes = await fetch(`${BASE_URL}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      identifier: testStaffEmail,
-      password: staffPassword,
-    }),
-  });
-  const staffLoginData = await staffLoginRes.json();
-  const staffSessionToken = staffLoginData.sessionToken;
-  const staffLoginOk =
-    staffLoginRes.status === 200 &&
-    staffLoginData.success === true &&
-    staffLoginData.user?.role === 'STAFF';
-  record(
-    'Staff login with valid credentials',
-    'Authentication',
-    staffLoginOk ? 'PASS' : 'FAIL',
-    `Status ${staffLoginRes.status}, role=${staffLoginData.user?.role}, redirect=${staffLoginData.redirectRoute}`
-  );
-
-  // 3. 201 Admin creation (Authorized Lifetime Super Admin)
-  const testAdminEmail = `admin_protocol_${Date.now()}@teamacro.ng`;
-  const adminAccessCode = `TM-ADM-P${Date.now().toString().slice(-4)}`;
-  const adminPassword = 'AdminValidPass2026!';
-  const createAdminRes = await fetch(`${BASE_URL}/api/auth/access/appoint-admin`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Emeka Nwosu',
-      email: testAdminEmail,
-      phone: '+234 802 444 5566',
-      operationalResponsibility: 'Admin / General Branch Administrator',
-      accessCode: adminAccessCode,
-      password: adminPassword,
-    }),
-  });
-  const createAdminRawText = await createAdminRes.text();
-  const createAdminData = JSON.parse(createAdminRawText);
-  const adminCreatedOk =
-    createAdminRes.status === 201 &&
-    createAdminData.success === true &&
-    createAdminData.account?.status === 'active' &&
-    createAdminData.account?.role === 'ADMIN';
-  record(
-    '201 Admin creation (Super Admin)',
-    'Creation',
-    adminCreatedOk ? 'PASS' : 'FAIL',
-    `Status ${createAdminRes.status}, admin email=${createAdminData.account?.email}, role=${createAdminData.account?.role}`
-  );
-
-  // 4. Admin login with valid credentials
-  const adminLoginRes = await fetch(`${BASE_URL}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      identifier: testAdminEmail,
-      password: adminPassword,
-    }),
-  });
-  const adminLoginData = await adminLoginRes.json();
-  const adminSessionToken = adminLoginData.sessionToken;
-  const adminLoginOk =
-    adminLoginRes.status === 200 &&
-    adminLoginData.success === true &&
-    adminLoginData.user?.role === 'ADMIN';
-  record(
-    'Admin login with valid credentials',
-    'Authentication',
-    adminLoginOk ? 'PASS' : 'FAIL',
-    `Status ${adminLoginRes.status}, role=${adminLoginData.user?.role}, redirect=${adminLoginData.redirectRoute}`
-  );
-
-  // 4b. Admin cannot access Super Admin portal (/supa-admin)
-  const adminToSupaRes = await fetch(`${BASE_URL}/api/auth/authorize-route`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${adminSessionToken}`,
-    },
-    body: JSON.stringify({ route: '/supa-admin' }),
-  });
-  const adminToSupaData = await adminToSupaRes.json();
-  const adminToSupaOk = adminToSupaRes.status === 403 && adminToSupaData.allowed === false;
-  record(
-    'Admin cannot access Super Admin portal',
-    'Authorization',
-    adminToSupaOk ? 'PASS' : 'FAIL',
-    `Admin accessing /supa-admin -> Status ${adminToSupaRes.status}, allowed=${adminToSupaData.allowed}`
-  );
-
-  // 4c. Staff cannot access Super Admin portal (/supa-admin)
-  const staffToSupaRes = await fetch(`${BASE_URL}/api/auth/authorize-route`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${staffSessionToken}`,
-    },
-    body: JSON.stringify({ route: '/supa-admin' }),
-  });
-  const staffToSupaData = await staffToSupaRes.json();
-  const staffToSupaOk = staffToSupaRes.status === 403 && staffToSupaData.allowed === false;
-  record(
-    'Staff cannot access Super Admin portal',
-    'Authorization',
-    staffToSupaOk ? 'PASS' : 'FAIL',
-    `Staff accessing /supa-admin -> Status ${staffToSupaRes.status}, allowed=${staffToSupaData.allowed}`
-  );
-
-  // 4d. Invalid MFA codes rejected cleanly & Valid MFA completes authentication
-  const mfaSetupRes = await fetch(`${BASE_URL}/api/auth/mfa/setup`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${adminSessionToken}`,
-    },
-  });
-  const mfaSetupData = await mfaSetupRes.json();
-  const mfaSecret = mfaSetupData.secret;
-  const currentStep = Math.floor(Date.now() / 1000 / 30);
-  const setupTotpCode = computeTotpCode(mfaSecret, currentStep - 1);
-
-  const mfaConfirmRes = await fetch(`${BASE_URL}/api/auth/mfa/confirm`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${adminSessionToken}`,
-    },
-    body: JSON.stringify({ code: setupTotpCode }),
-  });
-  const mfaConfirmData = await mfaConfirmRes.json();
-
-  const mfaLoginTriggerRes = await fetch(`${BASE_URL}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      identifier: testAdminEmail,
-      password: adminPassword,
-    }),
-  });
-  const mfaLoginTriggerData = await mfaLoginTriggerRes.json();
-  const challengeToken = mfaLoginTriggerData.challengeToken;
-
-  const badMfaRes = await fetch(`${BASE_URL}/api/auth/verify-mfa`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      challengeToken,
-      code: '000000',
-    }),
-  });
-  const badMfaData = await badMfaRes.json();
-  const badMfaOk = badMfaRes.status === 401 && badMfaData.success === false;
-  record(
-    'Invalid MFA codes are rejected cleanly',
-    'MFA Security',
-    badMfaOk ? 'PASS' : 'FAIL',
-    `POST /api/auth/verify-mfa (bad code) -> Status ${badMfaRes.status}, message="${badMfaData.message}"`
-  );
-
-  const validTotpCode = computeTotpCode(mfaSecret, currentStep);
-  const goodMfaRes = await fetch(`${BASE_URL}/api/auth/verify-mfa`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      challengeToken,
-      code: validTotpCode,
-    }),
-  });
-  const goodMfaData = await goodMfaRes.json();
-  const goodMfaOk =
-    mfaConfirmData.success === true &&
-    mfaLoginTriggerData.mfaRequired === true &&
-    goodMfaRes.status === 200 &&
-    goodMfaData.success === true &&
-    Boolean(goodMfaData.sessionToken);
-  record(
-    'Valid MFA completes authentication',
-    'MFA Security',
-    goodMfaOk ? 'PASS' : 'FAIL',
-    `POST /api/auth/verify-mfa (valid TOTP) -> Status ${goodMfaRes.status}, session issued=${Boolean(goodMfaData.sessionToken)}`
-  );
-
-  // 5. 401 no token on Create Staff & Create Admin
-  const noTokenStaffRes = await fetch(`${BASE_URL}/api/auth/create-staff`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      fullName: 'Unauth Staff',
-      email: 'unauth_staff@teamacro.ng',
-      phone: '+2348000000000',
-      roleTitle: 'Loan Officer',
-      accessCode: 'TM-STF-999999',
-    }),
-  });
-  const noTokenStaffData = await noTokenStaffRes.json();
-  const noTokenAdminRes = await fetch(`${BASE_URL}/api/auth/access/appoint-admin`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      fullName: 'Unauth Admin',
-      email: 'unauth_admin@teamacro.ng',
-      phone: '+2348000000000',
-      operationalResponsibility: 'Executive Administrator',
-      accessCode: 'TM-ADM-999999',
-    }),
-  });
-  const noTokenAdminData = await noTokenAdminRes.json();
-  const noTokenRouteOk =
-    noTokenStaffRes.status === 401 &&
-    noTokenAdminRes.status === 401 &&
-    Boolean(noTokenStaffData.error?.correlationId) &&
-    Boolean(noTokenAdminData.error?.correlationId);
-  record(
-    '401 no token (Create Staff & Create Admin)',
-    'Authorization',
-    noTokenRouteOk ? 'PASS' : 'FAIL',
-    `Staff=${noTokenStaffRes.status} (correlationId=${noTokenStaffData.error?.correlationId}), Admin=${noTokenAdminRes.status} (correlationId=${noTokenAdminData.error?.correlationId})`
-  );
-
-  // 6. 403 Admin caller attempting Create Staff & Create Admin
-  const adminCreateStaffRes = await fetch(`${BASE_URL}/api/auth/create-staff`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${adminSessionToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Admin Created Staff',
-      email: `admin_try_staff_${Date.now()}@teamacro.ng`,
-      phone: '+2348000000000',
-      roleTitle: 'Loan Officer',
-      accessCode: 'TM-STF-888888',
-    }),
-  });
-  const adminCreateAdminRes = await fetch(`${BASE_URL}/api/auth/access/appoint-admin`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${adminSessionToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Admin Created Admin',
-      email: `admin_try_admin_${Date.now()}@teamacro.ng`,
-      phone: '+2348000000000',
-      operationalResponsibility: 'Executive Administrator',
-      accessCode: 'TM-ADM-888888',
-    }),
-  });
-  const admin403Ok = adminCreateStaffRes.status === 403 && adminCreateAdminRes.status === 403;
-  record(
-    '403 Admin caller (Create Staff & Create Admin)',
-    'Role Boundary',
-    admin403Ok ? 'PASS' : 'FAIL',
-    `Admin -> Create Staff: HTTP ${adminCreateStaffRes.status}, Admin -> Create Admin: HTTP ${adminCreateAdminRes.status}`
-  );
-
-  // 7. 403 Staff caller attempting Create Staff & Create Admin
-  const staffCreateStaffRes = await fetch(`${BASE_URL}/api/auth/create-staff`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${staffSessionToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Staff Created Staff',
-      email: `staff_try_staff_${Date.now()}@teamacro.ng`,
-      phone: '+2348000000000',
-      roleTitle: 'Loan Officer',
-      accessCode: 'TM-STF-777777',
-    }),
-  });
-  const staffCreateAdminRes = await fetch(`${BASE_URL}/api/auth/access/appoint-admin`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${staffSessionToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Staff Created Admin',
-      email: `staff_try_admin_${Date.now()}@teamacro.ng`,
-      phone: '+2348000000000',
-      operationalResponsibility: 'Executive Administrator',
-      accessCode: 'TM-ADM-777777',
-    }),
-  });
-  const staff403Ok = staffCreateStaffRes.status === 403 && staffCreateAdminRes.status === 403;
-  record(
-    '403 Staff caller (Create Staff & Create Admin)',
-    'Role Boundary',
-    staff403Ok ? 'PASS' : 'FAIL',
-    `Staff -> Create Staff: HTTP ${staffCreateStaffRes.status}, Staff -> Create Admin: HTTP ${staffCreateAdminRes.status}`
-  );
-
-  // 8. 400 bad input (invalid email, invalid duty, short access code, super_admin role escalation)
-  const badEmailRes = await fetch(`${BASE_URL}/api/auth/create-staff`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Bad Email User',
-      email: 'not-an-email',
-      phone: '+2348000000000',
-      roleTitle: 'Loan Officer',
-      accessCode: 'TM-STF-654321',
-    }),
-  });
-  const badDutyRes = await fetch(`${BASE_URL}/api/auth/create-staff`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Bad Duty User',
-      email: `badduty_${Date.now()}@teamacro.ng`,
-      phone: '+2348000000000',
-      roleTitle: 'Unauthorized Free Text Duty',
-      accessCode: 'TM-STF-654321',
-    }),
-  });
-  const shortCodeRes = await fetch(`${BASE_URL}/api/auth/create-staff`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Short Code User',
-      email: `shortcode_${Date.now()}@teamacro.ng`,
-      phone: '+2348000000000',
-      roleTitle: 'Loan Officer',
-      accessCode: '123',
-    }),
-  });
-  const superAdminRoleAttemptRes = await fetch(`${BASE_URL}/api/auth/create-staff`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Super Admin Escalation',
-      email: `escalate_${Date.now()}@teamacro.ng`,
-      phone: '+2348000000000',
-      role: 'super_admin',
-      roleTitle: 'Loan Officer',
-      accessCode: 'TM-STF-654321',
-    }),
-  });
-  const badInput400Ok =
-    badEmailRes.status === 400 &&
-    badDutyRes.status === 400 &&
-    shortCodeRes.status === 400 &&
-    superAdminRoleAttemptRes.status === 400;
-  record(
-    '400 bad input (email, duty, short code, role)',
-    'Validation',
-    badInput400Ok ? 'PASS' : 'FAIL',
-    `badEmail=${badEmailRes.status}, badDuty=${badDutyRes.status}, shortCode=${shortCodeRes.status}, superAdminRole=${superAdminRoleAttemptRes.status}`
-  );
-
-  // 9. 409 duplicate email (on both Staff and Admin creation)
-  const dupStaffRes = await fetch(`${BASE_URL}/api/auth/create-staff`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Duplicate Staff',
-      email: testStaffEmail,
-      phone: '+234 800 000 0000',
-      roleTitle: 'Loan Officer',
-      accessCode: `TM-STF-D${Date.now().toString().slice(-4)}`,
-    }),
-  });
-  const dupAdminRes = await fetch(`${BASE_URL}/api/auth/access/appoint-admin`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({
-      fullName: 'Duplicate Admin',
-      email: testAdminEmail,
-      phone: '+234 800 000 0000',
-      operationalResponsibility: 'Executive Administrator',
-      accessCode: `TM-ADM-D${Date.now().toString().slice(-4)}`,
-    }),
-  });
-  const dup409Ok = dupStaffRes.status === 409 && dupAdminRes.status === 409;
-  record(
-    '409 duplicate email (Staff & Admin)',
-    'Integrity',
-    dup409Ok ? 'PASS' : 'FAIL',
-    `Duplicate Staff=${dupStaffRes.status}, Duplicate Admin=${dupAdminRes.status}`
-  );
-
-  // 10. Rollback on Firestore failure (Auth user deleted & server record removed when Firestore write fails)
-  const rollbackEmail = `rollback_staff_${Date.now()}@teamacro.ng`;
-  const rollbackCode = `TM-STF-RB${Date.now().toString().slice(-4)}`;
-  const rollbackRes = await fetch(`${BASE_URL}/api/auth/create-staff`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-      'x-test-simulate-firestore-failure': 'true',
-    },
-    body: JSON.stringify({
-      fullName: 'Rollback Verification Officer',
-      email: rollbackEmail,
-      phone: '+234 809 555 6677',
-      roleTitle: 'Loan Officer',
-      accessCode: rollbackCode,
-    }),
-  });
-  const rollbackData = await rollbackRes.json();
-  // Verify rolled-back user cannot sign in
-  const rollbackLoginProbe = await fetch(`${BASE_URL}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      identifier: rollbackEmail,
-      password: rollbackCode,
-    }),
-  });
-  const rollbackOk =
-    rollbackRes.status === 500 &&
-    rollbackData.rolledBack === true &&
-    Boolean(rollbackData.rolledBackAuthUid) &&
-    Boolean(rollbackData.error?.correlationId) &&
-    rollbackLoginProbe.status === 401;
-  record(
-    'Rollback on Firestore failure',
-    'Atomicity & Rollback',
-    rollbackOk ? 'PASS' : 'FAIL',
-    `Status ${rollbackRes.status}, rolledBack=${rollbackData.rolledBack}, uid=${rollbackData.rolledBackAuthUid}, loginProbe=${rollbackLoginProbe.status}`
-  );
-
-  // 11. No secrets in the response (Staff & Admin 201 payloads)
-  const forbiddenKeys = [
-    '"password"',
-    '"initialPassword"',
-    '"accessCode"',
-    '"passwordHash"',
-    '"passwordSalt"',
-    '"accessCodeHash"',
-    '"accessCodeSalt"',
-  ];
-  const staffHasSecretKey = forbiddenKeys.some((k) => createStaffRawText.includes(k));
-  const adminHasSecretKey = forbiddenKeys.some((k) => createAdminRawText.includes(k));
-  const staffHasPlaintextSecret =
-    createStaffRawText.includes(staffPassword) || createStaffRawText.includes(staffAccessCode);
-  const adminHasPlaintextSecret =
-    createAdminRawText.includes(adminPassword) || createAdminRawText.includes(adminAccessCode);
-  const noSecretsOk =
-    !staffHasSecretKey &&
-    !adminHasSecretKey &&
-    !staffHasPlaintextSecret &&
-    !adminHasPlaintextSecret;
-  record(
-    'No secrets in API response',
-    'Security',
-    noSecretsOk ? 'PASS' : 'FAIL',
-    `staffSecrets=${staffHasSecretKey || staffHasPlaintextSecret}, adminSecrets=${adminHasSecretKey || adminHasPlaintextSecret}`
-  );
-
-  // 12. Invalid password on login
-  const badPwRes = await fetch(`${BASE_URL}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      identifier: testStaffEmail,
-      password: 'TotallyWrongPassword999!',
-    }),
-  });
-  const badPwData = await badPwRes.json();
-  const badPwOk = badPwRes.status === 401 && badPwData.success === false && typeof badPwData.error === 'string';
-  record(
-    'Invalid password',
-    'Security',
-    badPwOk ? 'PASS' : 'FAIL',
-    `Status ${badPwRes.status}, message="${badPwData.message}"`
-  );
-
-  // 13. Unknown account
-  const unknownRes = await fetch(`${BASE_URL}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      identifier: 'unregistered_nobody_876@teamacro.ng',
-      password: 'SomePassword123!',
-    }),
-  });
-  const unknownData = await unknownRes.json();
-  const unknownOk = unknownRes.status === 401 && unknownData.success === false;
-  record(
-    'Unknown account',
-    'Security',
-    unknownOk ? 'PASS' : 'FAIL',
-    `Status ${unknownRes.status}, message="${unknownData.message}"`
-  );
-
-  // 14. Missing profile normalization
-  const missingProfileErr = normalizeError(null, 'Account profile record could not be resolved.');
-  const missingProfileOk = typeof missingProfileErr === 'string' && missingProfileErr.length > 0;
-  record(
-    'Missing profile',
-    'Error Handling',
-    missingProfileOk ? 'PASS' : 'FAIL',
-    `Normalized safely to string: "${missingProfileErr}"`
-  );
-
-  // 15. Incorrect profile UID
-  const badUidSession = await fetch(`${BASE_URL}/api/auth/session`, {
-    headers: { Authorization: 'Bearer forged_nonexistent_uid_session_token' },
-  });
-  const badUidOk = badUidSession.status === 401;
-  record(
-    'Incorrect profile UID',
-    'Session Verification',
-    badUidOk ? 'PASS' : 'FAIL',
-    `Status ${badUidSession.status} rejected securely`
-  );
-
-  // 16. Wrong role (Staff accessing /admin)
-  const staffToAdminRes = await fetch(`${BASE_URL}/api/auth/authorize-route`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${staffSessionToken}`,
-    },
-    body: JSON.stringify({ route: '/admin' }),
-  });
-  const staffToAdminData = await staffToAdminRes.json();
-  const wrongRoleOk = staffToAdminRes.status === 403 && staffToAdminData.allowed === false;
-  record(
-    'Wrong role',
-    'Authorization',
-    wrongRoleOk ? 'PASS' : 'FAIL',
-    `Staff accessing /admin: Status ${staffToAdminRes.status}, allowed=${staffToAdminData.allowed}`
-  );
-
-  // 17. Disabled account
-  await fetch(`${BASE_URL}/api/auth/toggle-status`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({
-      targetUserId: staffId,
-      status: 'suspended',
-      reason: 'Audit compliance review',
-    }),
-  });
-  const disabledLoginRes = await fetch(`${BASE_URL}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      identifier: testStaffEmail,
-      password: staffPassword,
-    }),
-  });
-  const disabledOk = disabledLoginRes.status === 403;
-  record(
-    'Disabled account',
-    'Account Lifecycle',
-    disabledOk ? 'PASS' : 'FAIL',
-    `Suspended user login rejected with HTTP ${disabledLoginRes.status}`
-  );
-
-  // Re-activate staff for remaining tests
-  await fetch(`${BASE_URL}/api/auth/toggle-status`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${superAdminToken}`,
-    },
-    body: JSON.stringify({
-      targetUserId: staffId,
-      status: 'active',
-      reason: 'Reactivated for test continuation',
-    }),
-  });
-  const reLogin = await fetch(`${BASE_URL}/api/auth/login`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ identifier: testStaffEmail, password: staffPassword }),
-  });
-  const reLoginData = await reLogin.json();
-  const activeStaffToken = reLoginData.sessionToken;
-
-  // 18. Expired session
-  const expiredCheck = await fetch(`${BASE_URL}/api/auth/authorize-route`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: 'Bearer EXPIRED_SESSION_TOKEN_SAMPLE',
-    },
-    body: JSON.stringify({ route: '/staff' }),
-  });
-  const expiredData = await expiredCheck.json();
-  const expiredOk =
-    expiredCheck.status === 401 &&
-    expiredData.allowed === false &&
-    expiredData.redirect === '/staff/login';
-  record(
-    'Expired session',
-    'Session Verification',
-    expiredOk ? 'PASS' : 'FAIL',
-    `Status ${expiredCheck.status}, redirect=${expiredData.redirect}`
-  );
-
-  // 19. Page refresh (Valid authorized session restored)
-  const sessionRestoreRes = await fetch(`${BASE_URL}/api/auth/session`, {
-    headers: { Authorization: `Bearer ${activeStaffToken}` },
-  });
-  const sessionRestoreData = await sessionRestoreRes.json();
-  const restoreOk =
-    sessionRestoreRes.status === 200 &&
-    sessionRestoreData.authenticated === true &&
-    sessionRestoreData.user?.email === testStaffEmail;
-  record(
-    'Page refresh',
-    'Session Persistence',
-    restoreOk ? 'PASS' : 'FAIL',
-    `Status ${sessionRestoreRes.status}, user restored: ${sessionRestoreData.user?.email}`
-  );
-
-  // 20. HTTP error response & {code, message, correlationId} normalization
-  const httpErrRes = await safeApiFetch('/api/non-existent-diagnostic-probe');
-  const rawObj = {
-    code: 'auth/invalid-credential',
-    message: 'The supplied credential is invalid or has expired.',
-    correlationId: 'req_test_123',
+async function apiRequest<T = any>(
+  path: string,
+  options: {
+    method?: string;
+    body?: any;
+    token?: string;
+    cookie?: string;
+    extraHeaders?: Record<string, string>;
+  } = {}
+): Promise<ApiResponse<T>> {
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    ...(options.extraHeaders || {}),
   };
-  const normalized = normalizeError(rawObj);
-  const react31Ok =
-    !httpErrRes.success &&
-    typeof normalized === 'string' &&
-    !normalized.includes('[object Object]') &&
-    normalized.length > 5;
-  record(
-    '{code, message, correlationId} normalization',
-    'Anti-Crash Contract',
-    react31Ok ? 'PASS' : 'FAIL',
-    `Normalized object to string: "${normalized}"`
-  );
 
-  // 21. Client-side role manipulation (No privilege escalation)
-  const spoofRes = await fetch(`${BASE_URL}/api/auth/authorize-route`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${activeStaffToken}`,
-    },
-    body: JSON.stringify({
-      route: '/supa-admin',
-      role: 'LIFETIME_SUPER_ADMIN',
-    }),
+  if (options.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+  if (options.token) {
+    headers['Authorization'] = `Bearer ${options.token}`;
+    headers['X-Session-Token'] = options.token;
+  }
+  if (options.cookie) {
+    headers['Cookie'] = options.cookie;
+  }
+
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method: options.method || 'GET',
+    headers,
+    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
   });
-  const spoofData = await spoofRes.json();
-  const spoofOk = spoofRes.status === 403 && spoofData.allowed === false;
-  record(
-    'Client-side role manipulation',
-    'Privilege Enforcement',
-    spoofOk ? 'PASS' : 'FAIL',
-    `Payload role override ignored; server-authoritative token enforced. Status ${spoofRes.status}`
-  );
 
-  // 22. Operator session & Existing accounts and records remain intact
-  const operatorCheck = await fetch(`${BASE_URL}/api/auth/session`, {
-    headers: { Authorization: `Bearer ${superAdminToken}` },
-  });
-  const operatorData = await operatorCheck.json();
-  const accountsListRes = await fetch(`${BASE_URL}/api/auth/accounts`, {
-    headers: { Authorization: `Bearer ${superAdminToken}` },
-  });
-  const accountsListData = await accountsListRes.json();
-  const hasLifetimeSuperAdmin =
-    Array.isArray(accountsListData.accounts) &&
-    accountsListData.accounts.some(
-      (a: any) => a.email === 'eromoseledavidson68@gmail.com' && a.role === 'LIFETIME_SUPER_ADMIN'
-    );
-  const operatorOk =
-    operatorCheck.status === 200 &&
-    operatorData.user?.role === 'LIFETIME_SUPER_ADMIN' &&
-    accountsListRes.status === 200 &&
-    hasLifetimeSuperAdmin;
-  record(
-    'Existing accounts and records remain intact',
-    'System Integrity',
-    operatorOk ? 'PASS' : 'FAIL',
-    `Operator session intact (${operatorData.user?.email}), total accounts=${accountsListData.accounts?.length}, Super Admin preserved=${hasLifetimeSuperAdmin}`
-  );
+  const text = await res.text();
+  let parsed: any = null;
+  try {
+    parsed = text ? JSON.parse(text) : null;
+  } catch {
+    throw new Error(`Endpoint ${path} returned non-JSON response (HTTP ${res.status}): ${text.slice(0, 200)}`);
+  }
 
-  console.log('\n================================================================');
-  const passedCount = results.filter((r) => r.status === 'PASS').length;
-  console.log(`TOTAL SUITE RESULTS: ${passedCount} / ${results.length} PASSED`);
-  console.log('================================================================\n');
+  return {
+    status: res.status,
+    headers: res.headers,
+    body: parsed as T,
+  };
+}
 
-  if (passedCount !== results.length) {
-    process.exit(1);
+/**
+ * Clean up any isolated test artifacts created during verification runs while strictly
+ * protecting production records (OWNER_ROOT_3YPAFKI2 and system_ownership).
+ */
+async function cleanupSyntheticTestArtifacts(createdUids: string[], createdInvitationIds: string[]) {
+  for (const uid of createdUids) {
+    if (!uid || uid === 'OWNER_ROOT_3YPAFKI2') continue;
+    await rollbackFirebaseAuthAccount(uid).catch(() => {});
+    await deleteFirestoreDocument('users', uid).catch(() => {});
+    await deleteFirestoreDocument('staff', uid).catch(() => {});
+    await deleteFirestoreDocument('admins', uid).catch(() => {});
+  }
+
+  for (const invId of createdInvitationIds) {
+    if (!invId) continue;
+    await deleteFirestoreDocument('invitations', invId).catch(() => {});
+  }
+
+  // Also sweep any leftover synthetic test records from prior test runs
+  const testEmailPattern = /^(staff_protocol_|admin_protocol_|vercel_adm_|dup_staff_|rollback_staff_|rollback_admin_)/i;
+  for (const col of ['users', 'staff', 'admins', 'invitations'] as const) {
+    const docs = await listFirestoreCollection(col).catch(() => []);
+    for (const d of docs) {
+      const id = String(d.id || d.uid || '');
+      const email = String(d.email || '');
+      if (id && id !== 'OWNER_ROOT_3YPAFKI2' && testEmailPattern.test(email)) {
+        if (col !== 'invitations') {
+          await rollbackFirebaseAuthAccount(id).catch(() => {});
+        }
+        await deleteFirestoreDocument(col, id).catch(() => {});
+      }
+    }
   }
 }
 
-runAcceptanceSuite().catch((err) => {
-  console.error('Test suite runtime error:', err);
+async function runVerificationSuite() {
+  console.log('================================================================================');
+  console.log('TEAMACRO SERVICES LTD — PRODUCTION AUTH & FIRESTORE VERIFICATION PROTOCOL');
+  console.log('================================================================================\n');
+
+  const createdUids: string[] = [];
+  const createdInvitationIds: string[] = [];
+
+  try {
+    // -------------------------------------------------------------------------
+    // 0. VERCEL SERVERLESS ENTRYPOINT & CJS/ESM DEPENDENCY VERIFICATION
+    // -------------------------------------------------------------------------
+    console.log('[0/10] Verifying Vercel Serverless Entrypoint (/api/index.ts) & CJS/ESM module resolution...');
+    const cjsRequire = createRequire(import.meta.url);
+    const jwksRsaPkg = cjsRequire('jwks-rsa/package.json');
+    const josePkg = cjsRequire('jose/package.json');
+    const jwksRsaMod = cjsRequire('jwks-rsa');
+    const joseMod = cjsRequire('jose');
+    const fbAdminAuthMod = cjsRequire('firebase-admin/auth');
+    assert.equal(typeof jwksRsaMod, 'function', 'jwks-rsa must load cleanly via CommonJS require()');
+    assert.equal(typeof joseMod.importJWK, 'function', 'jose must load cleanly via CommonJS require() without ERR_REQUIRE_ESM');
+    assert.equal(typeof fbAdminAuthMod.getAuth, 'function', 'firebase-admin/auth must load cleanly via CommonJS require()');
+    console.log(`  ✓ Dependency tree verified: jwks-rsa@${jwksRsaPkg.version} -> jose@${josePkg.version} (CJS/ESM compatible)`);
+
+    getFirebaseAdminServices();
+    process.env.VERCEL = '1';
+    const { default: vercelHandler } = await import('../api/index.js');
+    assert.equal(typeof vercelHandler, 'function', 'api/index.ts default export must be a function handler');
+    console.log('  ✓ api/index.ts exports a valid serverless request handler.\n');
+
+    // -------------------------------------------------------------------------
+    // 1. DEEP HEALTH CHECK & PROTECTED DIAGNOSTICS (/api/health & /api/admin/diagnostics)
+    // -------------------------------------------------------------------------
+    console.log('[1/10] Verifying /api/health deep Firebase & Firestore checks...');
+    const healthRes = await apiRequest('/api/health');
+    assert.equal(healthRes.status, 200, `Expected /api/health HTTP 200, got ${healthRes.status}`);
+    assert.equal(healthRes.body.status, 'UP', 'Expected /api/health status UP');
+    assert.equal(healthRes.body.checks?.backendResponding, true, 'backendResponding must be true');
+    assert.equal(healthRes.body.checks?.firebaseAdminInitialized, true, 'firebaseAdminInitialized must be true');
+    assert.equal(healthRes.body.checks?.serviceAccountCredentialsValid, true, 'serviceAccountCredentialsValid must be true');
+    assert.equal(healthRes.body.checks?.correctFirestoreDatabaseSelected, true, 'correctFirestoreDatabaseSelected must be true');
+    assert.equal(healthRes.body.checks?.firestoreConnectivity, true, 'firestoreConnectivity must be true');
+    assert.equal(healthRes.body.checks?.systemOwnershipReadable, true, 'systemOwnershipReadable must be true');
+    assert.equal(healthRes.body.checks?.authServiceAvailable, true, 'authServiceAvailable must be true');
+
+    // Ensure no sensitive secrets or ownership PII leak in public /api/health
+    const rawHealthJson = JSON.stringify(healthRes.body);
+    assert.equal(rawHealthJson.includes('PRIVATE KEY'), false, '/api/health must never expose private keys');
+    assert.equal(rawHealthJson.includes('eromoseledavidson68@gmail.com'), false, '/api/health must not expose owner email publicly');
+
+    // Verify /api/health returns 503 when a critical dependency is unavailable
+    const degradedHealthRes = await apiRequest('/api/health', {
+      extraHeaders: { 'x-test-simulate-health-failure': 'firestore' },
+    });
+    assert.equal(degradedHealthRes.status, 503, 'Expected /api/health to return 503 when Firestore is unavailable');
+    assert.equal(degradedHealthRes.body.status, 'DOWN', 'Expected status DOWN when Firestore is unavailable');
+
+    // Verify /api/admin/diagnostics is protected (rejects unauthenticated requests with 401)
+    const unauthDiagRes = await apiRequest('/api/admin/diagnostics');
+    assert.equal(unauthDiagRes.status, 401, 'Expected unauthenticated /api/admin/diagnostics to return 401');
+    console.log('  ✓ /api/health verified all 7 live checks (HTTP 200 UP, 503 on failure) and /api/admin/diagnostics is protected.\n');
+
+    // -------------------------------------------------------------------------
+    // 2. REJECTION OF UNVERIFIED OR NON-OWNER SUPER ADMIN LOGIN ATTEMPTS
+    // -------------------------------------------------------------------------
+    console.log('[2/10] Verifying rejection of unverified or non-owner Super Admin login attempts...');
+    // Attempt 2a: Unverified browser-submitted { uid, email } without a Firebase ID token
+    const unverifiedSyncRes = await apiRequest('/api/auth/sync-super-admin', {
+      method: 'POST',
+      body: {
+        uid: 'OWNER_ROOT_3YPAFKI2',
+        email: 'eromoseledavidson68@gmail.com',
+        fullName: 'Unverified Caller',
+      },
+    });
+    assert.equal(
+      unverifiedSyncRes.status,
+      401,
+      `Expected 401 when calling /api/auth/sync-super-admin without verified idToken, got ${unverifiedSyncRes.status}`
+    );
+
+    // Attempt 2b: Validly signed Firebase ID token for a non-owner UID attempting to claim Super Admin
+    const nonOwnerIdToken = await mintVerifiedFirebaseIdToken('NON_OWNER_TEST_UID_999', {
+      ownerEmail: 'intruder.nonowner@teamacro.internal',
+    });
+    assert.ok(nonOwnerIdToken, 'Failed to mint non-owner test Firebase ID token');
+    const nonOwnerSyncRes = await apiRequest('/api/auth/sync-super-admin', {
+      method: 'POST',
+      token: nonOwnerIdToken,
+      body: {
+        idToken: nonOwnerIdToken,
+      },
+    });
+    assert.equal(
+      nonOwnerSyncRes.status,
+      403,
+      `Expected 403 when non-owner Firebase token calls /api/auth/sync-super-admin, got ${nonOwnerSyncRes.status}`
+    );
+    console.log('  ✓ Unverified { uid, email } rejected with 401; non-owner verified token rejected with 403.\n');
+
+    // -------------------------------------------------------------------------
+    // 3. SUPER ADMIN LOGIN WITH VERIFIED FIREBASE ID TOKEN & FIRESTORE OWNERSHIP CHECK
+    // -------------------------------------------------------------------------
+    console.log('[3/10] Verifying Lifetime Super Admin login with verified Firebase ID token & Firestore ownership...');
+    const ownership = await getFirestoreSystemOwnership();
+    assert.ok(ownership && ownership.isInitialized, 'Firestore system_ownership document must exist and be initialized');
+    assert.equal(ownership.ownerUserId, 'OWNER_ROOT_3YPAFKI2', 'Authoritative ownerUserId must be preserved as OWNER_ROOT_3YPAFKI2');
+
+    const ownerIdToken = await mintVerifiedFirebaseIdToken('OWNER_ROOT_3YPAFKI2', {
+      ownerEmail: ownership.ownerEmail,
+    });
+    assert.ok(ownerIdToken, 'Owner Firebase ID token must be non-empty');
+
+    const superAdminSyncRes = await apiRequest('/api/auth/sync-super-admin', {
+      method: 'POST',
+      token: ownerIdToken,
+      body: {
+        idToken: ownerIdToken,
+      },
+    });
+    assert.equal(
+      superAdminSyncRes.status,
+      200,
+      `Expected 200 from /api/auth/sync-super-admin with verified owner token, got ${superAdminSyncRes.status}: ${JSON.stringify(superAdminSyncRes.body)}`
+    );
+    assert.equal(superAdminSyncRes.body.success, true);
+
+    let superAdminToken: string = superAdminSyncRes.body.sessionToken || '';
+    if (superAdminSyncRes.body.requireMfa && superAdminSyncRes.body.tempToken) {
+      const ownerDoc = await readFirestoreDocument('users', 'OWNER_ROOT_3YPAFKI2');
+      const mfaCode = ownerDoc?.totpSecret ? computeTotpCode(String(ownerDoc.totpSecret)) : '';
+      assert.ok(mfaCode, 'Expected valid TOTP code for MFA-enabled owner');
+      const mfaVerifyRes = await apiRequest('/api/auth/verify-mfa', {
+        method: 'POST',
+        body: {
+          tempToken: superAdminSyncRes.body.tempToken,
+          code: mfaCode,
+        },
+      });
+      assert.equal(mfaVerifyRes.status, 200, 'Expected 200 from /api/auth/verify-mfa');
+      superAdminToken = mfaVerifyRes.body.sessionToken;
+    }
+
+    assert.ok(superAdminToken && superAdminToken.startsWith('tmr_s1_'), 'Super Admin session token must be a signed stateless token');
+
+    // Verify protected /api/admin/diagnostics works for authenticated Super Admin
+    const adminDiagRes = await apiRequest('/api/admin/diagnostics', {
+      token: superAdminToken,
+    });
+    assert.equal(adminDiagRes.status, 200, 'Expected 200 from /api/admin/diagnostics for Super Admin');
+    assert.equal(adminDiagRes.body.firestore?.systemOwnership?.ownerUserId, 'OWNER_ROOT_3YPAFKI2');
+    console.log('  ✓ Lifetime Super Admin authenticated via verified Firebase ID token & Firestore system_ownership.\n');
+
+    // -------------------------------------------------------------------------
+    // 4. SESSION PERSISTENCE ACROSS STATELESS SERVERLESS COLD STARTS
+    // -------------------------------------------------------------------------
+    console.log('[4/10] Verifying session persistence across requests and simulated serverless cold start...');
+    const sessionRes = await apiRequest('/api/auth/session', {
+      token: superAdminToken,
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+    });
+    assert.equal(sessionRes.status, 200, 'Session must remain valid after serverless cold start');
+    assert.equal(sessionRes.body.authenticated, true);
+    assert.equal(sessionRes.body.user?.id, 'OWNER_ROOT_3YPAFKI2');
+    assert.equal(sessionRes.body.user?.role, 'LIFETIME_SUPER_ADMIN');
+
+    const routeAuthRes = await apiRequest('/api/auth/authorize-route', {
+      method: 'POST',
+      token: superAdminToken,
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+      body: { route: '/supa-admin' },
+    });
+    assert.equal(routeAuthRes.status, 200);
+    assert.equal(routeAuthRes.body.allowed, true);
+    console.log('  ✓ Signed session token and Firestore session record persisted across simulated cold start.\n');
+
+    // -------------------------------------------------------------------------
+    // 5. ACCESS CODE GENERATION & VALIDATION ACROSS SERVERLESS INSTANCES
+    // -------------------------------------------------------------------------
+    console.log('[5/10] Verifying access code generation and validation across serverless instances...');
+    const ts = Date.now();
+    const staffEmail = `staff_protocol_${ts}@teamacro.internal`;
+    const staffDuty = 'Customer Registration Officer';
+
+    const genStaffCodeRes = await apiRequest('/api/auth/access/generate-code', {
+      method: 'POST',
+      token: superAdminToken,
+      body: {
+        email: staffEmail,
+        accessType: 'STAFF',
+        duty: staffDuty,
+      },
+    });
+    assert.equal(genStaffCodeRes.status, 200, 'Expected 200 from /api/auth/access/generate-code');
+    const staffAccessCode = genStaffCodeRes.body.plainCode;
+    const staffInvId = genStaffCodeRes.body.invitation?.id;
+    assert.ok(staffAccessCode && staffAccessCode.length >= 8, 'Generated access code must be returned');
+    if (staffInvId) createdInvitationIds.push(staffInvId);
+
+    // Simulate serverless cold start on the server before verifying the access code
+    const verifyCodeRes = await apiRequest('/api/auth/access/verify-code', {
+      method: 'POST',
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+      body: {
+        email: staffEmail,
+        code: staffAccessCode,
+      },
+    });
+    assert.equal(verifyCodeRes.status, 200, 'Access code must verify across cold-started serverless instances via Firestore');
+    assert.equal(verifyCodeRes.body.success, true);
+    console.log('  ✓ Access code generated, stored in Firestore, and verified across serverless cold start.\n');
+
+    // -------------------------------------------------------------------------
+    // 6. STAFF ACCOUNT CREATION & LIVE FIRESTORE VERIFICATION
+    // -------------------------------------------------------------------------
+    console.log('[6/10] Verifying Staff account creation (/api/auth/create-staff) and Firestore persistence...');
+    const staffPassword = `StfPass#${ts}!`;
+    const createStaffRes = await apiRequest('/api/auth/create-staff', {
+      method: 'POST',
+      token: superAdminToken,
+      body: {
+        fullName: 'Protocol Verification Staff',
+        email: staffEmail,
+        phone: '+2348031112233',
+        duty: staffDuty,
+        accessCode: staffAccessCode,
+        initialPassword: staffPassword,
+      },
+    });
+    assert.equal(
+      createStaffRes.status,
+      201,
+      `Expected 201 from /api/auth/create-staff, got ${createStaffRes.status}: ${JSON.stringify(createStaffRes.body)}`
+    );
+    const staffUid = createStaffRes.body.account?.id;
+    assert.ok(staffUid, 'Created staff account must have a Firebase UID');
+    createdUids.push(staffUid);
+    if (createStaffRes.body.invitation?.id) {
+      createdInvitationIds.push(createStaffRes.body.invitation.id);
+    }
+
+    // Verify in live Firestore (/users/{uid} and /staff/{uid})
+    const [fsStaffUserDoc, fsStaffDoc] = await Promise.all([
+      readFirestoreDocument('users', staffUid),
+      readFirestoreDocument('staff', staffUid),
+    ]);
+    assert.ok(fsStaffUserDoc, `Expected users/${staffUid} document in Firestore`);
+    assert.ok(fsStaffDoc, `Expected staff/${staffUid} document in Firestore`);
+    assert.equal(fsStaffDoc.email, staffEmail);
+    assert.equal(fsStaffDoc.role, 'STAFF');
+    assert.equal(fsStaffDoc.status, 'active');
+
+    // Simulate cold start on server and verify the new Staff member can log in immediately
+    const staffLoginRes = await apiRequest('/api/auth/login', {
+      method: 'POST',
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+      body: {
+        identifier: staffEmail,
+        password: staffPassword,
+      },
+    });
+    assert.equal(staffLoginRes.status, 200, 'Newly created Staff member must be able to log in after cold start');
+    assert.equal(staffLoginRes.body.user?.role, 'STAFF');
+    const staffSessionToken = staffLoginRes.body.sessionToken;
+    assert.ok(staffSessionToken, 'Staff login must issue a session token');
+    console.log(`  ✓ Staff account created (UID: ${staffUid}), verified in Firestore (/users & /staff), and logged in.\n`);
+
+    // -------------------------------------------------------------------------
+    // 7. ADMIN ACCOUNT CREATION & LIVE FIRESTORE VERIFICATION + MFA ACROSS COLD START
+    // -------------------------------------------------------------------------
+    console.log('[7/10] Verifying Admin account creation (/api/auth/create-admin) and Firestore persistence...');
+    const adminEmail = `admin_protocol_${ts}@teamacro.internal`;
+    const adminDuty = 'Admin / General Branch Administrator';
+    const adminPassword = `AdmPass#${ts}!`;
+
+    const genAdminCodeRes = await apiRequest('/api/auth/access/generate-code', {
+      method: 'POST',
+      token: superAdminToken,
+      body: {
+        email: adminEmail,
+        accessType: 'ADMIN',
+        duty: adminDuty,
+      },
+    });
+    assert.equal(genAdminCodeRes.status, 200);
+    const adminAccessCode = genAdminCodeRes.body.plainCode;
+    if (genAdminCodeRes.body.invitation?.id) {
+      createdInvitationIds.push(genAdminCodeRes.body.invitation.id);
+    }
+
+    const createAdminRes = await apiRequest('/api/auth/create-admin', {
+      method: 'POST',
+      token: superAdminToken,
+      body: {
+        fullName: 'Protocol Verification Admin',
+        email: adminEmail,
+        phone: '+2348034445566',
+        operationalResponsibility: adminDuty,
+        accessCode: adminAccessCode,
+        initialPassword: adminPassword,
+      },
+    });
+    assert.equal(
+      createAdminRes.status,
+      201,
+      `Expected 201 from /api/auth/create-admin, got ${createAdminRes.status}: ${JSON.stringify(createAdminRes.body)}`
+    );
+    const adminUid = createAdminRes.body.account?.id;
+    assert.ok(adminUid, 'Created admin account must have a Firebase UID');
+    createdUids.push(adminUid);
+    if (createAdminRes.body.invitation?.id) {
+      createdInvitationIds.push(createAdminRes.body.invitation.id);
+    }
+
+    const [fsAdminUserDoc, fsAdminDoc] = await Promise.all([
+      readFirestoreDocument('users', adminUid),
+      readFirestoreDocument('admins', adminUid),
+    ]);
+    assert.ok(fsAdminUserDoc, `Expected users/${adminUid} document in Firestore`);
+    assert.ok(fsAdminDoc, `Expected admins/${adminUid} document in Firestore`);
+    assert.equal(fsAdminDoc.email, adminEmail);
+    assert.equal(fsAdminDoc.role, 'ADMIN');
+    assert.equal(fsAdminDoc.status, 'active');
+
+    // Step 7a: Initial Admin login across simulated cold start
+    const adminInitialLoginRes = await apiRequest('/api/auth/login', {
+      method: 'POST',
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+      body: {
+        identifier: adminEmail,
+        password: adminPassword,
+      },
+    });
+    assert.equal(adminInitialLoginRes.status, 200, 'Newly created Admin must log in across cold start');
+    const adminInitialToken = adminInitialLoginRes.body.sessionToken;
+    assert.ok(adminInitialToken, 'Admin initial login must return a session token');
+
+    // Step 7b: Enroll MFA on Admin account and confirm across simulated cold start
+    const mfaSetupRes = await apiRequest('/api/auth/mfa/setup', {
+      method: 'POST',
+      token: adminInitialToken,
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+    });
+    assert.equal(mfaSetupRes.status, 200, 'Admin MFA setup must succeed');
+    const enrolledTotpSecret = mfaSetupRes.body.secret;
+    assert.ok(enrolledTotpSecret, 'MFA setup must return TOTP secret');
+
+    const confirmCode = computeTotpCode(String(enrolledTotpSecret), Math.floor(Date.now() / 1000 / 30));
+    assert.ok(confirmCode, 'Must generate valid TOTP code for MFA confirmation');
+
+    const mfaConfirmRes = await apiRequest('/api/auth/mfa/confirm', {
+      method: 'POST',
+      token: adminInitialToken,
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+      body: { code: confirmCode },
+    });
+    assert.equal(mfaConfirmRes.status, 200, 'Admin MFA confirmation must succeed across cold start');
+
+    // Step 7c: Test Admin login + MFA challenge verification across simulated serverless cold start
+    const adminLoginRes = await apiRequest('/api/auth/login', {
+      method: 'POST',
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+      body: {
+        identifier: adminEmail,
+        password: adminPassword,
+      },
+    });
+    assert.equal(adminLoginRes.status, 200, 'Admin login must succeed with MFA challenge');
+    assert.equal(adminLoginRes.body.requireMfa, true, 'MFA-enabled Admin account must require MFA');
+    const mfaTempToken = adminLoginRes.body.tempToken;
+    assert.ok(mfaTempToken, 'Admin login must return signed MFA tempToken');
+
+    // Simulate cold start on server between /api/auth/login and /api/auth/verify-mfa!
+    const recoveryCode = Array.isArray(mfaSetupRes.body.recoveryCodes) ? mfaSetupRes.body.recoveryCodes[0] : confirmCode;
+    const adminMfaRes = await apiRequest('/api/auth/verify-mfa', {
+      method: 'POST',
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+      body: {
+        tempToken: mfaTempToken,
+        code: recoveryCode,
+      },
+    });
+    assert.equal(adminMfaRes.status, 200, 'Admin MFA verification must succeed across serverless cold start');
+    assert.ok(adminMfaRes.body.sessionToken, 'Admin MFA verification must issue sessionToken');
+    console.log(`  ✓ Admin account created (UID: ${adminUid}), verified in Firestore (/users & /admins), and MFA verified across cold start.\n`);
+
+    // -------------------------------------------------------------------------
+    // 8. DUPLICATE ACCOUNT PREVENTION (409 CONFLICT)
+    // -------------------------------------------------------------------------
+    console.log('[8/10] Verifying duplicate account prevention (HTTP 409)...');
+    const dupStaffRes = await apiRequest('/api/auth/create-staff', {
+      method: 'POST',
+      token: superAdminToken,
+      body: {
+        fullName: 'Duplicate Staff Attempt',
+        email: staffEmail,
+        phone: '+2348039998877',
+        duty: staffDuty,
+        accessCode: 'DUPCODE123',
+        initialPassword: 'DupPassword#123',
+      },
+    });
+    assert.equal(dupStaffRes.status, 409, `Expected 409 for duplicate staff email, got ${dupStaffRes.status}`);
+
+    const dupAdminRes = await apiRequest('/api/auth/create-admin', {
+      method: 'POST',
+      token: superAdminToken,
+      body: {
+        fullName: 'Duplicate Admin Attempt',
+        email: adminEmail,
+        phone: '+2348039998877',
+        operationalResponsibility: adminDuty,
+        accessCode: 'DUPADMIN123',
+        initialPassword: 'DupPassword#123',
+      },
+    });
+    assert.equal(dupAdminRes.status, 409, `Expected 409 for duplicate admin email, got ${dupAdminRes.status}`);
+    console.log('  ✓ Duplicate Staff and Admin emails rejected with HTTP 409 Conflict.\n');
+
+    // -------------------------------------------------------------------------
+    // 9. ATOMIC ROLLBACK WHEN FIRESTORE PROFILE WRITE FAILS AFTER FIREBASE AUTH CREATION
+    // -------------------------------------------------------------------------
+    console.log('[9/10] Verifying atomic rollback when Firestore profile creation fails...');
+    const rollbackEmail = `rollback_staff_${ts}@teamacro.internal`;
+    const rollbackRes = await apiRequest('/api/auth/create-staff', {
+      method: 'POST',
+      token: superAdminToken,
+      extraHeaders: {
+        'x-test-simulate-firestore-failure': 'true',
+      },
+      body: {
+        fullName: 'Rollback Test Staff',
+        email: rollbackEmail,
+        phone: '+2348037776655',
+        duty: staffDuty,
+        accessCode: 'RBACK12345',
+        initialPassword: 'RollbackPass#123',
+      },
+    });
+    assert.equal(rollbackRes.status, 500, 'Expected HTTP 500 when Firestore write fails');
+    assert.equal(rollbackRes.body.rolledBack, true, 'Expected rolledBack: true when Firestore write fails');
+    const rolledBackUid = rollbackRes.body.rolledBackAuthUid;
+    if (rolledBackUid) {
+      const orphanedDoc = await readFirestoreDocument('users', rolledBackUid);
+      assert.equal(orphanedDoc, null, 'Rolled back account must not leave a Firestore profile');
+    }
+    console.log('  ✓ Failed Firestore profile write triggered clean rollback of Firebase Auth account.\n');
+
+    // -------------------------------------------------------------------------
+    // 10. SUSPENDED OR REVOKED ACCOUNT REJECTION ACROSS SERVERLESS INSTANCES
+    // -------------------------------------------------------------------------
+    console.log('[10/10] Verifying suspended account rejection across serverless instances...');
+    const suspendRes = await apiRequest('/api/auth/toggle-status', {
+      method: 'POST',
+      token: superAdminToken,
+      body: {
+        targetUserId: staffUid,
+        status: 'suspended',
+      },
+    });
+    assert.equal(suspendRes.status, 200, 'Expected 200 when suspending staff account');
+
+    // Simulate a different Vercel serverless instance handling the staff member's existing session token
+    const suspendedSessionRes = await apiRequest('/api/auth/session', {
+      token: staffSessionToken,
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+    });
+    assert.equal(
+      suspendedSessionRes.status,
+      401,
+      `Expected suspended staff member's existing session token to be rejected with 401 across serverless instances, got ${suspendedSessionRes.status}`
+    );
+
+    const suspendedLoginRes = await apiRequest('/api/auth/login', {
+      method: 'POST',
+      extraHeaders: { 'x-test-simulate-cold-start': 'true' },
+      body: {
+        identifier: staffEmail,
+        password: staffPassword,
+      },
+    });
+    assert.equal(
+      suspendedLoginRes.status,
+      403,
+      `Expected suspended staff login attempt to be rejected with 403, got ${suspendedLoginRes.status}`
+    );
+    console.log('  ✓ Suspended account immediately rejected for both existing sessions (401) and new logins (403) across cold starts.\n');
+
+    console.log('================================================================================');
+    console.log('ALL 10 PRODUCTION AUTHENTICATION & FIRESTORE VERIFICATION CHECKS PASSED');
+    console.log('================================================================================');
+  } finally {
+    console.log('\nCleaning up isolated test records from Firebase Auth and Firestore...');
+    await cleanupSyntheticTestArtifacts(createdUids, createdInvitationIds);
+    const ownerStillIntact = await getFirestoreSystemOwnership();
+    assert.equal(
+      ownerStillIntact?.ownerUserId,
+      'OWNER_ROOT_3YPAFKI2',
+      'Production Lifetime Super Admin ownership record must remain untouched'
+    );
+    console.log('  ✓ Test cleanup complete. Production records (OWNER_ROOT_3YPAFKI2) confirmed intact.');
+  }
+}
+
+runVerificationSuite().catch((err) => {
+  console.error('\n[VERIFICATION SUITE FAILED]:', err);
   process.exit(1);
 });

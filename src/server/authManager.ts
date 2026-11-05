@@ -8,6 +8,8 @@ import {
   saveFirestoreSessionHash,
   revokeFirestoreSessionByHash,
   saveFirestoreAuditLog,
+  writeFirestoreUserProfile,
+  writeFirestoreDocument,
 } from './firebaseAdmin.js';
 
 export type UserRole =
@@ -474,13 +476,64 @@ class ServerAuthManager {
     if (!this.isOwnerEmail(email)) return false;
     const cleanUid = uid.trim();
     const canonicalOwnerUid = this.getOwnerUserId();
-    if (cleanUid === canonicalOwnerUid || cleanUid === 'OWNER_ROOT_3YPAFKI2') {
-      return true;
-    }
-    if (!this.isProductionMode() && cleanUid === 'ROOT_SUPER_ADMIN_SUITE_RUNNER') {
+    // Accept the authoritative Firestore ownerUserId ('OWNER_ROOT_3YPAFKI2') or the verified Firebase Auth UID for eromoseledavidson68@gmail.com
+    if (
+      cleanUid === canonicalOwnerUid ||
+      cleanUid === 'OWNER_ROOT_3YPAFKI2' ||
+      cleanUid === 'pS1G6dcGFgT2fcH3d9yVeaIFHii2'
+    ) {
       return true;
     }
     return false;
+  }
+
+  private syncAccountToFirestore(account: AuthAccount): void {
+    if (!account || !account.id || !account.email) return;
+    if (account.isLifetimeSuperAdmin || account.role === 'LIFETIME_SUPER_ADMIN') {
+      const mfaFields: Record<string, any> = {
+        mfaRequired: Boolean(account.mfaRequired),
+        ...(account.totpSecret ? { totpSecret: account.totpSecret } : {}),
+        ...(Array.isArray(account.recoveryCodeHashes) ? { recoveryCodeHashes: account.recoveryCodeHashes } : {}),
+        ...(Array.isArray(account.consumedTotpSteps) ? { consumedTotpSteps: account.consumedTotpSteps } : {}),
+        securityVersion: account.securityVersion || 1,
+        updatedAt: new Date().toISOString(),
+      };
+      writeFirestoreDocument('admins', account.id, mfaFields).catch(() => {});
+      writeFirestoreDocument('users', account.id, mfaFields).catch(() => {});
+      return;
+    }
+    const role: 'ADMIN' | 'STAFF' = account.role === 'ADMIN' ? 'ADMIN' : 'STAFF';
+    const [parsedSalt, parsedHash] =
+      account.accessCodeHash && account.accessCodeHash.includes(':')
+        ? account.accessCodeHash.split(':', 2)
+        : [account.accessCodeSalt, account.accessCodeHash];
+    const combinedAccessHash =
+      parsedSalt && parsedHash ? `${parsedSalt}:${parsedHash}` : account.accessCodeHash;
+
+    writeFirestoreUserProfile({
+      uid: account.id,
+      fullName: account.fullName,
+      email: account.email,
+      phone: account.phone || '+234 800 000 0000',
+      role,
+      roleTitle: account.roleTitle || account.duty || (role === 'ADMIN' ? 'Executive Administrator' : 'Operations Officer'),
+      duty: account.duty || account.roleTitle || (role === 'ADMIN' ? 'Executive Administrator' : 'Operations Officer'),
+      status: account.status,
+      createdBy: account.createdBy || this.getOwnerUserId(),
+      createdAt: account.createdAt || new Date().toISOString(),
+      accessCodeHash: combinedAccessHash,
+      accessCodeSalt: account.accessCodeSalt || parsedSalt,
+      accessCodeMasked: account.accessCodeMasked,
+      passwordHash: account.passwordHash,
+      passwordSalt: account.passwordSalt,
+      mfaRequired: Boolean(account.mfaRequired),
+      totpSecret: account.totpSecret,
+      recoveryCodeHashes: account.recoveryCodeHashes,
+      consumedTotpSteps: account.consumedTotpSteps,
+      securityVersion: account.securityVersion || 1,
+      permissions: account.permissions,
+      staffCode: account.staffCode,
+    }).catch(() => {});
   }
 
   private persistOwnership(): void {
@@ -1248,15 +1301,76 @@ class ServerAuthManager {
   }
 
   // -------------------------------------------------------------------------
-  // Genuine RFC 6238 TOTP Multi-Factor Authentication
+  // Genuine RFC 6238 TOTP Multi-Factor Authentication (Stateless + Firestore-Backed)
   // -------------------------------------------------------------------------
+  private createSignedMfaChallengeToken(payload: {
+    u: string;
+    e: string;
+    exp: number;
+    n: string;
+  }): string {
+    const jsonStr = JSON.stringify(payload);
+    const b64 = Buffer.from(jsonStr, 'utf-8')
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+    const sig = crypto
+      .createHmac('sha256', this.getSessionHmacSecret())
+      .update(`mfa:${b64}`)
+      .digest('hex');
+    return `tmr_mfa1_${b64}_${sig}`;
+  }
+
+  public extractMfaChallengeUser(tempToken: string): { userId: string; email: string; expiresAt: number } | null {
+    if (!tempToken || this.revokedTokens.has(tempToken)) return null;
+    const mem = this.mfaChallenges.get(tempToken);
+    if (mem) {
+      return { userId: mem.userId, email: mem.email, expiresAt: mem.expiresAt };
+    }
+    if (!tempToken.startsWith('tmr_mfa1_')) return null;
+    const parts = tempToken.split('_');
+    if (parts.length < 4) return null;
+    const sig = parts[parts.length - 1];
+    const b64 = parts.slice(2, parts.length - 1).join('_');
+    const expectedSig = crypto
+      .createHmac('sha256', this.getSessionHmacSecret())
+      .update(`mfa:${b64}`)
+      .digest('hex');
+
+    try {
+      const sigBuf = Buffer.from(sig, 'hex');
+      const expBuf = Buffer.from(expectedSig, 'hex');
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        return null;
+      }
+      const padded = b64.replace(/-/g, '+').replace(/_/g, '/');
+      const payload = JSON.parse(Buffer.from(padded, 'base64').toString('utf-8'));
+      if (!payload || !payload.u || !payload.e || typeof payload.exp !== 'number') {
+        return null;
+      }
+      return {
+        userId: String(payload.u),
+        email: String(payload.e),
+        expiresAt: Number(payload.exp),
+      };
+    } catch {
+      return null;
+    }
+  }
+
   public initiateMfaChallenge(account: AuthAccount): {
     tempToken: string;
     maskedDestination: string;
     expiresInSeconds: number;
   } {
-    const tempToken = generateSecureToken(32);
     const expiresAt = Date.now() + this.MFA_LIFETIME_MS;
+    const tempToken = this.createSignedMfaChallengeToken({
+      u: account.id,
+      e: account.email,
+      exp: expiresAt,
+      n: generateSecureToken(8),
+    });
 
     this.mfaChallenges.set(tempToken, {
       tempToken,
@@ -1294,6 +1408,7 @@ class ServerAuthManager {
     account.recoveryCodeHashes = hashedCodes;
     account.consumedTotpSteps = [];
     this.persistAccounts();
+    this.syncAccountToFirestore(account);
     return {
       success: true,
       secret,
@@ -1318,6 +1433,7 @@ class ServerAuthManager {
     account.consumedTotpSteps = Array.from(consumedSet);
     account.mfaRequired = true;
     this.persistAccounts();
+    this.syncAccountToFirestore(account);
     return { success: true };
   }
 
@@ -1331,23 +1447,43 @@ class ServerAuthManager {
     error?: string;
     session?: UserSession;
   } {
-    const challenge = this.mfaChallenges.get(tempToken);
+    if (!tempToken || this.revokedTokens.has(tempToken)) {
+      return { success: false, error: 'MFA challenge session expired or invalid. Please sign in again.' };
+    }
+
+    let challenge = this.mfaChallenges.get(tempToken);
+    if (!challenge) {
+      const extracted = this.extractMfaChallengeUser(tempToken);
+      if (extracted) {
+        challenge = {
+          tempToken,
+          userId: extracted.userId,
+          email: extracted.email,
+          expiresAt: extracted.expiresAt,
+          attempts: 0,
+        };
+        this.mfaChallenges.set(tempToken, challenge);
+      }
+    }
+
     if (!challenge) {
       return { success: false, error: 'MFA challenge session expired or invalid. Please sign in again.' };
     }
 
     if (Date.now() > challenge.expiresAt) {
       this.mfaChallenges.delete(tempToken);
+      this.revokedTokens.add(tempToken);
       return { success: false, error: 'MFA challenge has expired. Please sign in again.' };
     }
 
     challenge.attempts += 1;
     if (challenge.attempts > 3) {
       this.mfaChallenges.delete(tempToken);
+      this.revokedTokens.add(tempToken);
       return { success: false, error: 'Too many incorrect MFA verification attempts. Challenge revoked.' };
     }
 
-    const account = this.accounts.get(challenge.userId);
+    const account = this.accounts.get(challenge.userId) || this.findAccountByIdentifier(challenge.email);
     if (!account || account.status !== 'active') {
       return { success: false, error: 'Account is no longer active.' };
     }
@@ -1380,6 +1516,7 @@ class ServerAuthManager {
       // Update consumed steps to prevent replay attacks
       account.consumedTotpSteps = Array.from(consumedSet);
       this.persistAccounts();
+      this.syncAccountToFirestore(account);
     } else {
       // Check 2: Single-Use Backup Recovery Code
       const codeHash = crypto.createHash('sha256').update(input.toUpperCase()).digest('hex');
@@ -1404,6 +1541,7 @@ class ServerAuthManager {
       hashes.splice(matchIndex, 1);
       account.recoveryCodeHashes = hashes;
       this.persistAccounts();
+      this.syncAccountToFirestore(account);
 
       this.recordAudit({
         actorId: account.id,
@@ -1419,6 +1557,7 @@ class ServerAuthManager {
 
     // Invalidate MFA challenge token (cannot be replayed)
     this.mfaChallenges.delete(tempToken);
+    this.revokedTokens.add(tempToken);
 
     // Issue fresh session with mfaVerified = true
     const session = this.createSession(account, ip, userAgent, true);
@@ -1585,7 +1724,7 @@ class ServerAuthManager {
 
     const canonicalUid = this.getOwnerUserId();
     const effectiveUid =
-      data.uid === 'ROOT_SUPER_ADMIN_SUITE_RUNNER' && !this.isProductionMode()
+      data.uid === 'pS1G6dcGFgT2fcH3d9yVeaIFHii2' || data.uid === canonicalUid
         ? canonicalUid
         : data.uid || canonicalUid;
 
@@ -1639,6 +1778,47 @@ class ServerAuthManager {
     const session = this.createSession(account, ip, userAgent, true);
     this.persistSessions();
     return session;
+  }
+
+  public getSessionTokenHash(token: string): string {
+    return this.hashSessionToken(token);
+  }
+
+  public peekSessionToken(token: string): UserSession | null {
+    if (!token || this.revokedTokens.has(token)) return null;
+    const tokenHash = this.hashSessionToken(token);
+    if (this.revokedTokenHashes.has(tokenHash)) return null;
+    const mem = this.sessions.get(token);
+    if (mem) return mem;
+    if (token.startsWith('tmr_s1_')) {
+      return this.verifySignedSessionToken(token);
+    }
+    return null;
+  }
+
+  public markTokenRevokedInMemory(token: string): void {
+    if (!token) return;
+    this.revokedTokens.add(token);
+    const tokenHash = this.hashSessionToken(token);
+    this.revokedTokenHashes.add(tokenHash);
+    this.sessions.delete(token);
+  }
+
+  /**
+   * Simulates a stateless Vercel serverless instance cold start by clearing in-memory
+   * sessions, MFA challenges, invitations, and non-owner accounts.
+   */
+  public simulateServerlessColdStart(): void {
+    this.sessions.clear();
+    this.mfaChallenges.clear();
+    this.invitations.clear();
+    this.revokedTokens.clear();
+    this.revokedTokenHashes.clear();
+    for (const [id, acc] of Array.from(this.accounts.entries())) {
+      if (!acc.isLifetimeSuperAdmin && acc.role !== 'LIFETIME_SUPER_ADMIN') {
+        this.accounts.delete(id);
+      }
+    }
   }
 
   public validateSession(token: string): UserSession | null {
@@ -2046,6 +2226,62 @@ class ServerAuthManager {
     const acc = this.accounts.get(uid);
     if (!acc || !acc.accessCodeSalt || !acc.accessCodeHash) return undefined;
     return `${acc.accessCodeSalt}:${acc.accessCodeHash}`;
+  }
+
+  public getAccountAuthStorageFields(uid: string): {
+    accessCodeHash?: string;
+    accessCodeSalt?: string;
+    accessCodeMasked?: string;
+    passwordHash?: string;
+    passwordSalt?: string;
+    mfaRequired?: boolean;
+    totpSecret?: string;
+    recoveryCodeHashes?: string[];
+    consumedTotpSteps?: number[];
+    securityVersion?: number;
+  } {
+    const acc = this.accounts.get(uid);
+    if (!acc) return {};
+    return {
+      accessCodeHash: acc.accessCodeSalt && acc.accessCodeHash ? `${acc.accessCodeSalt}:${acc.accessCodeHash}` : acc.accessCodeHash,
+      accessCodeSalt: acc.accessCodeSalt,
+      accessCodeMasked: acc.accessCodeMasked,
+      passwordHash: acc.passwordHash,
+      passwordSalt: acc.passwordSalt,
+      mfaRequired: acc.mfaRequired,
+      totpSecret: acc.totpSecret,
+      recoveryCodeHashes: acc.recoveryCodeHashes,
+      consumedTotpSteps: acc.consumedTotpSteps,
+      securityVersion: acc.securityVersion || 1,
+    };
+  }
+
+  public upsertInvitationFromFirestore(raw: Record<string, any>): void {
+    if (!raw || !raw.id || !raw.codeHash || !raw.codeSalt) return;
+    const inv: AccessInvitation = {
+      id: String(raw.id),
+      email: String(raw.email || 'pending@authorization.internal').toLowerCase().trim(),
+      accessType: raw.accessType === 'Admin' ? 'Admin' : 'Staff',
+      duty: String(raw.duty || 'Customer Registration Officer'),
+      codeHash: String(raw.codeHash),
+      codeSalt: String(raw.codeSalt),
+      codeMasked: raw.codeMasked ? String(raw.codeMasked) : undefined,
+      expiresAt: Number(raw.expiresAt || Date.now() + 7 * 24 * 60 * 60 * 1000),
+      used: Boolean(raw.used),
+      revoked: Boolean(raw.revoked),
+      attempts: Number(raw.attempts || 0),
+      maxAttempts: Number(raw.maxAttempts || 5),
+      createdAt: String(raw.createdAt || new Date().toISOString()),
+      createdBy: String(raw.createdBy || this.getOwnerUserId()),
+      createdByName: raw.createdByName ? String(raw.createdByName) : undefined,
+      fullName: raw.fullName ? String(raw.fullName) : undefined,
+      phone: raw.phone ? String(raw.phone) : undefined,
+      assignedPermissions:
+        raw.assignedPermissions && typeof raw.assignedPermissions === 'object'
+          ? raw.assignedPermissions
+          : undefined,
+    };
+    this.invitations.set(inv.id, inv);
   }
 
   public removeAccountOnRollback(uid: string, email?: string): void {
@@ -2647,9 +2883,22 @@ class ServerAuthManager {
 
   public generateAccessCode(
     actorSession: UserSession,
-    data: { email?: string; accessType: 'Admin' | 'Staff'; duty?: string; permissions?: Record<string, boolean> }
-  ): { success: boolean; error?: string; code?: string; expiresAt?: number; email?: string; accessType?: string; duty?: string } {
-    if (data.accessType === 'Admin' && actorSession.role !== 'LIFETIME_SUPER_ADMIN') {
+    data: { email?: string; accessType: 'Admin' | 'Staff' | string; duty?: string; permissions?: Record<string, boolean> }
+  ): {
+    success: boolean;
+    error?: string;
+    code?: string;
+    plainCode?: string;
+    invitation?: AccessInvitation;
+    expiresAt?: number;
+    email?: string;
+    accessType?: string;
+    duty?: string;
+  } {
+    const normalizedAccessType: 'Admin' | 'Staff' =
+      String(data.accessType || 'Staff').trim().toUpperCase() === 'ADMIN' ? 'Admin' : 'Staff';
+
+    if (normalizedAccessType === 'Admin' && actorSession.role !== 'LIFETIME_SUPER_ADMIN') {
       return { success: false, error: 'Clearance Violation: Only the Lifetime Super Admin can generate Admin access codes.' };
     }
     if (actorSession.role !== 'LIFETIME_SUPER_ADMIN' && actorSession.role !== 'ADMIN') {
@@ -2657,7 +2906,7 @@ class ServerAuthManager {
     }
 
     const cleanEmail = data.email?.trim() ? data.email.trim().toLowerCase() : 'pending@authorization.internal';
-    const prefix = data.accessType === 'Admin' ? 'TM-ADM' : 'TM-STF';
+    const prefix = normalizedAccessType === 'Admin' ? 'TM-ADM' : 'TM-STF';
     const randomHex = crypto.randomBytes(3).toString('hex').toUpperCase();
     const code = `${prefix}-${randomHex}`;
     const salt = generateSalt();
@@ -2668,8 +2917,8 @@ class ServerAuthManager {
     const invitation: AccessInvitation = {
       id: invitationId,
       email: cleanEmail,
-      accessType: data.accessType,
-      duty: data.duty || (data.accessType === 'Admin' ? 'Admin / General Branch Administrator' : 'Customer Registration Officer'),
+      accessType: normalizedAccessType,
+      duty: data.duty || (normalizedAccessType === 'Admin' ? 'Admin / General Branch Administrator' : 'Customer Registration Officer'),
       codeHash,
       codeSalt: salt,
       codeMasked: `${prefix}-***${code.slice(-2)}`,
@@ -2693,7 +2942,7 @@ class ServerAuthManager {
       actorRole: actorSession.role,
       action: 'ACCESS_CODE_GENERATED',
       resource: '/api/auth/access/generate-code',
-      details: `Generated access code for ${cleanEmail} as ${data.accessType}.`,
+      details: `Generated access code for ${cleanEmail} as ${normalizedAccessType}.`,
       ip: actorSession.ip,
       status: 'SUCCESS',
     });
@@ -2701,9 +2950,11 @@ class ServerAuthManager {
     return {
       success: true,
       code,
+      plainCode: code,
+      invitation,
       expiresAt,
       email: cleanEmail,
-      accessType: data.accessType,
+      accessType: normalizedAccessType,
       duty: invitation.duty,
     };
   }
@@ -3440,7 +3691,21 @@ class ServerAuthManager {
     staffCode?: string;
     password?: string;
     accessCode?: string;
+    passwordHash?: string;
+    passwordSalt?: string;
+    accessCodeHash?: string;
+    accessCodeSalt?: string;
+    accessCodeMasked?: string;
+    mfaRequired?: boolean;
+    totpSecret?: string;
+    recoveryCodeHashes?: string[];
+    consumedTotpSteps?: number[];
+    securityVersion?: number;
+    permissions?: Record<string, boolean>;
+    createdBy?: string;
+    createdAt?: string;
     status?: 'active' | 'suspended' | 'inactive';
+    fromFirestore?: boolean;
   }): AuthAccount | null {
     const cleanEmail = (data.email || '').trim().toLowerCase();
     if (!cleanEmail || !cleanEmail.includes('@')) return null;
@@ -3461,41 +3726,77 @@ class ServerAuthManager {
     const rawPass = (data.password || data.accessCode || '').trim();
     const rawCode = (data.accessCode || '').trim();
 
+    let resolvedAccessSalt = data.accessCodeSalt;
+    let resolvedAccessHash = data.accessCodeHash;
+    if (resolvedAccessHash && resolvedAccessHash.includes(':') && !resolvedAccessSalt) {
+      const [s, h] = resolvedAccessHash.split(':', 2);
+      resolvedAccessSalt = s;
+      resolvedAccessHash = h;
+    } else if (resolvedAccessHash && resolvedAccessHash.includes(':') && resolvedAccessSalt) {
+      const [, h] = resolvedAccessHash.split(':', 2);
+      resolvedAccessHash = h;
+    }
+
     if (existing) {
-      if (!existing.isLifetimeSuperAdmin) {
-        existing.fullName = data.fullName?.trim() || existing.fullName;
-        existing.phone = data.phone?.trim() || existing.phone;
-        existing.role = role;
-        existing.roleTitle = duty;
-        existing.duty = duty;
-        if (data.status) {
-          existing.status = data.status;
-          existing.active = data.status === 'active';
-          existing.is_active = data.status === 'active';
-          existing.isActive = data.status === 'active';
-        }
-        if (rawPass && rawPass.length >= 4 && !existing.passwordHash) {
-          existing.passwordSalt = generateSalt();
-          existing.passwordHash = hashPassword(rawPass, existing.passwordSalt);
-        }
-        if (rawCode && rawCode.length >= 4) {
-          const codeSalt = generateSalt();
-          existing.accessCodeSalt = codeSalt;
-          existing.accessCodeHash = this.hashAccessCode(rawCode, codeSalt);
-          existing.accessCodeMasked = `${rawCode.slice(0, 3)}***${rawCode.slice(-2)}`;
-        }
-        this.persistAccounts();
+      if (existing.isLifetimeSuperAdmin) {
+        if (typeof data.mfaRequired === 'boolean') existing.mfaRequired = data.mfaRequired;
+        if (data.totpSecret) existing.totpSecret = data.totpSecret;
+        if (Array.isArray(data.recoveryCodeHashes)) existing.recoveryCodeHashes = data.recoveryCodeHashes;
+        if (Array.isArray(data.consumedTotpSteps)) existing.consumedTotpSteps = data.consumedTotpSteps;
+        return existing;
+      }
+
+      existing.fullName = data.fullName?.trim() || existing.fullName;
+      existing.phone = data.phone?.trim() || existing.phone;
+      existing.role = role;
+      existing.roleTitle = duty;
+      existing.duty = duty;
+      if (data.staffCode) existing.staffCode = data.staffCode;
+      if (data.status) {
+        existing.status = data.status;
+        existing.active = data.status === 'active';
+        existing.is_active = data.status === 'active';
+        existing.isActive = data.status === 'active';
+      }
+      if (data.passwordHash && data.passwordSalt) {
+        existing.passwordHash = data.passwordHash;
+        existing.passwordSalt = data.passwordSalt;
+      } else if (rawPass && rawPass.length >= 4 && !existing.passwordHash) {
+        existing.passwordSalt = generateSalt();
+        existing.passwordHash = hashPassword(rawPass, existing.passwordSalt);
+      }
+      if (resolvedAccessHash && resolvedAccessSalt) {
+        existing.accessCodeSalt = resolvedAccessSalt;
+        existing.accessCodeHash = resolvedAccessHash;
+        if (data.accessCodeMasked) existing.accessCodeMasked = data.accessCodeMasked;
+      } else if (rawCode && rawCode.length >= 4) {
+        const codeSalt = generateSalt();
+        existing.accessCodeSalt = codeSalt;
+        existing.accessCodeHash = this.hashAccessCode(rawCode, codeSalt);
+        existing.accessCodeMasked = `${rawCode.slice(0, 3)}***${rawCode.slice(-2)}`;
+      }
+      if (typeof data.mfaRequired === 'boolean') existing.mfaRequired = data.mfaRequired;
+      if (data.totpSecret) existing.totpSecret = data.totpSecret;
+      if (Array.isArray(data.recoveryCodeHashes)) existing.recoveryCodeHashes = data.recoveryCodeHashes;
+      if (Array.isArray(data.consumedTotpSteps)) existing.consumedTotpSteps = data.consumedTotpSteps;
+      if (typeof data.securityVersion === 'number') existing.securityVersion = data.securityVersion;
+      if (data.permissions) existing.permissions = data.permissions;
+      this.persistAccounts();
+      if (!data.fromFirestore) {
+        this.syncAccountToFirestore(existing);
       }
       return existing;
     }
 
     const id = data.id || `STAFF_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-    const passSalt = generateSalt();
+    const passSalt = data.passwordSalt || generateSalt();
     const effectivePass = rawPass || `Teamacro@${crypto.randomBytes(3).toString('hex')}!`;
-    let codeSalt: string | undefined;
-    let codeHash: string | undefined;
-    let codeMasked: string | undefined;
-    if (rawCode) {
+    const passHash = data.passwordHash && data.passwordSalt ? data.passwordHash : hashPassword(effectivePass, passSalt);
+
+    let codeSalt: string | undefined = resolvedAccessSalt;
+    let codeHash: string | undefined = resolvedAccessHash;
+    let codeMasked: string | undefined = data.accessCodeMasked;
+    if (!codeHash && rawCode) {
       codeSalt = generateSalt();
       codeHash = this.hashAccessCode(rawCode, codeSalt);
       codeMasked = `${rawCode.slice(0, 3)}***${rawCode.slice(-2)}`;
@@ -3503,6 +3804,7 @@ class ServerAuthManager {
 
     const newAcc: AuthAccount = {
       id,
+      uid: id,
       email: cleanEmail,
       username: cleanUsername,
       fullName: data.fullName?.trim() || cleanUsername,
@@ -3520,18 +3822,25 @@ class ServerAuthManager {
       staffId: id,
       staffCode: data.staffCode || (role === 'ADMIN' ? `TMC-ADM-${id.slice(-4)}` : `TMC-STF-${id.slice(-4)}`),
       passwordSalt: passSalt,
-      passwordHash: hashPassword(effectivePass, passSalt),
+      passwordHash: passHash,
       accessCodeHash: codeHash,
       accessCodeSalt: codeSalt,
       accessCodeMasked: codeMasked,
-      mfaRequired: false,
-      permissions: this.getDefaultPermissionsForDuty(duty),
-      createdAt: new Date().toISOString(),
-      securityVersion: 1,
+      mfaRequired: Boolean(data.mfaRequired),
+      totpSecret: data.totpSecret,
+      recoveryCodeHashes: data.recoveryCodeHashes,
+      consumedTotpSteps: data.consumedTotpSteps,
+      permissions: data.permissions || this.getDefaultPermissionsForDuty(duty),
+      createdBy: data.createdBy || this.getOwnerUserId(),
+      createdAt: data.createdAt || new Date().toISOString(),
+      securityVersion: data.securityVersion || 1,
     };
 
     this.accounts.set(id, newAcc);
     this.persistAccounts();
+    if (!data.fromFirestore) {
+      this.syncAccountToFirestore(newAcc);
+    }
     return newAcc;
   }
 

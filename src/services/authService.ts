@@ -413,22 +413,13 @@ class AuthService {
       }
 
       // 2. Create the user in Firebase Authentication
-      let fbUid: string;
+      const userCredential = await createUserWithEmailAndPassword(auth, cleanEmail, payload.password);
+      const fbUid = userCredential.user.uid;
+      const idToken = await userCredential.user.getIdToken();
       try {
-        const userCredential = await createUserWithEmailAndPassword(auth, cleanEmail, payload.password);
-        fbUid = userCredential.user.uid;
-        try {
-          await updateProfile(userCredential.user, { displayName: cleanName });
-        } catch {
-          // Ignore profile display name warning
-        }
-      } catch (authErr: any) {
-        if (authErr?.code === 'auth/operation-not-allowed') {
-          console.warn('[AUTH] Firebase Auth Email/Password provider disabled; generating authoritative owner UID.');
-          fbUid = 'OWNER_ROOT_' + Math.random().toString(36).substring(2, 10).toUpperCase();
-        } else {
-          throw authErr;
-        }
+        await updateProfile(userCredential.user, { displayName: cleanName });
+      } catch {
+        // Ignore profile display name warning
       }
 
       const createdAt = new Date().toISOString();
@@ -478,7 +469,7 @@ class AuthService {
         console.warn('[AUTH] users collection write note:', userErr);
       }
 
-      // 6. Establish server session
+      // 6. Establish server session using verified Firebase ID token
       const appUser: User = {
         id: fbUid,
         email: cleanEmail,
@@ -492,9 +483,11 @@ class AuthService {
       try {
         const syncRes = await safeApiFetch<{ sessionToken?: string; success?: boolean }>('/api/auth/sync-super-admin', {
           method: 'POST',
+          headers: {
+            Authorization: `Bearer ${idToken}`,
+          },
           body: {
-            uid: fbUid,
-            email: cleanEmail,
+            idToken,
             fullName: cleanName,
             phone: cleanPhone,
           },
