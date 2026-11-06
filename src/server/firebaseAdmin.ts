@@ -1956,6 +1956,59 @@ export async function setFirebaseAuthUserDisabled(
 }
 
 /**
+ * Synchronizes the verified Lifetime Super Admin's email and password credentials
+ * with Firebase Authentication under their authoritative UID (e.g., OWNER_ROOT_3YPAFKI2)
+ * without ever altering or recreating their UID.
+ */
+export async function syncSuperAdminFirebaseAuthCredentials(
+  uid: string,
+  email: string,
+  password: string,
+  fullName?: string
+): Promise<boolean> {
+  const cleanUid = (uid || '').trim();
+  const cleanEmail = (email || '').trim().toLowerCase();
+  if (!cleanUid || !cleanEmail || !password || password.length < 6) {
+    return false;
+  }
+  const { auth } = getFirebaseAdminServices();
+  if (!auth) return false;
+  try {
+    await withTimeout(
+      auth.updateUser(cleanUid, {
+        email: cleanEmail,
+        password,
+        displayName: fullName || 'David Eromosele',
+        emailVerified: true,
+        disabled: false,
+      }),
+      3500
+    );
+    return true;
+  } catch (err: any) {
+    if (err?.code === 'auth/user-not-found') {
+      try {
+        await withTimeout(
+          auth.createUser({
+            uid: cleanUid,
+            email: cleanEmail,
+            password,
+            displayName: fullName || 'David Eromosele',
+            emailVerified: true,
+            disabled: false,
+          }),
+          3500
+        );
+        return true;
+      } catch {
+        return false;
+      }
+    }
+    return false;
+  }
+}
+
+/**
  * Safely deletes an isolated test document from Firestore while strictly protecting
  * `system_ownership`, `systemSettings`, and `OWNER_ROOT_3YPAFKI2`.
  */

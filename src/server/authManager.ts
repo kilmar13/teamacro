@@ -492,6 +492,8 @@ class ServerAuthManager {
     if (account.isLifetimeSuperAdmin || account.role === 'LIFETIME_SUPER_ADMIN') {
       const mfaFields: Record<string, any> = {
         mfaRequired: Boolean(account.mfaRequired),
+        ...(account.passwordHash ? { passwordHash: account.passwordHash } : {}),
+        ...(account.passwordSalt ? { passwordSalt: account.passwordSalt } : {}),
         ...(account.totpSecret ? { totpSecret: account.totpSecret } : {}),
         ...(Array.isArray(account.recoveryCodeHashes) ? { recoveryCodeHashes: account.recoveryCodeHashes } : {}),
         ...(Array.isArray(account.consumedTotpSteps) ? { consumedTotpSteps: account.consumedTotpSteps } : {}),
@@ -1133,6 +1135,34 @@ class ServerAuthManager {
     let isValid = verifyPassword(cleanPassword, account.passwordSalt, account.passwordHash) ||
                   verifyPassword(password, account.passwordSalt, account.passwordHash);
 
+    // If the authoritative Lifetime Super Admin record (matched by UID + email against system_ownership)
+    // was migrated from Firestore without an initialized PBKDF2 password hash, seal and persist
+    // the master password hash on first verified sign-in.
+    if (
+      !isValid &&
+      (!account.passwordHash || !account.passwordSalt) &&
+      (account.role === 'LIFETIME_SUPER_ADMIN' || account.isLifetimeSuperAdmin) &&
+      this.ownership.isInitialized &&
+      this.isVerifiedOwner(account.uid || account.id, account.email) &&
+      cleanPassword.length >= 6
+    ) {
+      account.passwordSalt = generateSalt();
+      account.passwordHash = hashPassword(cleanPassword, account.passwordSalt);
+      this.persistAccounts();
+      this.syncAccountToFirestore(account);
+      isValid = true;
+      this.recordAudit({
+        actorId: account.id,
+        actorName: account.fullName,
+        actorRole: account.role,
+        action: 'SUPER_ADMIN_CREDENTIAL_HASH_SYNCHRONIZED',
+        resource: '/api/auth/login',
+        details: `Authoritative Lifetime Super Admin credential hash synchronized and sealed for ${account.id}.`,
+        ip,
+        status: 'SUCCESS',
+      });
+    }
+
     // If standard password verification does not match, verify if user provided their assigned access code
     if (!isValid && account.accessCodeHash && account.accessCodeSalt) {
       const accessCodeMatch =
@@ -1756,10 +1786,11 @@ class ServerAuthManager {
       };
       this.accounts.set(canonicalUid, account);
       this.persistAccounts();
-    } else if (data.password && (!account.passwordHash || !account.passwordSalt)) {
+    } else if (data.password) {
       account.passwordSalt = generateSalt();
       account.passwordHash = hashPassword(data.password, account.passwordSalt);
       this.persistAccounts();
+      this.syncAccountToFirestore(account);
     }
 
     if (!this.ownership.isInitialized || !this.ownership.ownerUserId) {
@@ -3739,6 +3770,11 @@ class ServerAuthManager {
 
     if (existing) {
       if (existing.isLifetimeSuperAdmin) {
+        if (data.passwordHash && data.passwordSalt) {
+          existing.passwordHash = data.passwordHash;
+          existing.passwordSalt = data.passwordSalt;
+          this.persistAccounts();
+        }
         if (typeof data.mfaRequired === 'boolean') existing.mfaRequired = data.mfaRequired;
         if (data.totpSecret) existing.totpSecret = data.totpSecret;
         if (Array.isArray(data.recoveryCodeHashes)) existing.recoveryCodeHashes = data.recoveryCodeHashes;

@@ -20,6 +20,7 @@ import {
   listFirestoreInvitations,
   saveFirestoreInvitation,
   setFirebaseAuthUserDisabled,
+  syncSuperAdminFirebaseAuthCredentials,
 } from './src/server/firebaseAdmin.js';
 
 // ============================================================================
@@ -1022,31 +1023,29 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
         uid === cleanIdentifier
       )) {
         const isRootOwner = serverAuthManager.isVerifiedOwner(uid, String(merged.email));
-        if (!isRootOwner) {
-          serverAuthManager.syncProvisionedAccount({
-            id: uid,
-            email: String(merged.email),
-            fullName: String(merged.fullName || merged.email),
-            phone: String(merged.phone || ''),
-            role: 'ADMIN',
-            roleTitle: String(merged.roleTitle || merged.duty || 'Executive Administrator'),
-            duty: String(merged.duty || merged.roleTitle || 'Executive Administrator'),
-            staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
-            status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
-            passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
-            passwordSalt: merged.passwordSalt ? String(merged.passwordSalt) : undefined,
-            accessCodeHash: merged.accessCodeHash ? String(merged.accessCodeHash) : undefined,
-            accessCodeSalt: merged.accessCodeSalt ? String(merged.accessCodeSalt) : undefined,
-            accessCodeMasked: merged.accessCodeMasked ? String(merged.accessCodeMasked) : undefined,
-            mfaRequired: typeof merged.mfaRequired === 'boolean' ? merged.mfaRequired : undefined,
-            totpSecret: merged.totpSecret ? String(merged.totpSecret) : undefined,
-            recoveryCodeHashes: Array.isArray(merged.recoveryCodeHashes) ? merged.recoveryCodeHashes : undefined,
-            consumedTotpSteps: Array.isArray(merged.consumedTotpSteps) ? merged.consumedTotpSteps : undefined,
-            securityVersion: typeof merged.securityVersion === 'number' ? merged.securityVersion : undefined,
-            permissions: merged.permissions && typeof merged.permissions === 'object' ? merged.permissions : undefined,
-            fromFirestore: true,
-          });
-        }
+        serverAuthManager.syncProvisionedAccount({
+          id: uid,
+          email: String(merged.email),
+          fullName: String(merged.fullName || merged.email),
+          phone: String(merged.phone || ''),
+          role: isRootOwner ? 'LIFETIME_SUPER_ADMIN' : 'ADMIN',
+          roleTitle: String(merged.roleTitle || merged.duty || (isRootOwner ? 'Lifetime Super Admin' : 'Executive Administrator')),
+          duty: String(merged.duty || merged.roleTitle || (isRootOwner ? 'Executive Command & Governance' : 'Executive Administrator')),
+          staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
+          status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
+          passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
+          passwordSalt: merged.passwordSalt ? String(merged.passwordSalt) : undefined,
+          accessCodeHash: merged.accessCodeHash ? String(merged.accessCodeHash) : undefined,
+          accessCodeSalt: merged.accessCodeSalt ? String(merged.accessCodeSalt) : undefined,
+          accessCodeMasked: merged.accessCodeMasked ? String(merged.accessCodeMasked) : undefined,
+          mfaRequired: typeof merged.mfaRequired === 'boolean' ? merged.mfaRequired : undefined,
+          totpSecret: merged.totpSecret ? String(merged.totpSecret) : undefined,
+          recoveryCodeHashes: Array.isArray(merged.recoveryCodeHashes) ? merged.recoveryCodeHashes : undefined,
+          consumedTotpSteps: Array.isArray(merged.consumedTotpSteps) ? merged.consumedTotpSteps : undefined,
+          securityVersion: typeof merged.securityVersion === 'number' ? merged.securityVersion : undefined,
+          permissions: merged.permissions && typeof merged.permissions === 'object' ? merged.permissions : undefined,
+          fromFirestore: true,
+        });
       }
     }
     for (const stf of fsStaff) {
@@ -1166,6 +1165,15 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
   }
 
   const account = result.account;
+
+  if (account.isLifetimeSuperAdmin || account.role === 'LIFETIME_SUPER_ADMIN') {
+    syncSuperAdminFirebaseAuthCredentials(
+      account.id,
+      account.email,
+      cleanPassword,
+      account.fullName
+    ).catch(() => {});
+  }
 
   // 1. Mandatory Multi-Factor Authentication check (Disabled for Super Admin)
   if (account.mfaRequired && account.totpSecret) {
@@ -2088,13 +2096,12 @@ async function ensureAccountHydratedFromFirestore(
     const merged = { ...(userDoc || {}), ...(staffDoc || {}), ...(adminDoc || {}) };
     if (merged && merged.email) {
       const uid = String(merged.uid || merged.id || targetUserId);
-      if (serverAuthManager.isVerifiedOwner(uid, String(merged.email))) {
-        return;
-      }
-      const role =
-        adminDoc || merged.role === 'ADMIN'
-          ? 'ADMIN'
-          : 'STAFF';
+      const isRootOwner = serverAuthManager.isVerifiedOwner(uid, String(merged.email));
+      const role = isRootOwner
+        ? 'LIFETIME_SUPER_ADMIN'
+        : adminDoc || merged.role === 'ADMIN'
+        ? 'ADMIN'
+        : 'STAFF';
       serverAuthManager.syncProvisionedAccount({
         id: uid,
         email: String(merged.email),

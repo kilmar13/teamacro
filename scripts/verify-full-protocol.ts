@@ -184,6 +184,7 @@ async function runVerificationSuite() {
     );
 
     // Attempt 2b: Validly signed Firebase ID token for a non-owner UID attempting to claim Super Admin
+    createdUids.push('NON_OWNER_TEST_UID_999');
     const nonOwnerIdToken = await mintVerifiedFirebaseIdToken('NON_OWNER_TEST_UID_999', {
       ownerEmail: 'intruder.nonowner@teamacro.internal',
     });
