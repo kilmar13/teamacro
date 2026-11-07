@@ -13,11 +13,12 @@ import { BankConfig, User } from '../../types/banking';
 import { authService, LoginResult } from '../../services/authService';
 import { normalizeError } from '../../utils/errorNormalizer';
 import { BrandLogo } from '../../components/common/BrandLogo';
+import { getDedicatedRouteForUser } from '../../utils/roleRouting';
 
 interface AdminLoginPageProps {
   config: BankConfig;
   onNavigate: (route: string) => void;
-  onLoginSuccess: (user: User) => void;
+  onLoginSuccess: (user: User, redirectRoute?: string) => void;
 }
 
 export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
@@ -49,19 +50,27 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
         return;
       }
 
-      // Check role authorization: Only ADMIN and LIFETIME_SUPER_ADMIN can enter /admin
+      // Check role authorization: Only ADMIN (including Account Manager, Operations Manager, Auditor) and LIFETIME_SUPER_ADMIN can enter /admin
+      const allowedAdminRoles = [
+        'ADMIN',
+        'ACCOUNT_MANAGER',
+        'OPERATIONS_MANAGER',
+        'AUDITOR',
+        'SUPER_ADMIN',
+        'LIFETIME_SUPER_ADMIN',
+      ];
       if (
         res.user &&
-        res.user.role !== 'ADMIN' &&
-        res.user.role !== 'LIFETIME_SUPER_ADMIN'
+        !allowedAdminRoles.includes(String(res.user.role || '').toUpperCase())
       ) {
         setErrorMsg('Clearance Denied: This portal requires Administrator role clearance.');
         return;
       }
 
       if (res.user) {
-        onLoginSuccess(res.user);
-        onNavigate('/admin');
+        const targetRoute = res.redirectRoute || getDedicatedRouteForUser(res.user);
+        onLoginSuccess(res.user, targetRoute);
+        onNavigate(targetRoute);
       }
     } catch (err: any) {
       setErrorMsg(normalizeError(err, 'Authentication gateway connection failed.'));

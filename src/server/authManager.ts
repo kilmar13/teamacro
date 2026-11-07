@@ -11,6 +11,14 @@ import {
   writeFirestoreUserProfile,
   writeFirestoreDocument,
 } from './firebaseAdmin.js';
+import {
+  normalizeCanonicalPosition,
+  getDedicatedRouteForUser,
+  isReadOnlyAuditor,
+  getDefaultPositionPermissions,
+  sanitizePermissionsForPosition,
+  POSITION_ROUTE_MAP,
+} from '../utils/roleRouting.js';
 
 export type UserRole =
   | 'LIFETIME_SUPER_ADMIN'
@@ -23,6 +31,7 @@ export type UserRole =
   | 'customer_service'
   | 'accountant'
   | 'auditor'
+  | 'ACCOUNT_MANAGER'
   | 'CUSTOMER_REGISTRATION_OFFICER'
   | 'PAYMENT_COLLECTION_OFFICER'
   | 'LOAN_OFFICER'
@@ -40,6 +49,9 @@ export interface AuthAccount {
   role: UserRole;
   roleTitle: string;
   duty?: string;
+  position?: string;
+  dashboardRoute?: string;
+  assignedProgramme?: string;
   permissions?: Record<string, boolean>;
   isLifetimeSuperAdmin: boolean;
   status: 'active' | 'suspended' | 'inactive';
@@ -70,6 +82,9 @@ export interface AccessInvitation {
   email: string;
   accessType: 'Admin' | 'Staff';
   duty: string;
+  position?: string;
+  dashboardRoute?: string;
+  assignedProgramme?: string;
   codeHash: string;
   codeSalt: string;
   codeMasked?: string;
@@ -112,6 +127,10 @@ export interface UserSession {
   fullName: string;
   role: UserRole;
   roleTitle: string;
+  position?: string;
+  dashboardRoute?: string;
+  assignedProgramme?: string;
+  permissions?: Record<string, boolean>;
   isLifetimeSuperAdmin: boolean;
   mfaVerified: boolean;
   securityVersion: number;
@@ -518,8 +537,11 @@ class ServerAuthManager {
       email: account.email,
       phone: account.phone || '+234 800 000 0000',
       role,
-      roleTitle: account.roleTitle || account.duty || (role === 'ADMIN' ? 'Executive Administrator' : 'Operations Officer'),
-      duty: account.duty || account.roleTitle || (role === 'ADMIN' ? 'Executive Administrator' : 'Operations Officer'),
+      roleTitle: account.roleTitle || account.position || account.duty || (role === 'ADMIN' ? 'Account Manager' : 'Customer Registration Officer'),
+      duty: account.duty || account.position || account.roleTitle || (role === 'ADMIN' ? 'Account Manager' : 'Customer Registration Officer'),
+      position: account.position || account.duty || account.roleTitle,
+      dashboardRoute: account.dashboardRoute || getDedicatedRouteForUser(account),
+      assignedProgramme: account.assignedProgramme,
       status: account.status,
       createdBy: account.createdBy || this.getOwnerUserId(),
       createdAt: account.createdAt || new Date().toISOString(),
@@ -1625,6 +1647,9 @@ class ServerAuthManager {
     n: string;
     r: UserRole;
     rt: string;
+    pos?: string;
+    dr?: string;
+    ap?: string;
     sa: boolean;
     mfa: boolean;
     sv: number;
@@ -1668,6 +1693,13 @@ class ServerAuthManager {
       if (!payload || typeof payload.exp !== 'number' || Date.now() > payload.exp) {
         return null;
       }
+      const pos = payload.pos || payload.rt || payload.r;
+      const dr = payload.dr || getDedicatedRouteForUser({
+        role: payload.r,
+        roleTitle: payload.rt || payload.r,
+        position: pos,
+        isLifetimeSuperAdmin: Boolean(payload.sa),
+      });
       return {
         token,
         userId: payload.u,
@@ -1675,6 +1707,9 @@ class ServerAuthManager {
         fullName: payload.n,
         role: payload.r,
         roleTitle: payload.rt || payload.r,
+        position: pos,
+        dashboardRoute: dr,
+        assignedProgramme: payload.ap,
         isLifetimeSuperAdmin: Boolean(payload.sa),
         mfaVerified: Boolean(payload.mfa),
         securityVersion: Number(payload.sv || 1),
@@ -1696,12 +1731,25 @@ class ServerAuthManager {
   ): UserSession {
     const now = Date.now();
     const expiresAt = now + this.SESSION_LIFETIME_MS;
+    const canonicalPos = normalizeCanonicalPosition(account.position || account.duty || account.roleTitle, account.role);
+    const position = canonicalPos || account.position || account.duty || account.roleTitle;
+    const dashboardRoute = getDedicatedRouteForUser({
+      role: account.role,
+      roleTitle: account.roleTitle,
+      duty: account.duty,
+      position,
+      dashboardRoute: account.dashboardRoute,
+      isLifetimeSuperAdmin: account.isLifetimeSuperAdmin,
+    });
     const token = this.createSignedSessionToken({
       u: account.id,
       e: account.email,
       n: account.fullName,
       r: account.role,
       rt: account.roleTitle,
+      pos: position,
+      dr: dashboardRoute,
+      ap: account.assignedProgramme,
       sa: account.isLifetimeSuperAdmin,
       mfa: mfaVerified,
       sv: account.securityVersion || 1,
@@ -1716,6 +1764,10 @@ class ServerAuthManager {
       fullName: account.fullName,
       role: account.role,
       roleTitle: account.roleTitle,
+      position,
+      dashboardRoute,
+      assignedProgramme: account.assignedProgramme,
+      permissions: account.permissions,
       isLifetimeSuperAdmin: account.isLifetimeSuperAdmin,
       mfaVerified,
       securityVersion: account.securityVersion || 1,
@@ -1809,6 +1861,25 @@ class ServerAuthManager {
     const session = this.createSession(account, ip, userAgent, true);
     this.persistSessions();
     return session;
+  }
+
+  private deletedIdentifiers: Set<string> = new Set();
+
+  public isDeletedAccount(idOrEmail?: string): boolean {
+    if (!idOrEmail) return false;
+    return this.deletedIdentifiers.has(idOrEmail.trim().toLowerCase());
+  }
+
+  public clearDeletedAccountMarker(idOrEmail?: string): void {
+    if (!idOrEmail) return;
+    this.deletedIdentifiers.delete(idOrEmail.trim().toLowerCase());
+  }
+
+  public hasWarmSession(token: string): boolean {
+    if (!token || this.revokedTokens.has(token)) return false;
+    const tokenHash = this.hashSessionToken(token);
+    if (this.revokedTokenHashes.has(tokenHash)) return false;
+    return this.sessions.has(token);
   }
 
   public getSessionTokenHash(token: string): string {
@@ -2132,13 +2203,15 @@ class ServerAuthManager {
     // Canonical Route 4: /supa-admin (Lifetime Super Admin with MFA ONLY)
     if (normalized === '/supa-admin' || normalized === '/superadmin') {
       if (session.role !== 'LIFETIME_SUPER_ADMIN' || !session.isLifetimeSuperAdmin) {
+        const account = this.accounts.get(session.userId) || this.findAccountByIdentifier(session.email);
+        const dedicatedRoute = getDedicatedRouteForUser(account || session);
         this.recordAudit({
           actorId: session.userId,
           actorName: session.fullName,
           actorRole: session.role,
           action: 'ATTEMPTED_PRIVILEGE_ESCALATION',
           resource: '/supa-admin',
-          details: `Non-Super-Admin user (${session.role}) attempted unauthorized access to root portal.`,
+          details: `Non-Super-Admin user (${session.role} / ${session.position || session.roleTitle}) attempted unauthorized access to root portal.`,
           ip: session.ip,
           status: 'DENIED',
         });
@@ -2147,16 +2220,61 @@ class ServerAuthManager {
           statusCode: 403,
           reason: 'Access Denied: The Super Admin portal is strictly reserved for the unique Lifetime Super Admin.',
           session,
+          targetRoute: dedicatedRoute,
         };
       }
 
       return { allowed: true, statusCode: 200, session, targetRoute: '/supa-admin' };
     }
 
-    // Canonical Route 3: /admin (Admin or Lifetime Super Admin)
+    const account = this.accounts.get(session.userId) || this.findAccountByIdentifier(session.email);
+    const userAssignedRoute = getDedicatedRouteForUser(account || session);
+    const userPosition =
+      normalizeCanonicalPosition(
+        account?.position || account?.duty || account?.roleTitle || session.position || session.roleTitle,
+        account?.role || session.role
+      ) ||
+      session.position ||
+      session.roleTitle;
+
+    // Dedicated Admin Position Routes: /admin/accountmanager, /admin/operationsmanager, /admin/auditor
+    if (
+      normalized === '/admin/accountmanager' ||
+      normalized === '/admin/operationsmanager' ||
+      normalized === '/admin/auditor'
+    ) {
+      if (session.role === 'LIFETIME_SUPER_ADMIN' && session.isLifetimeSuperAdmin) {
+        return { allowed: true, statusCode: 200, session, targetRoute: normalized };
+      }
+      if (session.role === 'ADMIN' && userAssignedRoute.toLowerCase() === normalized) {
+        return { allowed: true, statusCode: 200, session, targetRoute: userAssignedRoute };
+      }
+      this.recordAudit({
+        actorId: session.userId,
+        actorName: session.fullName,
+        actorRole: session.role,
+        action: 'UNAUTHORIZED_POSITION_ROUTE_ACCESS',
+        resource: normalized,
+        details: `User ${session.fullName} (${userPosition}) attempted to access ${normalized} instead of assigned route ${userAssignedRoute}.`,
+        ip: session.ip,
+        status: 'DENIED',
+      });
+      return {
+        allowed: false,
+        statusCode: 403,
+        reason: `Access Denied: Your assigned position (${userPosition}) only authorizes access to ${userAssignedRoute}.`,
+        session,
+        targetRoute: userAssignedRoute,
+      };
+    }
+
+    // Generic /admin route -> redirects Admin to their specific position route
     if (normalized === '/admin') {
-      if (session.role === 'ADMIN' || session.role === 'LIFETIME_SUPER_ADMIN') {
+      if (session.role === 'LIFETIME_SUPER_ADMIN' && session.isLifetimeSuperAdmin) {
         return { allowed: true, statusCode: 200, session, targetRoute: '/admin' };
+      }
+      if (session.role === 'ADMIN') {
+        return { allowed: true, statusCode: 200, session, targetRoute: userAssignedRoute };
       }
       this.recordAudit({
         actorId: session.userId,
@@ -2164,7 +2282,7 @@ class ServerAuthManager {
         actorRole: session.role,
         action: 'UNAUTHORIZED_ADMIN_PORTAL_ACCESS',
         resource: '/admin',
-        details: `Staff user (${session.role}) attempted unauthorized access to Admin portal.`,
+        details: `Staff user (${session.role} / ${userPosition}) attempted unauthorized access to Admin portal.`,
         ip: session.ip,
         status: 'DENIED',
       });
@@ -2173,14 +2291,58 @@ class ServerAuthManager {
         statusCode: 403,
         reason: 'Access Denied: Administrative role clearance required.',
         session,
+        targetRoute: userAssignedRoute,
       };
     }
 
-    // Canonical Route 2: /staff (Authenticated Staff)
+    // Dedicated Staff Position Routes:
+    // /staff/customer-registration, /staff/payment-collection, /staff/loan-officer, /staff/accounts-officer
+    if (
+      normalized === '/staff/customer-registration' ||
+      normalized === '/staff/payment-collection' ||
+      normalized === '/staff/loan-officer' ||
+      normalized === '/staff/accounts-officer'
+    ) {
+      if (session.role === 'LIFETIME_SUPER_ADMIN' && session.isLifetimeSuperAdmin) {
+        return { allowed: true, statusCode: 200, session, targetRoute: normalized };
+      }
+      if (userAssignedRoute.toLowerCase() === normalized) {
+        return { allowed: true, statusCode: 200, session, targetRoute: userAssignedRoute };
+      }
+      this.recordAudit({
+        actorId: session.userId,
+        actorName: session.fullName,
+        actorRole: session.role,
+        action: 'UNAUTHORIZED_POSITION_ROUTE_ACCESS',
+        resource: normalized,
+        details: `User ${session.fullName} (${userPosition}) attempted to access ${normalized} instead of assigned route ${userAssignedRoute}.`,
+        ip: session.ip,
+        status: 'DENIED',
+      });
+      return {
+        allowed: false,
+        statusCode: 403,
+        reason: `Access Denied: Your assigned position (${userPosition}) only authorizes access to ${userAssignedRoute}.`,
+        session,
+        targetRoute: userAssignedRoute,
+      };
+    }
+
+    // Generic /staff route -> resolves to user's dedicated route
     if (normalized === '/staff' || normalized.startsWith('/staff/')) {
+      if (session.role === 'LIFETIME_SUPER_ADMIN' && session.isLifetimeSuperAdmin) {
+        return { allowed: true, statusCode: 200, session, targetRoute: '/staff' };
+      }
+      if (session.role === 'ADMIN') {
+        return {
+          allowed: false,
+          statusCode: 403,
+          reason: `Access Denied: Administrators should use their dedicated dashboard (${userAssignedRoute}).`,
+          session,
+          targetRoute: userAssignedRoute,
+        };
+      }
       const staffRoles: string[] = [
-        'LIFETIME_SUPER_ADMIN',
-        'ADMIN',
         'STAFF',
         'staff',
         'operations_manager',
@@ -2189,9 +2351,13 @@ class ServerAuthManager {
         'customer_service',
         'accountant',
         'auditor',
+        'CUSTOMER_REGISTRATION_OFFICER',
+        'PAYMENT_COLLECTION_OFFICER',
+        'LOAN_OFFICER',
+        'ACCOUNTS_OFFICER',
       ];
       if (staffRoles.includes(session.role) || session.role.toUpperCase() === 'STAFF') {
-        return { allowed: true, statusCode: 200, session, targetRoute: '/staff' };
+        return { allowed: true, statusCode: 200, session, targetRoute: userAssignedRoute };
       }
       return {
         allowed: false,
@@ -2207,7 +2373,8 @@ class ServerAuthManager {
   // -------------------------------------------------------------------------
   // Role Matrix & Privilege Delegation (No Privilege Escalation)
   // - Super Admin can create/revoke Admins and Staff
-  // - Admin can create Staff only (cannot create Admin or Super Admin)
+  // - Admin (Operations Manager with canManageStaff) can create Staff only (cannot create Admin or Super Admin)
+  // - Auditor is strictly Read-Only
   // - Staff cannot create Admin or Super Admin
   // -------------------------------------------------------------------------
   public static readonly ALLOWED_STAFF_DUTIES: ReadonlySet<string> = new Set([
@@ -2215,6 +2382,7 @@ class ServerAuthManager {
     'payment collection officer',
     'loan officer',
     'accounts officer',
+    'credit operations officer',
     'operations manager',
     'auditor / read-only user',
     'field collector',
@@ -2230,6 +2398,9 @@ class ServerAuthManager {
   ]);
 
   public static readonly ALLOWED_ADMIN_DUTIES: ReadonlySet<string> = new Set([
+    'account manager',
+    'operations manager',
+    'auditor',
     'admin / general branch administrator',
     'executive administrator',
     'credit & risk portfolio oversight',
@@ -2237,7 +2408,6 @@ class ServerAuthManager {
     'compliance & audit administrator',
     'treasury & ledger administrator',
     'general branch administrator',
-    'operations manager',
     'branch manager',
   ]);
 
@@ -2251,6 +2421,17 @@ class ServerAuthManager {
       );
     }
     return ServerAuthManager.ALLOWED_STAFF_DUTIES.has(normalized);
+  }
+
+  public getDedicatedRouteForAccount(accountOrSession?: Partial<AuthAccount & UserSession> | null): string {
+    return getDedicatedRouteForUser(accountOrSession as any);
+  }
+
+  public isAuditorSession(session?: UserSession | AuthAccount | null): boolean {
+    if (!session) return false;
+    if (session.isLifetimeSuperAdmin || session.role === 'LIFETIME_SUPER_ADMIN') return false;
+    const acc = 'userId' in session ? this.accounts.get(session.userId) : session;
+    return isReadOnlyAuditor(acc || session);
   }
 
   public getAccountAccessCodeSaltedHash(uid: string): string | undefined {
@@ -2346,11 +2527,16 @@ class ServerAuthManager {
       role?: UserRole;
       roleTitle?: string;
       duty?: string;
+      position?: string;
+      dashboardRoute?: string;
+      assignedProgramme?: string;
       operationalResponsibility?: string;
       accessCode: string;
       password?: string;
       initialPassword?: string;
       assignedModules?: string[];
+      permissions?: Record<string, boolean>;
+      status?: 'active' | 'suspended' | 'inactive';
       firebaseUid?: string;
       allowUpdate?: boolean;
     }
@@ -2386,16 +2572,45 @@ class ServerAuthManager {
       };
     }
 
-    // 2. Invariant: Only the active Lifetime Super Admin can create Staff or Admin accounts on this endpoint
-    if (actorSession.role !== 'LIFETIME_SUPER_ADMIN' || !actorSession.isLifetimeSuperAdmin) {
-      const error = 'Privilege Violation: Only the Lifetime Super Admin holds account provisioning clearance.';
+    // 2. Role hierarchy invariant:
+    // - Only Lifetime Super Admin can create ADMIN accounts
+    // - Lifetime Super Admin OR an active non-Auditor ADMIN with canManageStaff clearance can create STAFF accounts
+    if (rawRole === 'ADMIN' && (actorSession.role !== 'LIFETIME_SUPER_ADMIN' || !actorSession.isLifetimeSuperAdmin)) {
+      const error = 'Privilege Violation: Only the Lifetime Super Admin can create Administrator accounts.';
+      this.recordAudit({
+        actorId: actorSession.userId,
+        actorName: actorSession.fullName,
+        actorRole: actorSession.role,
+        action: 'UNAUTHORIZED_ADMIN_CREATION_ATTEMPT',
+        resource: '/api/auth/create-staff',
+        details: `Non-Super-Admin user (${actorSession.role}) attempted to create an ADMIN account.`,
+        ip: actorSession.ip,
+        status: 'DENIED',
+      });
+      return {
+        success: false,
+        statusCode: 403,
+        message: error,
+        error,
+      };
+    }
+
+    const actorAccount = this.accounts.get(actorSession.userId);
+    const isSuperAdmin = actorSession.role === 'LIFETIME_SUPER_ADMIN' && actorSession.isLifetimeSuperAdmin;
+    const isAuthorizedAdmin =
+      actorSession.role === 'ADMIN' &&
+      !this.isAuditorSession(actorSession) &&
+      (actorAccount?.permissions?.canManageStaff !== false && actorSession.permissions?.canManageStaff !== false);
+
+    if (!isSuperAdmin && !isAuthorizedAdmin) {
+      const error = 'Privilege Violation: Insufficient administrative clearance to provision Staff accounts.';
       this.recordAudit({
         actorId: actorSession.userId,
         actorName: actorSession.fullName,
         actorRole: actorSession.role,
         action: 'UNAUTHORIZED_ACCOUNT_CREATION_ATTEMPT',
         resource: '/api/auth/create-staff',
-        details: `Non-Super-Admin user (${actorSession.role}) attempted to create an account.`,
+        details: `Unauthorized user (${actorSession.role} / ${actorSession.position || actorSession.roleTitle}) attempted to create a Staff account.`,
         ip: actorSession.ip,
         status: 'DENIED',
       });
@@ -2412,8 +2627,13 @@ class ServerAuthManager {
     const email = data.email?.trim().toLowerCase();
     const phone = data.phone?.trim();
     const accessCode = data.accessCode?.trim();
-    const explicitDuty = (data.duty || data.roleTitle || data.operationalResponsibility || '').trim();
-    const roleTitle = explicitDuty || 'Customer Registration Officer';
+    const explicitDuty = (data.position || data.duty || data.roleTitle || data.operationalResponsibility || '').trim();
+    const canonicalPos = normalizeCanonicalPosition(explicitDuty, rawRole);
+    const roleTitle = canonicalPos || explicitDuty || (rawRole === 'ADMIN' ? 'Account Manager' : 'Customer Registration Officer');
+    const assignedProgramme = (data.assignedProgramme || 'General Operations & Multi-Programme').trim();
+    const requestedStatus: 'active' | 'suspended' | 'inactive' =
+      data.status === 'suspended' ? 'suspended' : data.status === 'inactive' ? 'inactive' : 'active';
+    const isActiveStatus = requestedStatus === 'active';
 
     if (!fullName || !email || !phone || !accessCode) {
       const error = 'Full Legal Name, Official Email Address, Phone Number, and Access Code are mandatory.';
@@ -2432,7 +2652,7 @@ class ServerAuthManager {
     }
 
     if (!this.isValidOperationalDuty(roleTitle, rawRole === 'ADMIN' ? 'ADMIN' : 'STAFF')) {
-      const error = `Invalid operational duty "${roleTitle}". Please select an approved operational duty from the allowed list.`;
+      const error = `Invalid operational position "${roleTitle}". Please select an approved position from the allowed list.`;
       return {
         success: false,
         statusCode: 400,
@@ -2460,6 +2680,18 @@ class ServerAuthManager {
         error,
       };
     }
+
+    const dashboardRoute =
+      data.dashboardRoute ||
+      getDedicatedRouteForUser({
+        role: rawRole,
+        roleTitle,
+        duty: roleTitle,
+        position: roleTitle,
+        isLifetimeSuperAdmin: false,
+      });
+
+    const sanitizedPermissions = sanitizePermissionsForPosition(roleTitle, data.permissions);
 
     // 5. Duplicate Email Verification
     const existingByEmail = this.findAccountByIdentifier(email);
@@ -2550,6 +2782,10 @@ class ServerAuthManager {
       matchedInvitation.fullName = fullName;
       matchedInvitation.phone = phone;
       matchedInvitation.duty = roleTitle;
+      matchedInvitation.position = roleTitle;
+      matchedInvitation.dashboardRoute = dashboardRoute;
+      matchedInvitation.assignedProgramme = assignedProgramme;
+      matchedInvitation.assignedPermissions = sanitizedPermissions;
       matchedInvitation.used = true;
       matchedInvitation.revoked = false;
       matchedInvitation.attempts = 0;
@@ -2569,6 +2805,9 @@ class ServerAuthManager {
         email,
         accessType: rawRole === 'ADMIN' ? 'Admin' : 'Staff',
         duty: roleTitle,
+        position: roleTitle,
+        dashboardRoute,
+        assignedProgramme,
         codeHash,
         codeSalt,
         codeMasked,
@@ -2582,12 +2821,14 @@ class ServerAuthManager {
         createdByName: actorSession.fullName,
         fullName,
         phone,
-        assignedPermissions: this.getDefaultPermissionsForDuty(roleTitle),
+        assignedPermissions: sanitizedPermissions,
       };
       this.invitations.set(invitationId, newInvitation);
       this.persistInvitations();
     }
 
+    this.clearDeletedAccountMarker(email);
+    if (data.firebaseUid) this.clearDeletedAccountMarker(data.firebaseUid);
     const username = (data.username?.trim() || email.split('@')[0]).toLowerCase();
     if (existingByEmail && existingByEmail.email.toLowerCase() === email) {
       if (data.firebaseUid && existingByEmail.id !== data.firebaseUid) {
@@ -2595,10 +2836,10 @@ class ServerAuthManager {
         existingByEmail.id = data.firebaseUid;
       }
       existingByEmail.uid = data.firebaseUid || existingByEmail.uid || existingByEmail.id;
-      existingByEmail.status = 'active';
-      existingByEmail.active = true;
-      existingByEmail.is_active = true;
-      existingByEmail.isActive = true;
+      existingByEmail.status = requestedStatus;
+      existingByEmail.active = isActiveStatus;
+      existingByEmail.is_active = isActiveStatus;
+      existingByEmail.isActive = isActiveStatus;
       existingByEmail.verified = true;
       existingByEmail.isVerified = true;
       existingByEmail.fullName = fullName;
@@ -2606,6 +2847,10 @@ class ServerAuthManager {
       existingByEmail.role = (rawRole === 'ADMIN' ? 'ADMIN' : 'STAFF') as UserRole;
       existingByEmail.roleTitle = roleTitle;
       existingByEmail.duty = roleTitle;
+      existingByEmail.position = roleTitle;
+      existingByEmail.dashboardRoute = dashboardRoute;
+      existingByEmail.assignedProgramme = assignedProgramme;
+      existingByEmail.permissions = sanitizedPermissions;
       existingByEmail.createdBy = existingByEmail.createdBy || actorSession.userId;
       existingByEmail.accessCodeHash = codeHash;
       existingByEmail.accessCodeSalt = codeSalt;
@@ -2629,7 +2874,7 @@ class ServerAuthManager {
         actorRole: actorSession.role,
         action: 'CREATED_STAFF_ACCOUNT',
         resource: '/api/auth/create-staff',
-        details: `${actorSession.role} ${actorSession.fullName} activated/updated Staff account for ${existingByEmail.fullName} (${existingByEmail.email}) with verified access code (${codeMasked}).`,
+        details: `${actorSession.role} ${actorSession.fullName} activated/updated Staff account for ${existingByEmail.fullName} (${existingByEmail.email}) as ${roleTitle} (${dashboardRoute}).`,
         ip: actorSession.ip,
         status: 'SUCCESS',
       });
@@ -2644,6 +2889,9 @@ class ServerAuthManager {
         role: existingByEmail.role,
         roleTitle: existingByEmail.roleTitle,
         duty: existingByEmail.duty,
+        position: existingByEmail.position,
+        dashboardRoute: existingByEmail.dashboardRoute,
+        assignedProgramme: existingByEmail.assignedProgramme,
         staffId: existingByEmail.staffId || existingByEmail.id,
         staffCode: existingByEmail.staffCode,
         status: existingByEmail.status,
@@ -2662,6 +2910,9 @@ class ServerAuthManager {
           codeMasked,
           accessType: existingByEmail.role === 'ADMIN' ? 'Admin' : 'Staff',
           duty: roleTitle,
+          position: roleTitle,
+          dashboardRoute,
+          assignedProgramme,
         },
         data: {
           account: safeAccount,
@@ -2669,6 +2920,9 @@ class ServerAuthManager {
             codeMasked,
             accessType: existingByEmail.role === 'ADMIN' ? 'Admin' : 'Staff',
             duty: roleTitle,
+            position: roleTitle,
+            dashboardRoute,
+            assignedProgramme,
           },
         },
       };
@@ -2694,11 +2948,14 @@ class ServerAuthManager {
       role: (rawRole === 'ADMIN' ? 'ADMIN' : 'STAFF') as UserRole,
       roleTitle,
       duty: roleTitle,
+      position: roleTitle,
+      dashboardRoute,
+      assignedProgramme,
       isLifetimeSuperAdmin: false,
-      status: 'active',
-      active: true,
-      is_active: true,
-      isActive: true,
+      status: requestedStatus,
+      active: isActiveStatus,
+      is_active: isActiveStatus,
+      isActive: isActiveStatus,
       verified: true,
       isVerified: true,
       staffId: id,
@@ -2708,7 +2965,7 @@ class ServerAuthManager {
       accessCodeHash: codeHash,
       accessCodeSalt: codeSalt,
       accessCodeMasked: codeMasked,
-      permissions: this.getDefaultPermissionsForDuty(roleTitle),
+      permissions: sanitizedPermissions,
       mfaRequired: false,
       createdBy: actorSession.userId,
       createdAt: new Date().toISOString(),
@@ -2725,7 +2982,7 @@ class ServerAuthManager {
       actorRole: actorSession.role,
       action: 'CREATED_STAFF_ACCOUNT',
       resource: '/api/auth/create-staff',
-      details: `${actorSession.role} ${actorSession.fullName} provisioned Staff account for ${newAccount.fullName} (${newAccount.email}) with UID ${id} and verified access code (${codeMasked}).`,
+      details: `${actorSession.role} ${actorSession.fullName} provisioned Staff account for ${newAccount.fullName} (${newAccount.email}) as ${roleTitle} (${dashboardRoute}) with UID ${id}.`,
       ip: actorSession.ip,
       status: 'SUCCESS',
     });
@@ -2740,6 +2997,9 @@ class ServerAuthManager {
       role: newAccount.role,
       roleTitle: newAccount.roleTitle,
       duty: newAccount.duty,
+      position: newAccount.position,
+      dashboardRoute: newAccount.dashboardRoute,
+      assignedProgramme: newAccount.assignedProgramme,
       staffId: newAccount.staffId || newAccount.id,
       staffCode: newAccount.staffCode,
       status: newAccount.status,
@@ -2758,6 +3018,9 @@ class ServerAuthManager {
         codeMasked,
         accessType: 'Staff',
         duty: roleTitle,
+        position: roleTitle,
+        dashboardRoute,
+        assignedProgramme,
       },
       data: {
         account: safeAccount,
@@ -2765,6 +3028,9 @@ class ServerAuthManager {
           codeMasked,
           accessType: 'Staff',
           duty: roleTitle,
+          position: roleTitle,
+          dashboardRoute,
+          assignedProgramme,
         },
       },
     };
@@ -2817,12 +3083,12 @@ class ServerAuthManager {
     targetUserId: string,
     status: 'active' | 'suspended' | 'inactive'
   ): { success: boolean; error?: string } {
-    const target = this.accounts.get(targetUserId);
+    const target = this.accounts.get(targetUserId) || this.findAccountByIdentifier(targetUserId);
     if (!target) {
       return { success: false, error: 'Target account not found.' };
     }
 
-    if (target.isLifetimeSuperAdmin) {
+    if (target.isLifetimeSuperAdmin || this.isVerifiedOwner(target.id, target.email)) {
       return {
         success: false,
         error: 'Security Invariant: The Lifetime Super Admin account status cannot be altered or suspended.',
@@ -2847,7 +3113,7 @@ class ServerAuthManager {
     target.securityVersion = (target.securityVersion || 1) + 1;
 
     if (status !== 'active') {
-      this.revokeAllUserSessions(targetUserId);
+      this.revokeAllUserSessions(target.id);
     }
     this.persistAccounts();
 
@@ -2864,6 +3130,311 @@ class ServerAuthManager {
 
     return { success: true };
   }
+
+  public deleteUserAccount(
+    actorSession: UserSession,
+    targetUserIdOrEmail: string,
+    explicitEmail?: string
+  ): {
+    success: boolean;
+    error?: string;
+    deletedId?: string;
+    deletedEmail?: string;
+    deletedRole?: string;
+  } {
+    if (this.isAuditorSession(actorSession)) {
+      return {
+        success: false,
+        error: 'Read-Only Restriction: Auditors are strictly prohibited from deleting accounts.',
+      };
+    }
+
+    if (actorSession.role !== 'LIFETIME_SUPER_ADMIN' && actorSession.role !== 'ADMIN') {
+      return {
+        success: false,
+        error: 'Insufficient administrative privileges to delete Admin or Staff accounts.',
+      };
+    }
+
+    const cleanIdentifier = (targetUserIdOrEmail || '').trim();
+    const cleanEmail = (explicitEmail || '').trim().toLowerCase();
+
+    if (
+      cleanIdentifier === 'OWNER_ROOT_3YPAFKI2' ||
+      cleanIdentifier === 'LIFETIME_ROOT_SUPER_ADMIN_001' ||
+      this.isOwnerEmail(cleanIdentifier) ||
+      (cleanEmail && this.isOwnerEmail(cleanEmail))
+    ) {
+      return {
+        success: false,
+        error: 'Security Invariant: The Permanent Lifetime Super Admin account cannot be deleted.',
+      };
+    }
+
+    const target =
+      this.accounts.get(cleanIdentifier) ||
+      this.findAccountByIdentifier(cleanIdentifier) ||
+      (cleanEmail ? this.findAccountByIdentifier(cleanEmail) : null);
+
+    if (target) {
+      if (target.isLifetimeSuperAdmin || target.role === 'LIFETIME_SUPER_ADMIN' || this.isVerifiedOwner(target.id, target.email)) {
+        return {
+          success: false,
+          error: 'Security Invariant: The Permanent Lifetime Super Admin account cannot be deleted.',
+        };
+      }
+
+      if (target.id === actorSession.userId || target.email.toLowerCase() === actorSession.email.toLowerCase()) {
+        return {
+          success: false,
+          error: 'You cannot delete your own currently signed-in account.',
+        };
+      }
+
+      const deletedId = target.id;
+      const deletedEmail = target.email;
+      const deletedRole = target.role;
+
+      this.deletedIdentifiers.add(deletedId.toLowerCase());
+      this.deletedIdentifiers.add(deletedEmail.toLowerCase());
+      if (cleanIdentifier) this.deletedIdentifiers.add(cleanIdentifier.toLowerCase());
+      if (cleanEmail) this.deletedIdentifiers.add(cleanEmail.toLowerCase());
+
+      this.revokeAllUserSessions(deletedId);
+      this.accounts.delete(deletedId);
+
+      for (const [key, acc] of Array.from(this.accounts.entries())) {
+        if (acc.email.toLowerCase() === deletedEmail.toLowerCase() && !acc.isLifetimeSuperAdmin) {
+          this.deletedIdentifiers.add(key.toLowerCase());
+          this.accounts.delete(key);
+        }
+      }
+
+      for (const [invId, inv] of Array.from(this.invitations.entries())) {
+        if (inv.email.toLowerCase() === deletedEmail.toLowerCase()) {
+          this.invitations.delete(invId);
+        }
+      }
+
+      this.persistAccounts();
+      this.persistInvitations();
+
+      this.recordAudit({
+        actorId: actorSession.userId,
+        actorName: actorSession.fullName,
+        actorRole: actorSession.role,
+        action: 'DELETED_USER_ACCOUNT',
+        resource: '/api/auth/delete-account',
+        details: `${actorSession.role} (${actorSession.fullName}) permanently deleted ${deletedRole} account ${target.fullName} (${deletedEmail}, UID: ${deletedId}).`,
+        ip: actorSession.ip,
+        status: 'SUCCESS',
+      });
+
+      return {
+        success: true,
+        deletedId,
+        deletedEmail,
+        deletedRole,
+      };
+    }
+
+    if (cleanIdentifier) this.deletedIdentifiers.add(cleanIdentifier.toLowerCase());
+    if (cleanEmail) this.deletedIdentifiers.add(cleanEmail.toLowerCase());
+
+    // Even if not in local memory on a cold-started instance, allow Firestore/Firebase Auth cleanup to proceed
+    return {
+      success: true,
+      deletedId: cleanIdentifier,
+      deletedEmail: cleanEmail || (cleanIdentifier.includes('@') ? cleanIdentifier.toLowerCase() : undefined),
+      deletedRole: 'STAFF',
+    };
+  }
+
+  public updateUserAccount(
+    actorSession: UserSession,
+    targetUserId: string,
+    updates: {
+      fullName?: string;
+      email?: string;
+      phone?: string;
+      role?: 'ADMIN' | 'STAFF' | string;
+      position?: string;
+      duty?: string;
+      roleTitle?: string;
+      dashboardRoute?: string;
+      assignedProgramme?: string;
+      status?: 'active' | 'suspended' | 'inactive';
+      permissions?: Record<string, boolean>;
+      password?: string;
+      accessCode?: string;
+    }
+  ): {
+    success: boolean;
+    error?: string;
+    account?: Omit<AuthAccount, 'passwordHash' | 'passwordSalt' | 'totpSecret' | 'recoveryCodeHashes'>;
+    previousRole?: string;
+  } {
+    if (this.isAuditorSession(actorSession)) {
+      return {
+        success: false,
+        error: 'Read-Only Restriction: Auditors are strictly prohibited from modifying accounts.',
+      };
+    }
+
+    const isSuperAdmin = actorSession.role === 'LIFETIME_SUPER_ADMIN' && actorSession.isLifetimeSuperAdmin;
+    const isAdmin = actorSession.role === 'ADMIN';
+
+    if (!isSuperAdmin && !isAdmin) {
+      return {
+        success: false,
+        error: 'Insufficient administrative privileges to modify accounts.',
+      };
+    }
+
+    const target =
+      this.accounts.get(targetUserId) ||
+      this.findAccountByIdentifier(targetUserId) ||
+      (updates.email ? this.findAccountByIdentifier(updates.email) : null);
+
+    if (!target) {
+      return {
+        success: false,
+        error: 'Target user account not found.',
+      };
+    }
+
+    if (target.isLifetimeSuperAdmin || target.role === 'LIFETIME_SUPER_ADMIN' || this.isVerifiedOwner(target.id, target.email)) {
+      return {
+        success: false,
+        error: 'Security Invariant: The Permanent Lifetime Super Admin root account cannot be modified or demoted.',
+      };
+    }
+
+    if (!isSuperAdmin && target.role === 'ADMIN') {
+      return {
+        success: false,
+        error: 'Privilege Violation: Only the Lifetime Super Admin can modify Administrator accounts.',
+      };
+    }
+
+    const previousRole = target.role;
+    const requestedRoleRaw = String(updates.role || target.role || 'STAFF').trim().toUpperCase();
+    if (requestedRoleRaw === 'LIFETIME_SUPER_ADMIN' || requestedRoleRaw === 'SUPER_ADMIN') {
+      return {
+        success: false,
+        error: 'Security Invariant: Cannot promote any account to Lifetime Super Admin.',
+      };
+    }
+
+    const nextRole: 'ADMIN' | 'STAFF' = requestedRoleRaw === 'ADMIN' ? 'ADMIN' : 'STAFF';
+    if (nextRole === 'ADMIN' && !isSuperAdmin) {
+      return {
+        success: false,
+        error: 'Privilege Violation: Only the Lifetime Super Admin can assign the ADMIN role.',
+      };
+    }
+
+    if (updates.fullName && updates.fullName.trim()) {
+      target.fullName = updates.fullName.trim();
+    }
+
+    if (updates.email && updates.email.trim().includes('@')) {
+      const cleanNewEmail = updates.email.trim().toLowerCase();
+      if (this.isOwnerEmail(cleanNewEmail)) {
+        return {
+          success: false,
+          error: 'Cannot assign the Lifetime Super Admin email address to another account.',
+        };
+      }
+      target.email = cleanNewEmail;
+      target.username = cleanNewEmail.split('@')[0];
+    }
+
+    if (updates.phone && updates.phone.trim()) {
+      target.phone = updates.phone.trim();
+    }
+
+    const rawPos = (
+      updates.position ||
+      updates.duty ||
+      updates.roleTitle ||
+      target.position ||
+      target.duty ||
+      target.roleTitle ||
+      (nextRole === 'ADMIN' ? 'Account Manager' : 'Customer Registration Officer')
+    ).trim();
+    const canonicalPos = normalizeCanonicalPosition(rawPos, nextRole);
+    const effectivePosition = canonicalPos || rawPos;
+
+    target.role = nextRole;
+    target.roleTitle = effectivePosition;
+    target.duty = effectivePosition;
+    target.position = effectivePosition;
+    target.dashboardRoute =
+      updates.dashboardRoute ||
+      getDedicatedRouteForUser({
+        role: nextRole,
+        roleTitle: effectivePosition,
+        duty: effectivePosition,
+        position: effectivePosition,
+        isLifetimeSuperAdmin: false,
+      });
+
+    if (typeof updates.assignedProgramme === 'string' && updates.assignedProgramme.trim()) {
+      target.assignedProgramme = updates.assignedProgramme.trim();
+    }
+
+    if (updates.status === 'active' || updates.status === 'suspended' || updates.status === 'inactive') {
+      target.status = updates.status;
+      target.active = updates.status === 'active';
+      target.is_active = updates.status === 'active';
+      target.isActive = updates.status === 'active';
+      if (updates.status !== 'active') {
+        this.revokeAllUserSessions(target.id);
+      }
+    }
+
+    if (updates.permissions && typeof updates.permissions === 'object') {
+      target.permissions = sanitizePermissionsForPosition(effectivePosition, updates.permissions);
+    } else {
+      target.permissions = sanitizePermissionsForPosition(effectivePosition, target.permissions);
+    }
+
+    const newSecret = (updates.password || updates.accessCode || '').trim();
+    if (newSecret && newSecret.length >= 6) {
+      const passSalt = generateSalt();
+      target.passwordSalt = passSalt;
+      target.passwordHash = hashPassword(newSecret, passSalt);
+
+      const codeSalt = generateSalt();
+      target.accessCodeSalt = codeSalt;
+      target.accessCodeHash = this.hashAccessCode(newSecret, codeSalt);
+      target.accessCodeMasked = `${newSecret.slice(0, 3)}***${newSecret.slice(-2)}`;
+    }
+
+    target.securityVersion = (target.securityVersion || 1) + 1;
+    this.accounts.set(target.id, target);
+    this.persistAccounts();
+
+    this.recordAudit({
+      actorId: actorSession.userId,
+      actorName: actorSession.fullName,
+      actorRole: actorSession.role,
+      action: 'UPDATED_USER_ACCOUNT',
+      resource: '/api/auth/update-account',
+      details: `${actorSession.role} (${actorSession.fullName}) updated account ${target.fullName} (${target.email}) -> Role: ${target.role}, Position: ${target.position}, Route: ${target.dashboardRoute}, Status: ${target.status}.`,
+      ip: actorSession.ip,
+      status: 'SUCCESS',
+    });
+
+    const { passwordHash: _, passwordSalt: __, totpSecret: ___, recoveryCodeHashes: ____, ...safeAccount } = target;
+    return {
+      success: true,
+      account: safeAccount,
+      previousRole,
+    };
+  }
+
 
   // -------------------------------------------------------------------------
   // Financial Authorization: Self-Approval Prevention Invariant
@@ -2997,6 +3568,13 @@ class ServerAuthManager {
       email: string;
       phone: string;
       operationalResponsibility?: string;
+      position?: string;
+      duty?: string;
+      roleTitle?: string;
+      dashboardRoute?: string;
+      assignedProgramme?: string;
+      permissions?: Record<string, boolean>;
+      status?: 'active' | 'suspended' | 'inactive';
       accessCode: string;
       password?: string;
       initialPassword?: string;
@@ -3041,7 +3619,13 @@ class ServerAuthManager {
     const email = data.email?.trim().toLowerCase();
     const phone = data.phone?.trim();
     const accessCode = data.accessCode?.trim();
-    const duty = (data.operationalResponsibility || (data as any).duty || (data as any).roleTitle || '').trim() || 'Admin / General Branch Administrator';
+    const rawPosition = (data.position || data.operationalResponsibility || data.duty || data.roleTitle || '').trim();
+    const canonicalPos = normalizeCanonicalPosition(rawPosition, 'ADMIN');
+    const duty = canonicalPos || rawPosition || 'Account Manager';
+    const assignedProgramme = (data.assignedProgramme || 'All Savings & Loan Programmes').trim();
+    const requestedStatus: 'active' | 'suspended' | 'inactive' =
+      data.status === 'suspended' ? 'suspended' : data.status === 'inactive' ? 'inactive' : 'active';
+    const isActiveStatus = requestedStatus === 'active';
 
     if (!fullName || !email || !phone || !accessCode) {
       const error = 'Full Legal Name, Official Email Address, Phone Number, and Access Code are mandatory.';
@@ -3060,7 +3644,7 @@ class ServerAuthManager {
     }
 
     if (!this.isValidOperationalDuty(duty, 'ADMIN')) {
-      const error = `Invalid operational duty "${duty}". Please select an approved administrative duty from the allowed list.`;
+      const error = `Invalid administrative position "${duty}". Please select Account Manager, Operations Manager, or Auditor.`;
       return {
         success: false,
         statusCode: 400,
@@ -3088,6 +3672,18 @@ class ServerAuthManager {
         error,
       };
     }
+
+    const dashboardRoute =
+      data.dashboardRoute ||
+      getDedicatedRouteForUser({
+        role: 'ADMIN',
+        roleTitle: duty,
+        duty,
+        position: duty,
+        isLifetimeSuperAdmin: false,
+      });
+
+    const sanitizedPermissions = sanitizePermissionsForPosition(duty, data.permissions);
 
     const existingAccount = this.findAccountByIdentifier(email);
     if (
@@ -3132,10 +3728,13 @@ class ServerAuthManager {
       matchedAdminInv.phone = phone;
       matchedAdminInv.accessType = 'Admin';
       matchedAdminInv.duty = duty;
+      matchedAdminInv.position = duty;
+      matchedAdminInv.dashboardRoute = dashboardRoute;
+      matchedAdminInv.assignedProgramme = assignedProgramme;
       matchedAdminInv.used = true;
       matchedAdminInv.revoked = false;
       matchedAdminInv.attempts = 0;
-      matchedAdminInv.assignedPermissions = this.getDefaultPermissionsForDuty(duty);
+      matchedAdminInv.assignedPermissions = sanitizedPermissions;
       invitation = matchedAdminInv;
     } else {
       salt = generateSalt();
@@ -3149,6 +3748,9 @@ class ServerAuthManager {
         email,
         accessType: 'Admin',
         duty,
+        position: duty,
+        dashboardRoute,
+        assignedProgramme,
         codeHash,
         codeSalt: salt,
         codeMasked: masked,
@@ -3162,7 +3764,7 @@ class ServerAuthManager {
         createdByName: actorSession.fullName,
         fullName,
         phone,
-        assignedPermissions: this.getDefaultPermissionsForDuty(duty),
+        assignedPermissions: sanitizedPermissions,
       };
       this.invitations.set(invitationId, invitation);
     }
@@ -3175,6 +3777,8 @@ class ServerAuthManager {
       ? rawPassword
       : `Teamacro@${crypto.randomBytes(3).toString('hex')}!`;
 
+    this.clearDeletedAccountMarker(email);
+    if (data.firebaseUid) this.clearDeletedAccountMarker(data.firebaseUid);
     let account = existingAccount && existingAccount.email.toLowerCase() === email ? existingAccount : null;
     if (account) {
       if (account.isLifetimeSuperAdmin) {
@@ -3189,10 +3793,14 @@ class ServerAuthManager {
       account.role = 'ADMIN';
       account.roleTitle = duty;
       account.duty = duty;
-      account.status = 'active';
-      account.active = true;
-      account.is_active = true;
-      account.isActive = true;
+      account.position = duty;
+      account.dashboardRoute = dashboardRoute;
+      account.assignedProgramme = assignedProgramme;
+      account.permissions = sanitizedPermissions;
+      account.status = requestedStatus;
+      account.active = isActiveStatus;
+      account.is_active = isActiveStatus;
+      account.isActive = isActiveStatus;
       account.verified = true;
       account.isVerified = true;
       account.fullName = fullName;
@@ -3221,11 +3829,14 @@ class ServerAuthManager {
         role: 'ADMIN',
         roleTitle: duty,
         duty,
+        position: duty,
+        dashboardRoute,
+        assignedProgramme,
         isLifetimeSuperAdmin: false,
-        status: 'active',
-        active: true,
-        is_active: true,
-        isActive: true,
+        status: requestedStatus,
+        active: isActiveStatus,
+        is_active: isActiveStatus,
+        isActive: isActiveStatus,
         verified: true,
         isVerified: true,
         staffId: accountId,
@@ -3236,7 +3847,7 @@ class ServerAuthManager {
         accessCodeSalt: salt,
         accessCodeMasked: masked,
         mfaRequired: false,
-        permissions: this.getDefaultPermissionsForDuty(duty),
+        permissions: sanitizedPermissions,
         createdBy: actorSession.userId,
         createdAt: new Date().toISOString(),
         securityVersion: 1,
@@ -3251,7 +3862,7 @@ class ServerAuthManager {
       actorRole: actorSession.role,
       action: 'APPOINTED_ADMINISTRATOR_WITH_CODE',
       resource: '/api/auth/access/appoint-admin',
-      details: `Lifetime Super Admin appointed ${fullName} (${email}) as Administrator with UID ${account.id} and access authorization code.`,
+      details: `Lifetime Super Admin appointed ${fullName} (${email}) as ${duty} (${dashboardRoute}) with UID ${account.id}.`,
       ip: actorSession.ip,
       status: 'SUCCESS',
     });
@@ -3261,6 +3872,9 @@ class ServerAuthManager {
       email: invitation.email,
       accessType: invitation.accessType,
       duty: invitation.duty,
+      position: invitation.position || duty,
+      dashboardRoute: invitation.dashboardRoute || dashboardRoute,
+      assignedProgramme: invitation.assignedProgramme || assignedProgramme,
       codeMasked: invitation.codeMasked,
       expiresAt: invitation.expiresAt,
       status: 'ACTIVE',
@@ -3276,6 +3890,9 @@ class ServerAuthManager {
       role: account.role,
       roleTitle: account.roleTitle,
       duty: account.duty,
+      position: account.position,
+      dashboardRoute: account.dashboardRoute,
+      assignedProgramme: account.assignedProgramme,
       staffId: account.staffId || account.id,
       staffCode: account.staffCode,
       status: account.status,
@@ -3719,6 +4336,9 @@ class ServerAuthManager {
     role?: UserRole;
     roleTitle?: string;
     duty?: string;
+    position?: string;
+    dashboardRoute?: string;
+    assignedProgramme?: string;
     staffCode?: string;
     password?: string;
     accessCode?: string;
@@ -3753,7 +4373,19 @@ class ServerAuthManager {
         : data.role === 'ADMIN'
         ? 'ADMIN'
         : 'STAFF';
-    const duty = data.duty || data.roleTitle || (role === 'ADMIN' ? 'Admin / General Branch Administrator' : 'Operations Staff');
+    const rawPosition = data.position || data.duty || data.roleTitle || (role === 'ADMIN' ? 'Account Manager' : 'Customer Registration Officer');
+    const canonicalPos = normalizeCanonicalPosition(rawPosition, role);
+    const duty = canonicalPos || rawPosition;
+    const dashboardRoute =
+      data.dashboardRoute ||
+      getDedicatedRouteForUser({
+        role,
+        roleTitle: duty,
+        duty,
+        position: duty,
+        isLifetimeSuperAdmin: role === 'LIFETIME_SUPER_ADMIN',
+      });
+    const assignedProgramme = data.assignedProgramme;
     const rawPass = (data.password || data.accessCode || '').trim();
     const rawCode = (data.accessCode || '').trim();
 
@@ -3787,6 +4419,9 @@ class ServerAuthManager {
       existing.role = role;
       existing.roleTitle = duty;
       existing.duty = duty;
+      existing.position = duty;
+      existing.dashboardRoute = dashboardRoute;
+      if (assignedProgramme) existing.assignedProgramme = assignedProgramme;
       if (data.staffCode) existing.staffCode = data.staffCode;
       if (data.status) {
         existing.status = data.status;
@@ -3816,7 +4451,7 @@ class ServerAuthManager {
       if (Array.isArray(data.recoveryCodeHashes)) existing.recoveryCodeHashes = data.recoveryCodeHashes;
       if (Array.isArray(data.consumedTotpSteps)) existing.consumedTotpSteps = data.consumedTotpSteps;
       if (typeof data.securityVersion === 'number') existing.securityVersion = data.securityVersion;
-      if (data.permissions) existing.permissions = data.permissions;
+      if (data.permissions) existing.permissions = sanitizePermissionsForPosition(duty, data.permissions);
       this.persistAccounts();
       if (!data.fromFirestore) {
         this.syncAccountToFirestore(existing);
@@ -3848,6 +4483,9 @@ class ServerAuthManager {
       role,
       roleTitle: duty,
       duty,
+      position: duty,
+      dashboardRoute,
+      assignedProgramme,
       isLifetimeSuperAdmin: role === 'LIFETIME_SUPER_ADMIN',
       status: data.status || 'active',
       active: (data.status || 'active') === 'active',
@@ -3866,7 +4504,7 @@ class ServerAuthManager {
       totpSecret: data.totpSecret,
       recoveryCodeHashes: data.recoveryCodeHashes,
       consumedTotpSteps: data.consumedTotpSteps,
-      permissions: data.permissions || this.getDefaultPermissionsForDuty(duty),
+      permissions: sanitizePermissionsForPosition(duty, data.permissions),
       createdBy: data.createdBy || this.getOwnerUserId(),
       createdAt: data.createdAt || new Date().toISOString(),
       securityVersion: data.securityVersion || 1,
@@ -3886,117 +4524,14 @@ class ServerAuthManager {
     if (d.includes('payment collection') || d.includes('field collector')) return 'field_collector';
     if (d.includes('loan officer')) return 'loan_officer';
     if (d.includes('accounts officer') || d.includes('accountant')) return 'accountant';
+    if (d.includes('account manager')) return 'ACCOUNT_MANAGER';
     if (d.includes('operations manager')) return 'operations_manager';
     if (d.includes('auditor')) return 'auditor';
     return 'operations_manager';
   }
 
   public getDefaultPermissionsForDuty(duty: string): Record<string, boolean> {
-    const d = duty.toLowerCase();
-    if (d.includes('customer registration')) {
-      return {
-        canViewCustomers: true,
-        canRegisterCustomers: true,
-        canRecordCollections: false,
-        canReviewLoans: false,
-        canUpdateLoanStages: false,
-        canViewFinancialRecords: false,
-        canPrepareReconciliations: false,
-        canApproveTransactions: false,
-        canViewAuditLogs: false,
-        canManageStaff: false,
-        canExportReports: false,
-      };
-    }
-    if (d.includes('payment collection')) {
-      return {
-        canViewCustomers: true,
-        canRegisterCustomers: false,
-        canRecordCollections: true,
-        canReviewLoans: false,
-        canUpdateLoanStages: false,
-        canViewFinancialRecords: true,
-        canPrepareReconciliations: false,
-        canApproveTransactions: false,
-        canViewAuditLogs: false,
-        canManageStaff: false,
-        canExportReports: false,
-      };
-    }
-    if (d.includes('loan officer')) {
-      return {
-        canViewCustomers: true,
-        canRegisterCustomers: false,
-        canRecordCollections: false,
-        canReviewLoans: true,
-        canUpdateLoanStages: true,
-        canViewFinancialRecords: false,
-        canPrepareReconciliations: false,
-        canApproveTransactions: false,
-        canViewAuditLogs: false,
-        canManageStaff: false,
-        canExportReports: false,
-      };
-    }
-    if (d.includes('accounts officer')) {
-      return {
-        canViewCustomers: true,
-        canRegisterCustomers: false,
-        canRecordCollections: false,
-        canReviewLoans: false,
-        canUpdateLoanStages: false,
-        canViewFinancialRecords: true,
-        canPrepareReconciliations: true,
-        canApproveTransactions: false,
-        canViewAuditLogs: true,
-        canManageStaff: false,
-        canExportReports: true,
-      };
-    }
-    if (d.includes('operations manager')) {
-      return {
-        canViewCustomers: true,
-        canRegisterCustomers: true,
-        canRecordCollections: true,
-        canReviewLoans: true,
-        canUpdateLoanStages: true,
-        canViewFinancialRecords: true,
-        canPrepareReconciliations: true,
-        canApproveTransactions: true,
-        canViewAuditLogs: true,
-        canManageStaff: true,
-        canExportReports: true,
-      };
-    }
-    if (d.includes('auditor')) {
-      return {
-        canViewCustomers: true,
-        canRegisterCustomers: false,
-        canRecordCollections: false,
-        canReviewLoans: true,
-        canUpdateLoanStages: false,
-        canViewFinancialRecords: true,
-        canPrepareReconciliations: false,
-        canApproveTransactions: false,
-        canViewAuditLogs: true,
-        canManageStaff: false,
-        canExportReports: true,
-      };
-    }
-    // Admin default
-    return {
-      canViewCustomers: true,
-      canRegisterCustomers: true,
-      canRecordCollections: true,
-      canReviewLoans: true,
-      canUpdateLoanStages: true,
-      canViewFinancialRecords: true,
-      canPrepareReconciliations: true,
-      canApproveTransactions: true,
-      canViewAuditLogs: true,
-      canManageStaff: true,
-      canExportReports: true,
-    };
+    return getDefaultPositionPermissions(duty);
   }
 
   public getAccessInvitations(actorSession?: UserSession): any[] {
@@ -4033,6 +4568,9 @@ class ServerAuthManager {
       phone: inv.phone,
       accessType: inv.accessType,
       duty: inv.duty,
+      position: inv.position || inv.duty,
+      dashboardRoute: inv.dashboardRoute,
+      assignedProgramme: inv.assignedProgramme,
       codeMasked: inv.codeMasked || '******',
       expiresAt: inv.expiresAt,
       used: inv.used,
@@ -4058,8 +4596,12 @@ class ServerAuthManager {
     if (!target) {
       return { success: false, error: 'User account not found.' };
     }
-    target.permissions = permissions;
+    target.permissions = sanitizePermissionsForPosition(
+      target.position || target.duty || target.roleTitle || '',
+      permissions
+    );
     this.persistAccounts();
+    this.syncAccountToFirestore(target);
     return { success: true };
   }
 
@@ -4070,9 +4612,525 @@ class ServerAuthManager {
     const list: Array<Omit<AuthAccount, 'passwordHash' | 'passwordSalt' | 'totpSecret' | 'recoveryCodeHashes'>> = [];
     for (const acc of this.accounts.values()) {
       const { passwordHash: _, passwordSalt: __, totpSecret: ___, recoveryCodeHashes: ____, ...safe } = acc;
-      list.push(safe);
+      const canonicalPos = normalizeCanonicalPosition(safe.position || safe.duty || safe.roleTitle, safe.role);
+      const position = canonicalPos || safe.position || safe.duty || safe.roleTitle;
+      const dashboardRoute = safe.dashboardRoute || getDedicatedRouteForUser(safe);
+      list.push({
+        ...safe,
+        position,
+        dashboardRoute,
+      });
     }
     return list;
+  }
+
+  // -------------------------------------------------------------------------
+  // Operational Ledger Records: Collections, Loans, Reconciliations & Reversals
+  // -------------------------------------------------------------------------
+  private operationalCollections: Map<string, any> = new Map();
+  private operationalLoans: Map<string, any> = new Map();
+  private operationalReconciliations: Map<string, any> = new Map();
+
+  private seedDefaultOperationalRecordsIfNeeded(): void {
+    if (this.operationalCollections.size === 0) {
+      const today = new Date().toISOString().split('T')[0];
+      const seedCollections = [
+        {
+          id: 'COL_2026_001',
+          reference: 'TMC-COL-882401',
+          customerId: 'cust_001',
+          customerName: 'Chief Adebayo Ogunlesi',
+          accountNumber: '2038194820',
+          programme: 'Daily Contribution (Ajo)',
+          collectionType: 'SAVINGS_CONTRIBUTION',
+          amount: 150000,
+          paymentMethod: 'Bank Transfer',
+          paymentDate: today,
+          recordedById: 'STAFF_COLLECTION',
+          recordedByName: 'Payment Collection Desk',
+          status: 'CONFIRMED',
+          reconciled: true,
+          createdAt: new Date(Date.now() - 3600000 * 6).toISOString(),
+        },
+        {
+          id: 'COL_2026_002',
+          reference: 'TMC-COL-882402',
+          customerId: 'cust_002',
+          customerName: 'Hajia Zainab Abubakar',
+          accountNumber: '2038491025',
+          programme: 'Thrift & Cooperative Savings',
+          collectionType: 'SAVINGS_CONTRIBUTION',
+          amount: 85000,
+          paymentMethod: 'POS Terminal',
+          paymentDate: today,
+          recordedById: 'STAFF_COLLECTION',
+          recordedByName: 'Payment Collection Desk',
+          status: 'CONFIRMED',
+          reconciled: true,
+          createdAt: new Date(Date.now() - 3600000 * 4).toISOString(),
+        },
+        {
+          id: 'COL_2026_003',
+          reference: 'TMC-COL-882403',
+          customerId: 'cust_003',
+          customerName: 'Ngozi Okafor Enterprises',
+          accountNumber: '2038773219',
+          programme: 'SME Working Capital Loans',
+          collectionType: 'LOAN_REPAYMENT',
+          amount: 210000,
+          paymentMethod: 'Bank Transfer',
+          paymentDate: today,
+          recordedById: 'STAFF_COLLECTION',
+          recordedByName: 'Payment Collection Desk',
+          status: 'PENDING_RECONCILIATION',
+          reconciled: false,
+          createdAt: new Date(Date.now() - 3600000 * 2).toISOString(),
+        },
+      ];
+      for (const c of seedCollections) this.operationalCollections.set(c.id, c);
+    }
+
+    if (this.operationalLoans.size === 0) {
+      const today = new Date().toISOString().split('T')[0];
+      const seedLoans = [
+        {
+          id: 'LN_2026_101',
+          loanCode: 'TMC-LN-9041',
+          customerId: 'cust_003',
+          customerName: 'Ngozi Okafor Enterprises',
+          accountNumber: '2038773219',
+          programme: 'SME Working Capital Loans',
+          principalAmount: 1500000,
+          interestRate: 12,
+          totalRepayable: 1680000,
+          amountRepaid: 840000,
+          outstandingBalance: 840000,
+          durationMonths: 6,
+          purpose: 'Inventory restocking for wholesale distribution',
+          guarantorName: 'Chukwuma Okafor',
+          guarantorPhone: '+234 803 555 0192',
+          stage: 'ACTIVE_DISBURSED',
+          repaymentStatus: 'ON_SCHEDULE',
+          nextDueDate: today,
+          createdByStaffId: 'STAFF_LOAN',
+          createdByStaffName: 'Loan Operations Desk',
+          createdAt: new Date(Date.now() - 86400000 * 25).toISOString(),
+        },
+        {
+          id: 'LN_2026_102',
+          loanCode: 'TMC-LN-9042',
+          customerId: 'cust_004',
+          customerName: 'Ibrahim Musa Logistics',
+          accountNumber: '2038991823',
+          programme: 'SME Working Capital Loans',
+          principalAmount: 750000,
+          interestRate: 10,
+          totalRepayable: 825000,
+          amountRepaid: 0,
+          outstandingBalance: 825000,
+          durationMonths: 4,
+          purpose: 'Delivery motorcycle fleet maintenance',
+          guarantorName: 'Sani Abdullahi',
+          guarantorPhone: '+234 802 444 9811',
+          stage: 'PENDING_FINAL_APPROVAL',
+          repaymentStatus: 'AWAITING_DISBURSEMENT',
+          nextDueDate: today,
+          createdByStaffId: 'STAFF_LOAN',
+          createdByStaffName: 'Loan Operations Desk',
+          createdAt: new Date(Date.now() - 86400000 * 2).toISOString(),
+        },
+      ];
+      for (const l of seedLoans) this.operationalLoans.set(l.id, l);
+    }
+
+    if (this.operationalReconciliations.size === 0) {
+      const today = new Date().toISOString().split('T')[0];
+      const seedReconciliations = [
+        {
+          id: 'REC_2026_001',
+          reconciliationCode: 'TMC-REC-501',
+          periodDate: today,
+          programme: 'Daily Contribution (Ajo)',
+          recordedCollectionsTotal: 445000,
+          verifiedBankLedgerTotal: 445000,
+          discrepancyAmount: 0,
+          status: 'BALANCED',
+          notes: 'All daily field POS and bank transfer receipts matched against settlement statement.',
+          preparedById: 'STAFF_ACCOUNTS',
+          preparedByName: 'Accounts Review Desk',
+          createdAt: new Date(Date.now() - 3600000 * 3).toISOString(),
+        },
+      ];
+      for (const r of seedReconciliations) this.operationalReconciliations.set(r.id, r);
+    }
+  }
+
+  public getCollectionsList(): any[] {
+    this.seedDefaultOperationalRecordsIfNeeded();
+    return Array.from(this.operationalCollections.values()).sort(
+      (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+    );
+  }
+
+  public recordCollectionTransaction(
+    actorSession: UserSession,
+    payload: {
+      customerId?: string;
+      customerName: string;
+      accountNumber?: string;
+      programme: string;
+      collectionType?: 'SAVINGS_CONTRIBUTION' | 'LOAN_REPAYMENT';
+      amount: number;
+      paymentMethod?: string;
+      paymentDate?: string;
+      reference: string;
+      notes?: string;
+    }
+  ): { success: boolean; statusCode?: number; error?: string; record?: any } {
+    this.seedDefaultOperationalRecordsIfNeeded();
+    if (this.isAuditorSession(actorSession)) {
+      return {
+        success: false,
+        statusCode: 403,
+        error: 'Read-Only Restriction: Auditors are strictly prohibited from recording or modifying collection transactions.',
+      };
+    }
+
+    const pos = normalizeCanonicalPosition(actorSession.position || actorSession.roleTitle, actorSession.role);
+    const allowedPositions = new Set([
+      'Payment Collection Officer',
+      'Account Manager',
+      'Operations Manager',
+    ]);
+    const hasPermission =
+      actorSession.isLifetimeSuperAdmin ||
+      actorSession.role === 'LIFETIME_SUPER_ADMIN' ||
+      (pos && allowedPositions.has(pos)) ||
+      actorSession.permissions?.canRecordCollections === true;
+
+    if (!hasPermission) {
+      return {
+        success: false,
+        statusCode: 403,
+        error: `Access Denied: Your position (${pos || actorSession.roleTitle}) is not authorized to post collection transactions.`,
+      };
+    }
+
+    const customerName = String(payload.customerName || '').trim();
+    const reference = String(payload.reference || '').trim().toUpperCase();
+    const amount = Number(payload.amount || 0);
+    if (!customerName || !reference || !Number.isFinite(amount) || amount <= 0) {
+      return {
+        success: false,
+        statusCode: 400,
+        error: 'Customer name, valid positive amount, and payment reference are mandatory.',
+      };
+    }
+
+    // Duplicate transaction submission prevention
+    for (const existing of this.operationalCollections.values()) {
+      if (String(existing.reference || '').toUpperCase() === reference) {
+        return {
+          success: false,
+          statusCode: 409,
+          error: `Duplicate Transaction Blocked: Payment reference "${reference}" has already been recorded.`,
+        };
+      }
+      const timeDiff = Date.now() - new Date(existing.createdAt || 0).getTime();
+      if (
+        timeDiff < 60000 &&
+        existing.customerName.toLowerCase() === customerName.toLowerCase() &&
+        Number(existing.amount) === amount &&
+        existing.collectionType === (payload.collectionType || 'SAVINGS_CONTRIBUTION')
+      ) {
+        return {
+          success: false,
+          statusCode: 409,
+          error: 'Duplicate Submission Blocked: An identical collection for this customer and amount was recorded less than 60 seconds ago.',
+        };
+      }
+    }
+
+    const id = `COL_${Date.now()}_${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+    const record = {
+      id,
+      reference,
+      customerId: payload.customerId || `cust_${Date.now().toString(36)}`,
+      customerName,
+      accountNumber: payload.accountNumber || '2038001928',
+      programme: payload.programme || 'Daily Contribution (Ajo)',
+      collectionType: payload.collectionType || 'SAVINGS_CONTRIBUTION',
+      amount,
+      paymentMethod: payload.paymentMethod || 'Bank Transfer',
+      paymentDate: payload.paymentDate || new Date().toISOString().split('T')[0],
+      notes: payload.notes || '',
+      recordedById: actorSession.userId,
+      recordedByName: actorSession.fullName,
+      recordedByPosition: pos || actorSession.roleTitle,
+      status: 'CONFIRMED',
+      reconciled: false,
+      createdAt: new Date().toISOString(),
+    };
+
+    this.operationalCollections.set(id, record);
+    this.recordAudit({
+      actorId: actorSession.userId,
+      actorName: actorSession.fullName,
+      actorRole: actorSession.role,
+      action: 'RECORDED_COLLECTION_TRANSACTION',
+      resource: '/api/operations/collections',
+      details: `Recorded ${record.collectionType} of ₦${amount.toLocaleString()} for ${customerName} (Ref: ${reference}).`,
+      ip: actorSession.ip,
+      status: 'SUCCESS',
+    });
+
+    return { success: true, statusCode: 201, record };
+  }
+
+  public getLoanApplicationsList(): any[] {
+    this.seedDefaultOperationalRecordsIfNeeded();
+    return Array.from(this.operationalLoans.values()).sort(
+      (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+    );
+  }
+
+  public createLoanApplicationRecord(
+    actorSession: UserSession,
+    payload: {
+      id?: string;
+      customerId?: string;
+      customerName: string;
+      accountNumber?: string;
+      programme?: string;
+      principalAmount: number;
+      interestRate?: number;
+      durationMonths?: number;
+      purpose: string;
+      guarantorName: string;
+      guarantorPhone: string;
+      stage?: string;
+    }
+  ): { success: boolean; statusCode?: number; error?: string; record?: any } {
+    this.seedDefaultOperationalRecordsIfNeeded();
+    if (this.isAuditorSession(actorSession)) {
+      return {
+        success: false,
+        statusCode: 403,
+        error: 'Read-Only Restriction: Auditors cannot create or modify loan applications.',
+      };
+    }
+
+    const pos = normalizeCanonicalPosition(actorSession.position || actorSession.roleTitle, actorSession.role);
+    const allowedPositions = new Set(['Loan Officer', 'Operations Manager', 'Account Manager']);
+    const hasPermission =
+      actorSession.isLifetimeSuperAdmin ||
+      actorSession.role === 'LIFETIME_SUPER_ADMIN' ||
+      (pos && allowedPositions.has(pos)) ||
+      actorSession.permissions?.canReviewLoans === true ||
+      actorSession.permissions?.canUpdateLoanStages === true;
+
+    if (!hasPermission) {
+      return {
+        success: false,
+        statusCode: 403,
+        error: `Access Denied: Your position (${pos || actorSession.roleTitle}) is not authorized to create or update loan applications.`,
+      };
+    }
+
+    // Loan Officers cannot directly mark a loan as ACTIVE_DISBURSED (requires Admin / Super Admin approval workflow)
+    let requestedStage = payload.stage || 'UNDER_CREDIT_REVIEW';
+    if (
+      requestedStage === 'ACTIVE_DISBURSED' &&
+      !actorSession.isLifetimeSuperAdmin &&
+      actorSession.role !== 'LIFETIME_SUPER_ADMIN' &&
+      actorSession.role !== 'ADMIN'
+    ) {
+      requestedStage = 'PENDING_FINAL_APPROVAL';
+    }
+
+    const principal = Number(payload.principalAmount || 0);
+    const rate = Number(payload.interestRate ?? 10);
+    const duration = Number(payload.durationMonths ?? 6);
+    if (!payload.customerName?.trim() || principal <= 0) {
+      return {
+        success: false,
+        statusCode: 400,
+        error: 'Borrower full name and a valid principal loan amount are mandatory.',
+      };
+    }
+
+    const totalRepayable = Math.round(principal * (1 + rate / 100));
+    const id = payload.id && this.operationalLoans.has(payload.id) ? payload.id : `LN_${Date.now()}`;
+    const existing = this.operationalLoans.get(id);
+
+    const record = {
+      ...(existing || {}),
+      id,
+      loanCode: existing?.loanCode || `TMC-LN-${Math.floor(1000 + Math.random() * 9000)}`,
+      customerId: payload.customerId || existing?.customerId || `cust_${Date.now().toString(36)}`,
+      customerName: payload.customerName.trim(),
+      accountNumber: payload.accountNumber || existing?.accountNumber || '2038551920',
+      programme: payload.programme || existing?.programme || 'SME Working Capital Loans',
+      principalAmount: principal,
+      interestRate: rate,
+      totalRepayable,
+      amountRepaid: existing?.amountRepaid || 0,
+      outstandingBalance: totalRepayable - (existing?.amountRepaid || 0),
+      durationMonths: duration,
+      purpose: payload.purpose?.trim() || existing?.purpose || 'Working Capital Financing',
+      guarantorName: payload.guarantorName?.trim() || existing?.guarantorName || 'Verified Guarantor',
+      guarantorPhone: payload.guarantorPhone?.trim() || existing?.guarantorPhone || '+234 800 000 0000',
+      stage: requestedStage,
+      repaymentStatus: requestedStage === 'ACTIVE_DISBURSED' ? 'ON_SCHEDULE' : 'AWAITING_DISBURSEMENT',
+      nextDueDate: new Date(Date.now() + 30 * 86400000).toISOString().split('T')[0],
+      createdByStaffId: existing?.createdByStaffId || actorSession.userId,
+      createdByStaffName: existing?.createdByStaffName || actorSession.fullName,
+      updatedByStaffName: actorSession.fullName,
+      createdAt: existing?.createdAt || new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    this.operationalLoans.set(id, record);
+    this.recordAudit({
+      actorId: actorSession.userId,
+      actorName: actorSession.fullName,
+      actorRole: actorSession.role,
+      action: existing ? 'UPDATED_LOAN_APPLICATION' : 'CREATED_LOAN_APPLICATION',
+      resource: '/api/operations/loans',
+      details: `${existing ? 'Updated' : 'Created'} loan application ${record.loanCode} for ${record.customerName} (₦${principal.toLocaleString()}, stage: ${requestedStage}).`,
+      ip: actorSession.ip,
+      status: 'SUCCESS',
+    });
+
+    return { success: true, statusCode: existing ? 200 : 201, record };
+  }
+
+  public getReconciliationsList(): any[] {
+    this.seedDefaultOperationalRecordsIfNeeded();
+    return Array.from(this.operationalReconciliations.values()).sort(
+      (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+    );
+  }
+
+  public submitReconciliationRecord(
+    actorSession: UserSession,
+    payload: {
+      periodDate?: string;
+      programme: string;
+      recordedCollectionsTotal: number;
+      verifiedBankLedgerTotal: number;
+      notes?: string;
+    }
+  ): { success: boolean; statusCode?: number; error?: string; record?: any } {
+    this.seedDefaultOperationalRecordsIfNeeded();
+    if (this.isAuditorSession(actorSession)) {
+      return {
+        success: false,
+        statusCode: 403,
+        error: 'Read-Only Restriction: Auditors cannot create or modify financial reconciliation records.',
+      };
+    }
+
+    const pos = normalizeCanonicalPosition(actorSession.position || actorSession.roleTitle, actorSession.role);
+    const allowedPositions = new Set(['Accounts Officer', 'Account Manager', 'Operations Manager']);
+    const hasPermission =
+      actorSession.isLifetimeSuperAdmin ||
+      actorSession.role === 'LIFETIME_SUPER_ADMIN' ||
+      (pos && allowedPositions.has(pos)) ||
+      actorSession.permissions?.canPrepareReconciliations === true;
+
+    if (!hasPermission) {
+      return {
+        success: false,
+        statusCode: 403,
+        error: `Access Denied: Your position (${pos || actorSession.roleTitle}) is not authorized to submit reconciliation reports.`,
+      };
+    }
+
+    const recorded = Number(payload.recordedCollectionsTotal || 0);
+    const verified = Number(payload.verifiedBankLedgerTotal || 0);
+    const discrepancy = verified - recorded;
+    const status = discrepancy === 0 ? 'BALANCED' : 'DISCREPANCY_FLAGGED';
+
+    const id = `REC_${Date.now()}`;
+    const record = {
+      id,
+      reconciliationCode: `TMC-REC-${Math.floor(100 + Math.random() * 900)}`,
+      periodDate: payload.periodDate || new Date().toISOString().split('T')[0],
+      programme: payload.programme || 'All Programmes',
+      recordedCollectionsTotal: recorded,
+      verifiedBankLedgerTotal: verified,
+      discrepancyAmount: discrepancy,
+      status,
+      notes: payload.notes?.trim() || (discrepancy === 0 ? 'Collections reconciled with zero variance.' : 'Variance flagged for Account Manager & Auditor review.'),
+      preparedById: actorSession.userId,
+      preparedByName: actorSession.fullName,
+      preparedByPosition: pos || actorSession.roleTitle,
+      createdAt: new Date().toISOString(),
+    };
+
+    this.operationalReconciliations.set(id, record);
+    this.recordAudit({
+      actorId: actorSession.userId,
+      actorName: actorSession.fullName,
+      actorRole: actorSession.role,
+      action: 'SUBMITTED_RECONCILIATION_REPORT',
+      resource: '/api/operations/reconciliations',
+      details: `Submitted reconciliation ${record.reconciliationCode} for ${record.programme} (Status: ${status}, Discrepancy: ₦${discrepancy.toLocaleString()}).`,
+      ip: actorSession.ip,
+      status: 'SUCCESS',
+    });
+
+    return { success: true, statusCode: 201, record };
+  }
+
+  public reverseFinancialTransaction(
+    actorSession: UserSession,
+    transactionId: string,
+    reason: string
+  ): { success: boolean; statusCode?: number; error?: string; record?: any } {
+    if (actorSession.role !== 'LIFETIME_SUPER_ADMIN' || !actorSession.isLifetimeSuperAdmin) {
+      this.recordAudit({
+        actorId: actorSession.userId,
+        actorName: actorSession.fullName,
+        actorRole: actorSession.role,
+        action: 'UNAUTHORIZED_TRANSACTION_REVERSAL_ATTEMPT',
+        resource: `/api/financial/reverse/${transactionId}`,
+        details: `Non-Super-Admin (${actorSession.role} / ${actorSession.position || actorSession.roleTitle}) attempted to reverse confirmed transaction ${transactionId}.`,
+        ip: actorSession.ip,
+        status: 'DENIED',
+      });
+      return {
+        success: false,
+        statusCode: 403,
+        error: 'Security Invariant: Only the Lifetime Super Admin can reverse confirmed financial transactions.',
+      };
+    }
+
+    this.seedDefaultOperationalRecordsIfNeeded();
+    const target = this.operationalCollections.get(transactionId);
+    if (!target) {
+      return { success: false, statusCode: 404, error: 'Transaction record not found.' };
+    }
+
+    target.status = 'REVERSED';
+    target.reversedAt = new Date().toISOString();
+    target.reversedBy = actorSession.fullName;
+    target.reversalReason = reason || 'Executive reversal by Lifetime Super Admin';
+    this.operationalCollections.set(transactionId, target);
+
+    this.recordAudit({
+      actorId: actorSession.userId,
+      actorName: actorSession.fullName,
+      actorRole: actorSession.role,
+      action: 'REVERSED_FINANCIAL_TRANSACTION',
+      resource: `/api/financial/reverse/${transactionId}`,
+      details: `Lifetime Super Admin reversed transaction ${target.reference} (${transactionId}): ${target.reversalReason}`,
+      ip: actorSession.ip,
+      status: 'SUCCESS',
+    });
+
+    return { success: true, statusCode: 200, record: target };
   }
 
   public saveCustomerRecord(customerData: any): any {

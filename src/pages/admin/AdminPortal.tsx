@@ -24,6 +24,8 @@ import {
   UserPlus,
   Briefcase,
   ExternalLink,
+  Edit3,
+  Trash2,
 } from 'lucide-react';
 import {
   BankConfig,
@@ -40,6 +42,14 @@ import { authService } from '../../services/authService';
 import { formatNaira, formatLagosDate } from '../../utils/formatters';
 import { BrandLogo } from '../../components/common/BrandLogo';
 import { ThemeSelector } from '../../components/common/ThemeSelector';
+import {
+  ADMIN_POSITIONS,
+  STAFF_POSITIONS,
+  ASSIGNABLE_PROGRAMMES,
+  POSITION_METADATA,
+  getDefaultPositionPermissions,
+  getDedicatedRouteForUser,
+} from '../../utils/roleRouting';
 
 interface AdminPortalProps {
   config: BankConfig;
@@ -85,11 +95,43 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [newStaffName, setNewStaffName] = useState('');
   const [newStaffEmail, setNewStaffEmail] = useState('');
   const [newStaffPhone, setNewStaffPhone] = useState('');
-  const [newStaffRole, setNewStaffRole] = useState<'operations_manager' | 'loan_officer' | 'field_collector' | 'customer_service' | 'accountant' | 'auditor'>('loan_officer');
+  const [newStaffPosition, setNewStaffPosition] = useState<string>('Customer Registration Officer');
+  const [newStaffProgramme, setNewStaffProgramme] = useState<string>(ASSIGNABLE_PROGRAMMES[0]);
+  const [newStaffStatus, setNewStaffStatus] = useState<'active' | 'suspended'>('active');
+  const [newStaffPermissions, setNewStaffPermissions] = useState<Record<string, boolean>>(
+    getDefaultPositionPermissions('Customer Registration Officer')
+  );
   const [newStaffResponsibility, setNewStaffResponsibility] = useState('');
   const [newStaffAccessCode, setNewStaffAccessCode] = useState('');
   const [newStaffPassword, setNewStaffPassword] = useState('');
   const [isCreatingStaff, setIsCreatingStaff] = useState(false);
+
+  // Edit & Delete Staff/Admin Modals
+  const [editingStaffTarget, setEditingStaffTarget] = useState<StaffUser | null>(null);
+  const [editStaffForm, setEditStaffForm] = useState<{
+    fullName: string;
+    email: string;
+    phone: string;
+    role: 'ADMIN' | 'STAFF';
+    position: string;
+    assignedProgramme: string;
+    status: 'active' | 'suspended';
+    password: string;
+    accessCode: string;
+  }>({
+    fullName: '',
+    email: '',
+    phone: '',
+    role: 'STAFF',
+    position: 'Customer Registration Officer',
+    assignedProgramme: ASSIGNABLE_PROGRAMMES[0],
+    status: 'active',
+    password: '',
+    accessCode: '',
+  });
+  const [isSavingStaffEdit, setIsSavingStaffEdit] = useState(false);
+  const [deletingStaffTarget, setDeletingStaffTarget] = useState<StaffUser | null>(null);
+  const [isDeletingStaff, setIsDeletingStaff] = useState(false);
 
   // Add Customer Modal
   const [showAddCustomerModal, setShowAddCustomerModal] = useState(false);
@@ -120,13 +162,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         if (Array.isArray(accs) && accs.length > 0) {
           setStaffList((prev) => {
             const byEmail = new Map<string, StaffUser>();
-            for (const s of prev) {
-              if (s.email) byEmail.set(s.email.toLowerCase(), s);
-            }
             for (const acc of accs) {
               if (acc.email && acc.role !== 'CUSTOMER') {
                 const emailKey = acc.email.toLowerCase();
-                const existing = byEmail.get(emailKey);
+                const existing = prev.find((p) => p.email?.toLowerCase() === emailKey);
                 byEmail.set(emailKey, {
                   ...(existing || {}),
                   id: acc.id || existing?.id || `STAFF_${Date.now()}`,
@@ -137,10 +176,10 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   fullName: acc.fullName || existing?.fullName || emailKey,
                   email: acc.email,
                   phone: acc.phone || existing?.phone || '',
-                  role: (existing?.role || acc.role || 'STAFF') as any,
-                  roleTitle: acc.roleTitle || acc.duty || existing?.roleTitle || 'Operational Staff',
+                  role: (acc.isLifetimeSuperAdmin ? 'LIFETIME_SUPER_ADMIN' : acc.role || existing?.role || 'STAFF') as any,
+                  roleTitle: acc.position || acc.roleTitle || acc.duty || existing?.roleTitle || 'Operational Staff',
                   operationalResponsibility:
-                    acc.duty || acc.roleTitle || existing?.operationalResponsibility || 'Field operations & customer servicing',
+                    acc.position || acc.duty || acc.roleTitle || existing?.operationalResponsibility || 'Field operations & customer servicing',
                   permissions: (acc.permissions || existing?.permissions || {}) as any,
                   status: acc.status || existing?.status || 'active',
                   lastLogin: acc.lastLogin || existing?.lastLogin || new Date().toISOString(),
@@ -298,7 +337,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     const fullName = newStaffName.trim();
     const email = newStaffEmail.trim().toLowerCase();
     const phone = newStaffPhone.trim() || '+234 800 000 0000';
-    const duty = newStaffResponsibility.trim() || 'Field operations & customer servicing';
+    const duty = newStaffPosition || 'Customer Registration Officer';
     const accessCode = newStaffAccessCode.trim() || `TM-STF-${Math.random().toString(36).substring(2, 8).toUpperCase()}`;
     const password = newStaffPassword.trim() || accessCode;
 
@@ -314,8 +353,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         fullName,
         email,
         phone,
+        position: duty,
         roleTitle: duty,
-        operationalResponsibility: duty,
+        operationalResponsibility: newStaffResponsibility.trim() || duty,
+        assignedProgramme: newStaffProgramme,
+        status: newStaffStatus,
+        permissions: newStaffPermissions,
         accessCode,
         password,
       });
@@ -333,8 +376,9 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
             fullName,
             email,
             phone,
-            role: newStaffRole,
-            operationalResponsibility: duty,
+            role: 'STAFF',
+            roleTitle: duty,
+            operationalResponsibility: newStaffResponsibility.trim() || duty,
           },
           currentUser
         );
@@ -342,11 +386,19 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         // Ignored if already recorded
       }
 
-      setActionSuccess(`Operational staff member "${fullName}" successfully created and activated.`);
+      const routeAssigned =
+        POSITION_METADATA[duty as keyof typeof POSITION_METADATA]?.route || '/staff/customer-registration';
+      setActionSuccess(
+        `Operational staff member "${fullName}" (${duty}) created and bound to ${routeAssigned}.`
+      );
       setShowAddStaffModal(false);
       setNewStaffName('');
       setNewStaffEmail('');
       setNewStaffPhone('');
+      setNewStaffPosition('Customer Registration Officer');
+      setNewStaffProgramme(ASSIGNABLE_PROGRAMMES[0]);
+      setNewStaffStatus('active');
+      setNewStaffPermissions(getDefaultPositionPermissions('Customer Registration Officer'));
       setNewStaffResponsibility('');
       setNewStaffAccessCode('');
       setNewStaffPassword('');
@@ -358,20 +410,138 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     }
   };
 
-  // Toggle staff status
-  const handleToggleStaffStatus = (staff: StaffUser) => {
+  // Toggle staff/admin status
+  const handleToggleStaffStatus = async (staff: StaffUser) => {
     if (!currentUser) return;
     if (staff.isLifetimeSuperAdmin || staff.role === 'LIFETIME_SUPER_ADMIN') {
-      alert('The Permanent Lifetime Super Admin account cannot be modified or suspended.');
+      setActionError('The Permanent Lifetime Super Admin account cannot be modified or suspended.');
       return;
     }
     const newStatus = staff.status === 'active' ? 'suspended' : 'active';
     try {
-      ledgerEngine.updateStaffUser(staff.id, { status: newStatus }, currentUser);
-      setActionSuccess(`Staff member ${staff.fullName} marked as ${newStatus}.`);
+      await authService.updateAccount(staff.id, { status: newStatus });
+      try {
+        ledgerEngine.updateStaffUser(staff.id, { status: newStatus }, currentUser);
+      } catch {
+        // Ignore if only in server store
+      }
+      setStaffList((prev) =>
+        prev.map((s) => (s.id === staff.id || s.email === staff.email ? { ...s, status: newStatus } : s))
+      );
+      setActionSuccess(`Account ${staff.fullName} marked as ${newStatus}.`);
       loadData();
     } catch (err: any) {
-      setActionError(err.message || 'Failed to update staff status.');
+      setActionError(err.message || 'Failed to update account status.');
+    }
+  };
+
+  // Open Edit Staff/Admin Modal
+  const handleOpenEditStaff = (staff: StaffUser) => {
+    if (staff.isLifetimeSuperAdmin || staff.role === 'LIFETIME_SUPER_ADMIN') {
+      setActionError('The Permanent Lifetime Super Admin account is protected.');
+      return;
+    }
+    const roleTier: 'ADMIN' | 'STAFF' = staff.role === 'ADMIN' ? 'ADMIN' : 'STAFF';
+    const currentPos =
+      staff.roleTitle ||
+      staff.operationalResponsibility ||
+      (roleTier === 'ADMIN' ? 'Operations Manager' : 'Customer Registration Officer');
+    setEditingStaffTarget(staff);
+    setEditStaffForm({
+      fullName: staff.fullName || '',
+      email: staff.email || '',
+      phone: staff.phone || '',
+      role: roleTier,
+      position: currentPos,
+      assignedProgramme: ASSIGNABLE_PROGRAMMES[0],
+      status: staff.status === 'suspended' ? 'suspended' : 'active',
+      password: '',
+      accessCode: '',
+    });
+  };
+
+  // Submit Edit Staff/Admin Modal
+  const handleSaveStaffEdit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingStaffTarget || !currentUser || isSavingStaffEdit) return;
+    setActionError(null);
+    setIsSavingStaffEdit(true);
+    try {
+      const route =
+        POSITION_METADATA[editStaffForm.position as keyof typeof POSITION_METADATA]?.route ||
+        (editStaffForm.role === 'ADMIN' ? '/admin/operationsmanager' : '/staff/customer-registration');
+      const res = await authService.updateAccount(editingStaffTarget.id, {
+        fullName: editStaffForm.fullName.trim(),
+        email: editStaffForm.email.trim().toLowerCase(),
+        phone: editStaffForm.phone.trim(),
+        role: editStaffForm.role,
+        position: editStaffForm.position,
+        duty: editStaffForm.position,
+        roleTitle: editStaffForm.position,
+        operationalResponsibility: editStaffForm.position,
+        dashboardRoute: route,
+        assignedProgramme: editStaffForm.assignedProgramme,
+        status: editStaffForm.status,
+        permissions: getDefaultPositionPermissions(editStaffForm.position),
+        ...(editStaffForm.password.trim() ? { password: editStaffForm.password.trim() } : {}),
+        ...(editStaffForm.accessCode.trim() ? { accessCode: editStaffForm.accessCode.trim() } : {}),
+      });
+      if (!res.success) {
+        setActionError(res.message || 'Failed to update account.');
+        return;
+      }
+      setStaffList((prev) =>
+        prev.map((s) =>
+          s.id === editingStaffTarget.id || s.email.toLowerCase() === editingStaffTarget.email.toLowerCase()
+            ? {
+                ...s,
+                fullName: editStaffForm.fullName.trim(),
+                email: editStaffForm.email.trim().toLowerCase(),
+                phone: editStaffForm.phone.trim(),
+                role: editStaffForm.role as any,
+                roleTitle: editStaffForm.position,
+                operationalResponsibility: editStaffForm.position,
+                status: editStaffForm.status,
+              }
+            : s
+        )
+      );
+      setActionSuccess(`Account "${editStaffForm.fullName}" updated successfully.`);
+      setEditingStaffTarget(null);
+      loadData();
+    } catch (err: any) {
+      setActionError(err.message || 'Failed to update account.');
+    } finally {
+      setIsSavingStaffEdit(false);
+    }
+  };
+
+  // Confirm Delete Staff/Admin Account
+  const handleConfirmDeleteStaff = async () => {
+    if (!deletingStaffTarget || !currentUser || isDeletingStaff) return;
+    setActionError(null);
+    setIsDeletingStaff(true);
+    try {
+      const res = await authService.deleteAccount(deletingStaffTarget.id, deletingStaffTarget.email);
+      if (!res.success) {
+        setActionError(res.message || 'Failed to delete account.');
+        return;
+      }
+      setStaffList((prev) =>
+        prev.filter(
+          (s) =>
+            s.id !== deletingStaffTarget.id &&
+            s.email.toLowerCase() !== deletingStaffTarget.email.toLowerCase()
+        )
+      );
+      setActionSuccess(
+        `${deletingStaffTarget.role === 'ADMIN' ? 'Admin' : 'Staff'} account "${deletingStaffTarget.fullName}" (${deletingStaffTarget.email}) has been permanently deleted.`
+      );
+      setDeletingStaffTarget(null);
+    } catch (err: any) {
+      setActionError(err.message || 'Failed to delete account.');
+    } finally {
+      setIsDeletingStaff(false);
     }
   };
 
@@ -1022,21 +1192,40 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                         <td className="p-3.5 text-center">
                           {s.isLifetimeSuperAdmin || s.role === 'LIFETIME_SUPER_ADMIN' ? (
                             <span className="text-[10px] font-bold uppercase tracking-wider text-[#7C3AED]">
-                              Permanent Owner
+                              Permanent Owner (Protected)
                             </span>
-                          ) : s.role === 'ADMIN' ? (
-                            <span className="text-[10px] text-slate-400 uppercase tracking-wider">Super Admin Managed</span>
                           ) : (
-                            <button
-                              onClick={() => handleToggleStaffStatus(s)}
-                              className={`px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider transition ${
-                                s.status === 'active'
-                                  ? 'bg-rose-50 text-rose-600 hover:bg-rose-100 dark:bg-rose-950/40'
-                                  : 'bg-emerald-50 text-emerald-600 hover:bg-emerald-100 dark:bg-emerald-950/40'
-                              }`}
-                            >
-                              {s.status === 'active' ? 'Suspend' : 'Activate'}
-                            </button>
+                            <div className="flex items-center justify-center gap-1.5 flex-wrap">
+                              <button
+                                onClick={() => handleOpenEditStaff(s)}
+                                className="px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-950/50 dark:text-blue-300 transition inline-flex items-center gap-1 cursor-pointer"
+                                title="Edit Account Details & Position"
+                              >
+                                <Edit3 size={11} />
+                                <span>Edit</span>
+                              </button>
+                              <button
+                                onClick={() => handleToggleStaffStatus(s)}
+                                className={`px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider transition cursor-pointer ${
+                                  s.status === 'active'
+                                    ? 'bg-amber-50 text-amber-700 hover:bg-amber-100 dark:bg-amber-950/40 dark:text-amber-300'
+                                    : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:text-emerald-300'
+                                }`}
+                              >
+                                {s.status === 'active' ? 'Suspend' : 'Activate'}
+                              </button>
+                              {s.id !== currentUser?.id &&
+                                s.email?.toLowerCase() !== currentUser?.email?.toLowerCase() && (
+                                  <button
+                                    onClick={() => setDeletingStaffTarget(s)}
+                                    className="px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider bg-rose-600 text-white hover:bg-rose-700 transition inline-flex items-center gap-1 cursor-pointer"
+                                    title="Permanently Delete Account"
+                                  >
+                                    <Trash2 size={11} />
+                                    <span>Delete</span>
+                                  </button>
+                                )}
+                            </div>
                           )}
                         </td>
                       </tr>
@@ -1556,38 +1745,90 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 />
               </div>
 
-              <div>
-                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  Assigned Operational Role <span className="text-rose-500">*</span>
-                </label>
-                <select
-                  value={newStaffRole}
-                  onChange={(e) => setNewStaffRole(e.target.value as any)}
-                  className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none"
-                >
-                  <option value="loan_officer">Loan Officer (Credit Appraisal & Guarantor Verification)</option>
-                  <option value="field_collector">Field Collector (Daily Ajo Collections)</option>
-                  <option value="customer_service">Customer Service (Account Opening & Support)</option>
-                  <option value="accountant">Accountant (Treasury & Cashier Operations)</option>
-                  <option value="operations_manager">Operations Manager (Programme Coordinator)</option>
-                  <option value="auditor">Auditor (Internal Compliance Inspections)</option>
-                </select>
-                <p className="text-[10px] text-amber-600 dark:text-amber-400 mt-1">
-                  Admin role creation is restricted. Only the Lifetime Super Admin can appoint Admins.
-                </p>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Staff Position <span className="text-rose-500">*</span>
+                  </label>
+                  <select
+                    required
+                    value={newStaffPosition}
+                    onChange={(e) => {
+                      const pos = e.target.value;
+                      setNewStaffPosition(pos);
+                      setNewStaffPermissions(getDefaultPositionPermissions(pos));
+                    }}
+                    className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none"
+                  >
+                    {STAFF_POSITIONS.map((pos) => (
+                      <option key={pos} value={pos}>
+                        {pos} ({POSITION_METADATA[pos].route})
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Assigned Programme / Department <span className="text-rose-500">*</span>
+                  </label>
+                  <select
+                    required
+                    value={newStaffProgramme}
+                    onChange={(e) => setNewStaffProgramme(e.target.value)}
+                    className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none"
+                  >
+                    {ASSIGNABLE_PROGRAMMES.map((prog) => (
+                      <option key={prog} value={prog}>
+                        {prog}
+                      </option>
+                    ))}
+                  </select>
+                </div>
               </div>
 
               <div>
                 <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
-                  Operational Responsibility / Station
+                  Account Status <span className="text-rose-500">*</span>
                 </label>
-                <input
-                  type="text"
-                  value={newStaffResponsibility}
-                  onChange={(e) => setNewStaffResponsibility(e.target.value)}
-                  placeholder="e.g. Yaba Market Field Collections · Lagos Mainland Zone"
+                <select
+                  value={newStaffStatus}
+                  onChange={(e) => setNewStaffStatus(e.target.value as 'active' | 'suspended')}
                   className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white focus:outline-none"
-                />
+                >
+                  <option value="active">Active</option>
+                  <option value="suspended">Suspended</option>
+                </select>
+              </div>
+
+              <div className="p-2.5 rounded-lg bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 space-y-1.5">
+                <div className="font-semibold text-slate-700 dark:text-slate-300 text-[11px]">
+                  Assigned Staff Permissions
+                </div>
+                <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+                  {[
+                    { key: 'canViewDashboard', label: 'View Workspace' },
+                    { key: 'canRegisterCustomer', label: 'Register Customers' },
+                    { key: 'canEditCustomer', label: 'Update Customer Info' },
+                    { key: 'canCollectPayments', label: 'Record Collections' },
+                    { key: 'canManageSavings', label: 'Manage Savings' },
+                    { key: 'canViewReports', label: 'View / Prepare Reports' },
+                  ].map((p) => (
+                    <label key={p.key} className="flex items-center gap-1.5 text-slate-700 dark:text-slate-300">
+                      <input
+                        type="checkbox"
+                        checked={!!newStaffPermissions[p.key]}
+                        onChange={(e) =>
+                          setNewStaffPermissions({
+                            ...newStaffPermissions,
+                            [p.key]: e.target.checked,
+                          })
+                        }
+                      />
+                      <span>{p.label}</span>
+                    </label>
+                  ))}
+                </div>
               </div>
 
               <div>
@@ -1751,6 +1992,198 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* 7. EDIT ADMIN / STAFF ACCOUNT MODAL */}
+      {editingStaffTarget && (
+        <div className="fixed inset-0 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center z-50 p-4 overflow-y-auto">
+          <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4 my-8">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-slate-800">
+              <div className="flex items-center gap-2">
+                <Edit3 size={18} className="text-blue-600" />
+                <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                  Edit Account: {editingStaffTarget.fullName}
+                </h3>
+              </div>
+              <button onClick={() => setEditingStaffTarget(null)} className="text-slate-400 hover:text-slate-600">
+                <X size={18} />
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveStaffEdit} className="space-y-3 text-xs">
+              <div>
+                <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                  Full Name *
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={editStaffForm.fullName}
+                  onChange={(e) => setEditStaffForm({ ...editStaffForm, fullName: e.target.value })}
+                  className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white"
+                />
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Official Email *
+                  </label>
+                  <input
+                    type="email"
+                    required
+                    value={editStaffForm.email}
+                    onChange={(e) => setEditStaffForm({ ...editStaffForm, email: e.target.value })}
+                    className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white"
+                  />
+                </div>
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Phone Number
+                  </label>
+                  <input
+                    type="tel"
+                    value={editStaffForm.phone}
+                    onChange={(e) => setEditStaffForm({ ...editStaffForm, phone: e.target.value })}
+                    className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Position *
+                  </label>
+                  <select
+                    value={editStaffForm.position}
+                    onChange={(e) => setEditStaffForm({ ...editStaffForm, position: e.target.value })}
+                    className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white"
+                  >
+                    {(editStaffForm.role === 'ADMIN' ? ADMIN_POSITIONS : STAFF_POSITIONS).map((pos) => (
+                      <option key={pos} value={pos}>
+                        {pos}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Account Status *
+                  </label>
+                  <select
+                    value={editStaffForm.status}
+                    onChange={(e) =>
+                      setEditStaffForm({
+                        ...editStaffForm,
+                        status: e.target.value as 'active' | 'suspended',
+                      })
+                    }
+                    className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white"
+                  >
+                    <option value="active">Active</option>
+                    <option value="suspended">Suspended</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Reset Password (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    value={editStaffForm.password}
+                    onChange={(e) => setEditStaffForm({ ...editStaffForm, password: e.target.value })}
+                    placeholder="Leave blank to keep current"
+                    className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white font-mono"
+                  />
+                </div>
+                <div>
+                  <label className="block font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                    Reset Access Code (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    value={editStaffForm.accessCode}
+                    onChange={(e) => setEditStaffForm({ ...editStaffForm, accessCode: e.target.value })}
+                    placeholder="Leave blank to keep current"
+                    className="w-full p-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-slate-900 dark:text-white font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-3">
+                <button
+                  type="button"
+                  onClick={() => setEditingStaffTarget(null)}
+                  className="px-4 py-2 rounded-lg text-xs font-semibold text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isSavingStaffEdit}
+                  className="px-5 py-2 rounded-lg text-xs font-bold bg-[#1E5BD8] hover:bg-[#0B2A5B] text-white shadow transition disabled:opacity-50"
+                >
+                  {isSavingStaffEdit ? 'Saving...' : 'Save Changes'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* 8. DELETE ADMIN / STAFF CONFIRMATION MODAL */}
+      {deletingStaffTarget && (
+        <div className="fixed inset-0 bg-slate-950/70 backdrop-blur-xs flex items-center justify-center z-50 p-4">
+          <div className="bg-white dark:bg-slate-900 border border-rose-300 dark:border-rose-800 rounded-2xl max-w-md w-full p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between pb-3 border-b border-slate-200 dark:border-slate-800">
+              <div className="flex items-center gap-2 text-rose-600">
+                <Trash2 size={18} />
+                <h3 className="text-sm font-bold">
+                  Delete {deletingStaffTarget.role === 'ADMIN' ? 'Admin' : 'Staff'} Account
+                </h3>
+              </div>
+              <button onClick={() => setDeletingStaffTarget(null)} className="text-slate-400 hover:text-slate-600">
+                <X size={18} />
+              </button>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800/60 text-xs space-y-1.5">
+              <div className="font-bold text-rose-900 dark:text-rose-200">
+                {deletingStaffTarget.fullName} ({deletingStaffTarget.email})
+              </div>
+              <div className="text-rose-700 dark:text-rose-300">
+                Role: {deletingStaffTarget.roleTitle || deletingStaffTarget.role} · Code: {deletingStaffTarget.staffCode}
+              </div>
+              <p className="text-slate-600 dark:text-slate-300 pt-1">
+                This will permanently remove this account from TEAMACRO Authentication, Cloud Firestore, and revoke all active sessions.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setDeletingStaffTarget(null)}
+                disabled={isDeletingStaff}
+                className="px-4 py-2 rounded-lg text-xs font-semibold text-slate-600 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDeleteStaff}
+                disabled={isDeletingStaff}
+                className="px-5 py-2 rounded-lg text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white shadow transition disabled:opacity-50 flex items-center gap-1.5"
+              >
+                <Trash2 size={13} />
+                <span>{isDeletingStaff ? 'Deleting...' : 'Permanently Delete'}</span>
+              </button>
+            </div>
           </div>
         </div>
       )}

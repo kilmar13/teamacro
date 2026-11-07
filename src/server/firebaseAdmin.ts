@@ -1405,6 +1405,9 @@ export async function writeFirestoreUserProfile(
     role: 'ADMIN' | 'STAFF' | 'LIFETIME_SUPER_ADMIN';
     roleTitle: string;
     duty: string;
+    position?: string;
+    dashboardRoute?: string;
+    assignedProgramme?: string;
     status: 'active' | 'suspended' | 'inactive';
     createdBy: string;
     createdAt: string;
@@ -1444,6 +1447,9 @@ export async function writeFirestoreUserProfile(
   const { db, config } = getFirebaseAdminServices();
 
   const sharedAuthFields: Record<string, any> = {
+    ...(profile.position ? { position: profile.position } : { position: profile.duty || profile.roleTitle }),
+    ...(profile.dashboardRoute ? { dashboardRoute: profile.dashboardRoute } : {}),
+    ...(profile.assignedProgramme ? { assignedProgramme: profile.assignedProgramme } : {}),
     ...(profile.accessCodeHash ? { accessCodeHash: profile.accessCodeHash } : {}),
     ...(profile.accessCodeSalt ? { accessCodeSalt: profile.accessCodeSalt } : {}),
     ...(profile.accessCodeMasked ? { accessCodeMasked: profile.accessCodeMasked } : {}),
@@ -2009,31 +2015,263 @@ export async function syncSuperAdminFirebaseAuthCredentials(
 }
 
 /**
- * Safely deletes an isolated test document from Firestore while strictly protecting
+ * Safely deletes a document from Firestore (Admin SDK + REST fallback) while strictly protecting
  * `system_ownership`, `systemSettings`, and `OWNER_ROOT_3YPAFKI2`.
  */
 export async function deleteFirestoreDocument(
   collectionName: string,
-  docId: string
+  docId: string,
+  bearerToken?: string
 ): Promise<boolean> {
   if (!collectionName || !docId) return false;
   if (
     collectionName === 'system_ownership' ||
     collectionName === 'systemSettings' ||
     docId === 'lifetimeSuperAdmin' ||
-    docId === 'OWNER_ROOT_3YPAFKI2'
+    docId === 'OWNER_ROOT_3YPAFKI2' ||
+    docId === 'LIFETIME_ROOT_SUPER_ADMIN_001'
   ) {
     return false;
   }
-  const { db } = getFirebaseAdminServices();
-  if (!db) return false;
+  const { db, config } = getFirebaseAdminServices();
+  if (db) {
+    try {
+      await withTimeout(db.collection(collectionName).doc(docId).delete(), 3000);
+      return true;
+    } catch {
+      // Fall through to REST API
+    }
+  }
+
+  const adminToken = await getServiceAccountAccessToken(config);
+  const effectiveToken = adminToken || bearerToken;
   try {
-    await withTimeout(db.collection(collectionName).doc(docId).delete(), 3000);
+    const url = `https://firestore.googleapis.com/v1/projects/${config.projectId}/databases/${config.firestoreDatabaseId}/documents/${encodeURIComponent(collectionName)}/${encodeURIComponent(docId)}`;
+    const headers: Record<string, string> = {};
+    if (effectiveToken) {
+      headers['Authorization'] = `Bearer ${effectiveToken}`;
+    }
+    const res = await withTimeout(
+      fetch(url, {
+        method: 'DELETE',
+        headers,
+      }),
+      3000
+    );
+    if (res.ok || res.status === 404) {
+      return true;
+    }
+  } catch {
+    // Ignore delete timeout
+  }
+  return false;
+}
+
+/**
+ * Updates an Admin or Staff user's credentials/profile in Firebase Authentication.
+ * Never modifies the Lifetime Super Admin root owner via this helper.
+ */
+export async function updateFirebaseAuthUserCredentials(
+  uid: string,
+  updates: {
+    email?: string;
+    displayName?: string;
+    password?: string;
+    disabled?: boolean;
+  }
+): Promise<boolean> {
+  const cleanUid = (uid || '').trim();
+  if (
+    !cleanUid ||
+    cleanUid === 'OWNER_ROOT_3YPAFKI2' ||
+    cleanUid === 'LIFETIME_ROOT_SUPER_ADMIN_001' ||
+    cleanUid === 'pS1G6dcGFgT2fcH3d9yVeaIFHii2'
+  ) {
+    return false;
+  }
+
+  const { auth } = getFirebaseAdminServices();
+  if (!auth) return false;
+
+  const payload: Record<string, any> = {};
+  if (updates.email && updates.email.includes('@')) {
+    payload.email = updates.email.trim().toLowerCase();
+  }
+  if (updates.displayName && updates.displayName.trim()) {
+    payload.displayName = updates.displayName.trim();
+  }
+  if (updates.password && updates.password.trim().length >= 6) {
+    payload.password = updates.password.trim();
+  }
+  if (typeof updates.disabled === 'boolean') {
+    payload.disabled = updates.disabled;
+  }
+
+  if (Object.keys(payload).length === 0) return true;
+
+  try {
+    await withTimeout(auth.updateUser(cleanUid, payload), 3500);
     return true;
   } catch {
     return false;
   }
 }
+
+/**
+ * Permanently deletes an Admin or Staff account from Firebase Authentication and
+ * removes its profile documents from Firestore (`users`, `admins`, `staff`).
+ * Strictly protects `OWNER_ROOT_3YPAFKI2` and `eromoseledavidson68@gmail.com`.
+ */
+export async function deleteFirebaseAccountAndFirestoreProfile(
+  uid: string,
+  email?: string,
+  bearerToken?: string
+): Promise<{
+  success: boolean;
+  deletedFromAuth: boolean;
+  deletedFromFirestore: boolean;
+}> {
+  const cleanUid = (uid || '').trim();
+  const cleanEmail = (email || '').trim().toLowerCase();
+
+  if (
+    cleanUid === 'OWNER_ROOT_3YPAFKI2' ||
+    cleanUid === 'LIFETIME_ROOT_SUPER_ADMIN_001' ||
+    cleanUid === 'pS1G6dcGFgT2fcH3d9yVeaIFHii2' ||
+    cleanEmail === AUTHORIZED_SUPER_ADMIN_EMAIL.toLowerCase()
+  ) {
+    return {
+      success: false,
+      deletedFromAuth: false,
+      deletedFromFirestore: false,
+    };
+  }
+
+  if (cleanUid) {
+    const cached = provisionedAuthUsersByUid.get(cleanUid);
+    if (cached) {
+      provisionedAuthUsersByEmail.delete(cached.email);
+    }
+    provisionedAuthUsersByUid.delete(cleanUid);
+  }
+  if (cleanEmail) {
+    const cachedByEmail = provisionedAuthUsersByEmail.get(cleanEmail);
+    if (cachedByEmail) {
+      provisionedAuthUsersByUid.delete(cachedByEmail.uid);
+    }
+    provisionedAuthUsersByEmail.delete(cleanEmail);
+  }
+
+  const { auth, db } = getFirebaseAdminServices();
+
+  // Execute Firebase Auth deletion and Firestore document deletions concurrently in a single pass
+  const [deletedFromAuth, deletedDirectFirestore, deletedByEmailFirestore] = await Promise.all([
+    // 1. Firebase Auth deletion (direct UID first; fallback to email lookup only if needed)
+    (async (): Promise<boolean> => {
+      if (!auth) {
+        if (cleanUid) {
+          const rb = await rollbackFirebaseAuthAccount(cleanUid);
+          return rb.rolledBack;
+        }
+        return false;
+      }
+
+      if (cleanUid && !cleanUid.startsWith('STAFF_')) {
+        try {
+          await withTimeout(auth.deleteUser(cleanUid), 1500);
+          return true;
+        } catch (err: any) {
+          if (err?.code === 'auth/user-not-found') {
+            if (!cleanEmail) return true;
+          }
+        }
+      }
+
+      if (cleanEmail) {
+        try {
+          const existingUser = await withTimeout(auth.getUserByEmail(cleanEmail), 1200);
+          if (
+            existingUser?.uid &&
+            existingUser.uid !== 'OWNER_ROOT_3YPAFKI2' &&
+            existingUser.uid !== 'pS1G6dcGFgT2fcH3d9yVeaIFHii2'
+          ) {
+            await withTimeout(auth.deleteUser(existingUser.uid), 1500);
+            return true;
+          }
+        } catch {
+          // User not found by email or already deleted
+        }
+      }
+      return false;
+    })(),
+
+    // 2. Direct Firestore atomic batch deletion by UID across users, admins, and staff
+    (async (): Promise<boolean> => {
+      if (!cleanUid) return false;
+      if (db) {
+        try {
+          const batch = db.batch();
+          batch.delete(db.collection('users').doc(cleanUid));
+          batch.delete(db.collection('admins').doc(cleanUid));
+          batch.delete(db.collection('staff').doc(cleanUid));
+          await withTimeout(batch.commit(), 1500);
+          return true;
+        } catch {
+          // Fall back to individual document helper
+        }
+      }
+      const res = await Promise.all([
+        deleteFirestoreDocument('users', cleanUid, bearerToken),
+        deleteFirestoreDocument('admins', cleanUid, bearerToken),
+        deleteFirestoreDocument('staff', cleanUid, bearerToken),
+      ]);
+      return res.some(Boolean);
+    })(),
+
+    // 3. Fast indexed email lookup in Firestore (catches any docs where docId !== cleanUid)
+    (async (): Promise<boolean> => {
+      if (!db || !cleanEmail) return false;
+      try {
+        const [usersSnap, adminsSnap, staffSnap] = await withTimeout(
+          Promise.all([
+            db.collection('users').where('email', '==', cleanEmail).get(),
+            db.collection('admins').where('email', '==', cleanEmail).get(),
+            db.collection('staff').where('email', '==', cleanEmail).get(),
+          ]),
+          1500
+        );
+        const batch = db.batch();
+        let count = 0;
+        for (const snap of [usersSnap, adminsSnap, staffSnap]) {
+          for (const docSnap of snap.docs) {
+            if (
+              docSnap.id !== cleanUid &&
+              docSnap.id !== 'OWNER_ROOT_3YPAFKI2' &&
+              docSnap.id !== 'LIFETIME_ROOT_SUPER_ADMIN_001'
+            ) {
+              batch.delete(docSnap.ref);
+              count++;
+            }
+          }
+        }
+        if (count > 0) {
+          await withTimeout(batch.commit(), 1500);
+          return true;
+        }
+      } catch {
+        // Non-fatal if indexed query times out
+      }
+      return false;
+    })(),
+  ]);
+
+  return {
+    success: true,
+    deletedFromAuth,
+    deletedFromFirestore: deletedDirectFirestore || deletedByEmailFirestore,
+  };
+}
+
 
 /**
  * Verifies credentials against Firebase Authentication (`accounts:signInWithPassword`)

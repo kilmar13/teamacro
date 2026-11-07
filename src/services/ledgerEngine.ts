@@ -826,13 +826,18 @@ export class LedgerEngine {
   }
 
 
-  static updateStaffUser(staffId: string, updates: Partial<StaffUser>, actor?: any): StaffUser | null {
+  static updateStaffUser(staffId: string, updates: Partial<StaffUser> & Record<string, any>, actor?: any): StaffUser | null {
     const all = this.getStaffUsers();
-    const idx = all.findIndex((s) => s.id === staffId);
+    const cleanEmail = (updates.email || '').trim().toLowerCase();
+    const idx = all.findIndex(
+      (s) =>
+        s.id === staffId ||
+        (cleanEmail && s.email?.toLowerCase() === cleanEmail)
+    );
     if (idx === -1) return null;
 
     if (this.isLifetimeSuperAdmin(all[idx])) {
-      if (updates.status === 'suspended' || updates.role) {
+      if (updates.status === 'suspended' || (updates.role && updates.role !== 'LIFETIME_SUPER_ADMIN')) {
         throw new Error('PROTECTED RECORD: Cannot suspend or change role of the Permanent Lifetime Super Admin.');
       }
     }
@@ -850,6 +855,35 @@ export class LedgerEngine {
     );
 
     return all[idx];
+  }
+
+  static deleteStaffOrAdminUser(userIdOrEmail: string, email?: string, actor?: any): boolean {
+    const all = this.getStaffUsers();
+    const cleanId = (userIdOrEmail || '').trim().toLowerCase();
+    const cleanEmail = (email || '').trim().toLowerCase();
+
+    const filtered = all.filter((s) => {
+      if (this.isLifetimeSuperAdmin(s)) return true;
+      const matchId = s.id?.toLowerCase() === cleanId || s.staffCode?.toLowerCase() === cleanId;
+      const matchEmail =
+        (cleanEmail && s.email?.toLowerCase() === cleanEmail) ||
+        (cleanId.includes('@') && s.email?.toLowerCase() === cleanId);
+      return !(matchId || matchEmail);
+    });
+
+    if (filtered.length !== all.length) {
+      saveToStorage(STORAGE_KEYS.STAFF, filtered);
+      const currentActor = actor || this.getCurrentStaff();
+      this.recordAuditLog(
+        currentActor?.id || 'SYSTEM',
+        currentActor?.fullName || 'Administrator',
+        'Deleted Staff/Admin Account',
+        'Staff Management',
+        `Permanently deleted account (${userIdOrEmail}${email ? ` / ${email}` : ''})`
+      );
+      return true;
+    }
+    return false;
   }
 
   // 5. Discreet Super Admin Activity Monitoring
@@ -3257,6 +3291,14 @@ export class LedgerEngine {
 
   updateStaffUser(staffId: string, updates: Partial<StaffUser>, actor?: any): StaffUser | null {
     return LedgerEngine.updateStaffUser(staffId, updates, actor);
+  }
+
+  deleteStaffOrAdminUser(userIdOrEmail: string, email?: string, actor?: any): boolean {
+    const res = LedgerEngine.deleteStaffOrAdminUser(userIdOrEmail, email, actor);
+    if (res) {
+      this.notifyListeners({ type: 'STAFF_DELETED', id: userIdOrEmail });
+    }
+    return res;
   }
 
   getStaffAndAdminDirectory(): StaffUser[] {

@@ -10,12 +10,16 @@ export type StaffRole =
   | 'accountant'
   | 'auditor'
   | 'SUPER_ADMIN'
+  | 'ACCOUNT_MANAGER'
   | 'OPERATIONS_MANAGER'
+  | 'AUDITOR'
+  | 'CUSTOMER_REGISTRATION_OFFICER'
+  | 'PAYMENT_COLLECTION_OFFICER'
   | 'LOAN_OFFICER'
+  | 'ACCOUNTS_OFFICER'
   | 'FIELD_COLLECTOR'
   | 'CUSTOMER_SERVICE'
-  | 'ACCOUNTANT'
-  | 'AUDITOR';
+  | 'ACCOUNTANT';
 
 export type UserRole =
   | 'LIFETIME_SUPER_ADMIN'
@@ -23,12 +27,16 @@ export type UserRole =
   | 'CUSTOMER'
   | 'STAFF'
   | 'SUPER_ADMIN'
+  | 'ACCOUNT_MANAGER'
   | 'OPERATIONS_MANAGER'
+  | 'AUDITOR'
+  | 'CUSTOMER_REGISTRATION_OFFICER'
+  | 'PAYMENT_COLLECTION_OFFICER'
   | 'LOAN_OFFICER'
+  | 'ACCOUNTS_OFFICER'
   | 'FIELD_COLLECTOR'
   | 'CUSTOMER_SERVICE'
   | 'ACCOUNTANT'
-  | 'AUDITOR'
   | StaffRole;
 
 export interface PermissionSet {
@@ -46,6 +54,7 @@ export interface PermissionSet {
   canManageStaff: boolean;
   canViewAuditLogs: boolean;
   canModifySettings: boolean;
+  [key: string]: boolean | undefined;
 }
 
 export interface User {
@@ -55,7 +64,11 @@ export interface User {
   fullName: string;
   phone: string;
   role: UserRole;
-  permissions?: PermissionSet;
+  position?: string;
+  duty?: string;
+  dashboardRoute?: string;
+  assignedProgramme?: string;
+  permissions?: PermissionSet | Record<string, boolean>;
   status?: 'active' | 'suspended' | 'inactive' | 'dormant' | string;
   active?: boolean;
   branchId?: string;
@@ -78,6 +91,10 @@ export interface StaffUser {
   phone: string;
   role: StaffRole;
   roleTitle: string;
+  position?: string;
+  duty?: string;
+  dashboardRoute?: string;
+  assignedProgramme?: string;
   permissions: PermissionSet;
   status: 'active' | 'suspended';
   lastLogin: string;

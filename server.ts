@@ -21,7 +21,14 @@ import {
   saveFirestoreInvitation,
   setFirebaseAuthUserDisabled,
   syncSuperAdminFirebaseAuthCredentials,
+  deleteFirebaseAccountAndFirestoreProfile,
+  updateFirebaseAuthUserCredentials,
+  deleteFirestoreDocument,
 } from './src/server/firebaseAdmin.js';
+import {
+  getDedicatedRouteForUser,
+  normalizeCanonicalPosition,
+} from './src/utils/roleRouting.js';
 
 // ============================================================================
 // 0. PROCESS-LEVEL STABILITY GUARDS (PREVENT UNEXPECTED CONNECTION CLOSURES)
@@ -119,6 +126,7 @@ app.use((req: Request, _res: Response, next: NextFunction) => {
     (req.url.startsWith('/auth/') ||
       req.url.startsWith('/admin/diagnostics') ||
       req.url.startsWith('/customers') ||
+      req.url.startsWith('/operations/') ||
       req.url.startsWith('/financial/') ||
       req.url.startsWith('/audit/') ||
       req.url.startsWith('/super-admin/'))
@@ -222,23 +230,28 @@ async function authenticateRequest(req: Request): Promise<UserSession | null> {
   const sessionCandidates = [customSessionToken, cookieToken, bearerToken].filter(
     (t) => t && t.split('.').length !== 3
   );
+  const isColdStartSimulated = req.headers['x-test-simulate-cold-start'] === 'true';
 
   for (const tok of sessionCandidates) {
+    const isWarm = !isColdStartSimulated && serverAuthManager.hasWarmSession(tok);
     const peeked = serverAuthManager.peekSessionToken(tok);
     if (peeked) {
-      const tokenHash = serverAuthManager.getSessionTokenHash(tok);
-      try {
-        const fsSession = await withServerTimeout(getFirestoreSessionByHash(tokenHash), 1200);
+      const accountInMemory =
+        peeked.role === 'LIFETIME_SUPER_ADMIN' ||
+        Boolean(serverAuthManager.findAccountByIdentifier(peeked.userId));
+
+      if (!isWarm || !accountInMemory) {
+        const tokenHash = serverAuthManager.getSessionTokenHash(tok);
+        const [fsSession] = await Promise.all([
+          withServerTimeout(getFirestoreSessionByHash(tokenHash), 1000).catch(() => null),
+          peeked.role !== 'LIFETIME_SUPER_ADMIN'
+            ? ensureAccountHydratedFromFirestore(peeked.userId, undefined, true)
+            : Promise.resolve(),
+        ]);
         if (fsSession && fsSession.revoked === true) {
           serverAuthManager.markTokenRevokedInMemory(tok);
           continue;
         }
-      } catch {
-        // Non-fatal if Firestore session hash check times out
-      }
-
-      if (peeked.role !== 'LIFETIME_SUPER_ADMIN') {
-        await ensureAccountHydratedFromFirestore(peeked.userId, undefined, true);
       }
     }
 
@@ -1023,14 +1036,18 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
         uid === cleanIdentifier
       )) {
         const isRootOwner = serverAuthManager.isVerifiedOwner(uid, String(merged.email));
+        const pos = String(merged.position || merged.duty || merged.roleTitle || (isRootOwner ? 'Lifetime Super Admin' : 'Account Manager'));
         serverAuthManager.syncProvisionedAccount({
           id: uid,
           email: String(merged.email),
           fullName: String(merged.fullName || merged.email),
           phone: String(merged.phone || ''),
           role: isRootOwner ? 'LIFETIME_SUPER_ADMIN' : 'ADMIN',
-          roleTitle: String(merged.roleTitle || merged.duty || (isRootOwner ? 'Lifetime Super Admin' : 'Executive Administrator')),
-          duty: String(merged.duty || merged.roleTitle || (isRootOwner ? 'Executive Command & Governance' : 'Executive Administrator')),
+          roleTitle: pos,
+          duty: pos,
+          position: pos,
+          dashboardRoute: merged.dashboardRoute ? String(merged.dashboardRoute) : undefined,
+          assignedProgramme: merged.assignedProgramme ? String(merged.assignedProgramme) : undefined,
           staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
           status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
           passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
@@ -1056,14 +1073,18 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
         String(merged.staffCode || '').toLowerCase() === cleanIdentifier.toLowerCase() ||
         uid === cleanIdentifier
       )) {
+        const pos = String(merged.position || merged.duty || merged.roleTitle || 'Customer Registration Officer');
         serverAuthManager.syncProvisionedAccount({
           id: uid,
           email: String(merged.email),
           fullName: String(merged.fullName || merged.email),
           phone: String(merged.phone || ''),
           role: 'STAFF',
-          roleTitle: String(merged.roleTitle || merged.duty || 'Operations Officer'),
-          duty: String(merged.duty || merged.roleTitle || 'Operations Officer'),
+          roleTitle: pos,
+          duty: pos,
+          position: pos,
+          dashboardRoute: merged.dashboardRoute ? String(merged.dashboardRoute) : undefined,
+          assignedProgramme: merged.assignedProgramme ? String(merged.assignedProgramme) : undefined,
           staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
           status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
           passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
@@ -1197,16 +1218,18 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
     });
   }
 
-  // 2. Direct Session Issuance (Non-MFA Staff)
+  // 2. Direct Session Issuance (Non-MFA Staff & Admins)
   const session = serverAuthManager.createSession(account, ip, userAgent, false);
   setSessionCookie(res, session.token);
 
-  let redirectRoute = '/staff';
-  if (account.role === 'LIFETIME_SUPER_ADMIN') {
-    redirectRoute = '/supa-admin';
-  } else if (account.role === 'ADMIN') {
-    redirectRoute = '/admin';
-  }
+  const redirectRoute = getDedicatedRouteForUser({
+    role: session.role,
+    roleTitle: session.roleTitle,
+    duty: account.duty || session.roleTitle,
+    position: session.position || account.position || account.duty || session.roleTitle,
+    dashboardRoute: session.dashboardRoute || account.dashboardRoute,
+    isLifetimeSuperAdmin: session.isLifetimeSuperAdmin,
+  });
 
   return res.status(200).json({
     success: true,
@@ -1219,6 +1242,11 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
       fullName: session.fullName,
       role: session.role,
       roleTitle: session.roleTitle,
+      duty: account.duty || session.position || session.roleTitle,
+      position: session.position || account.position || account.duty || session.roleTitle,
+      dashboardRoute: redirectRoute,
+      assignedProgramme: session.assignedProgramme || account.assignedProgramme,
+      permissions: account.permissions,
       isLifetimeSuperAdmin: session.isLifetimeSuperAdmin,
       status: 'active',
       active: true,
@@ -1399,13 +1427,15 @@ app.post('/api/auth/verify-mfa', apiHandler(async (req: Request, res: Response) 
 
   const session = result.session;
   setSessionCookie(res, session.token);
-
-  let redirectRoute = '/staff';
-  if (session.role === 'LIFETIME_SUPER_ADMIN') {
-    redirectRoute = '/supa-admin';
-  } else if (session.role === 'ADMIN') {
-    redirectRoute = '/admin';
-  }
+  const acc = serverAuthManager.findAccountByIdentifier(session.userId);
+  const redirectRoute = getDedicatedRouteForUser({
+    role: session.role,
+    roleTitle: session.roleTitle,
+    duty: acc?.duty || session.position || session.roleTitle,
+    position: session.position || acc?.position || acc?.duty || session.roleTitle,
+    dashboardRoute: session.dashboardRoute || acc?.dashboardRoute,
+    isLifetimeSuperAdmin: session.isLifetimeSuperAdmin,
+  });
 
   return res.status(200).json({
     success: true,
@@ -1417,6 +1447,11 @@ app.post('/api/auth/verify-mfa', apiHandler(async (req: Request, res: Response) 
       fullName: session.fullName,
       role: session.role,
       roleTitle: session.roleTitle,
+      duty: acc?.duty || session.position || session.roleTitle,
+      position: session.position || acc?.position || acc?.duty || session.roleTitle,
+      dashboardRoute: redirectRoute,
+      assignedProgramme: session.assignedProgramme || acc?.assignedProgramme,
+      permissions: acc?.permissions || session.permissions,
       isLifetimeSuperAdmin: session.isLifetimeSuperAdmin,
       mfaVerified: true,
       status: 'active',
@@ -1441,16 +1476,32 @@ app.get('/api/auth/session', apiHandler(async (req: Request, res: Response) => {
     });
   }
 
+  const acc = serverAuthManager.findAccountByIdentifier(session.userId) || serverAuthManager.findAccountByIdentifier(session.email);
+  const redirectRoute = getDedicatedRouteForUser({
+    role: session.role,
+    roleTitle: session.roleTitle,
+    duty: acc?.duty || session.position || session.roleTitle,
+    position: session.position || acc?.position || acc?.duty || session.roleTitle,
+    dashboardRoute: session.dashboardRoute || acc?.dashboardRoute,
+    isLifetimeSuperAdmin: session.isLifetimeSuperAdmin,
+  });
+
   return res.status(200).json({
     authenticated: true,
     sessionToken: session.token,
     expiresAt: session.expiresAt,
+    redirectRoute,
     user: {
       id: session.userId,
       email: session.email,
       fullName: session.fullName,
       role: session.role,
       roleTitle: session.roleTitle,
+      duty: acc?.duty || session.position || session.roleTitle,
+      position: session.position || acc?.position || acc?.duty || session.roleTitle,
+      dashboardRoute: redirectRoute,
+      assignedProgramme: session.assignedProgramme || acc?.assignedProgramme,
+      permissions: acc?.permissions || session.permissions,
       isLifetimeSuperAdmin: session.isLifetimeSuperAdmin,
       mfaVerified: session.mfaVerified,
       status: 'active',
@@ -1516,26 +1567,41 @@ app.post('/api/auth/authorize-route', apiHandler(async (req: Request, res: Respo
   }
 
   const check = serverAuthManager.authorizeRouteAccess(session.token, route || '/');
+  const acc = serverAuthManager.findAccountByIdentifier(session.userId) || serverAuthManager.findAccountByIdentifier(session.email);
+  const dedicatedRoute = getDedicatedRouteForUser({
+    role: session.role,
+    roleTitle: session.roleTitle,
+    duty: acc?.duty || session.position || session.roleTitle,
+    position: session.position || acc?.position || acc?.duty || session.roleTitle,
+    dashboardRoute: session.dashboardRoute || acc?.dashboardRoute,
+    isLifetimeSuperAdmin: session.isLifetimeSuperAdmin,
+  });
 
   if (!check.allowed) {
     return res.status(check.statusCode).json({
       allowed: false,
       statusCode: check.statusCode,
       reason: check.reason,
-      redirect: check.statusCode === 401 ? '/staff/login' : undefined,
+      targetRoute: check.targetRoute || dedicatedRoute,
+      redirect: check.statusCode === 401 ? '/staff/login' : check.targetRoute || dedicatedRoute,
     });
   }
 
   return res.status(200).json({
     allowed: true,
     statusCode: 200,
-    targetRoute: check.targetRoute,
+    targetRoute: check.targetRoute || dedicatedRoute,
     user: {
       id: session.userId,
       email: session.email,
       fullName: session.fullName,
       role: session.role,
       roleTitle: session.roleTitle,
+      duty: acc?.duty || session.position || session.roleTitle,
+      position: session.position || acc?.position || acc?.duty || session.roleTitle,
+      dashboardRoute: dedicatedRoute,
+      assignedProgramme: session.assignedProgramme || acc?.assignedProgramme,
+      permissions: acc?.permissions || session.permissions,
       isLifetimeSuperAdmin: session.isLifetimeSuperAdmin,
       mfaVerified: session.mfaVerified,
     },
@@ -1641,8 +1707,18 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
     });
   }
 
-  if (session.role !== 'LIFETIME_SUPER_ADMIN' || !session.isLifetimeSuperAdmin) {
-    const msg = 'Insufficient privileges: Only the Lifetime Super Admin can create staff accounts.';
+  const actorAcc = serverAuthManager.findAccountByIdentifier(session.userId);
+  const isSuperAdmin = session.role === 'LIFETIME_SUPER_ADMIN' && session.isLifetimeSuperAdmin;
+  const isAuthorizedAdmin =
+    session.role === 'ADMIN' &&
+    !serverAuthManager.isAuditorSession(session) &&
+    actorAcc?.permissions?.canManageStaff !== false &&
+    session.permissions?.canManageStaff !== false;
+
+  if (!isSuperAdmin && !isAuthorizedAdmin) {
+    const msg = serverAuthManager.isAuditorSession(session)
+      ? 'Read-Only Restriction: Auditors are strictly prohibited from creating or modifying staff accounts.'
+      : 'Insufficient privileges: Only the Lifetime Super Admin or an authorized Operations Manager / Admin can create staff accounts.';
     logStructuredServerError({
       correlationId,
       endpoint,
@@ -1650,7 +1726,7 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
       errorCategory: 'INSUFFICIENT_PRIVILEGES',
       firebaseErrorCode: 'auth/insufficient-permission',
       statusCode: 403,
-      message: `Role ${session.role} is forbidden from creating staff accounts.`,
+      message: `Role ${session.role} (${session.position || session.roleTitle}) is forbidden from creating staff accounts.`,
     });
     return res.status(403).json({
       success: false,
@@ -1672,7 +1748,11 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
   const cleanAccessCode = String(body.accessCode || '').trim();
   const cleanInitialPassword = String(body.password || body.initialPassword || '').trim();
   const secretCredential = cleanInitialPassword || cleanAccessCode;
-  const duty = String(body.duty || body.roleTitle || body.operationalResponsibility || 'Customer Registration Officer').trim();
+  const rawPosition = String(body.position || body.duty || body.roleTitle || body.operationalResponsibility || 'Customer Registration Officer').trim();
+  const canonicalPos = normalizeCanonicalPosition(rawPosition, 'STAFF');
+  const duty = canonicalPos || rawPosition;
+  const assignedProgramme = String(body.assignedProgramme || 'General Operations & Multi-Programme').trim();
+  const requestedStatus: 'active' | 'suspended' = body.status === 'suspended' ? 'suspended' : 'active';
   const requestedRole = String(body.role || 'STAFF').trim().toUpperCase();
 
   if (requestedRole === 'SUPER_ADMIN' || requestedRole === 'LIFETIME_SUPER_ADMIN') {
@@ -1695,6 +1775,21 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
       message: msg,
       correlationId,
       statusCode: 400,
+    });
+  }
+
+  if (requestedRole === 'ADMIN' && !isSuperAdmin) {
+    const msg = 'Clearance Violation: Only the Lifetime Super Admin can create Administrator accounts.';
+    return res.status(403).json({
+      success: false,
+      error: {
+        code: 'INSUFFICIENT_PRIVILEGES',
+        message: msg,
+        correlationId,
+      },
+      message: msg,
+      correlationId,
+      statusCode: 403,
     });
   }
 
@@ -1723,7 +1818,7 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
   }
 
   if (!serverAuthManager.isValidOperationalDuty(duty, 'STAFF')) {
-    const msg = `Invalid operational duty "${duty}". Please select an approved operational duty from the allowed list.`;
+    const msg = `Invalid staff position "${duty}". Please select Customer Registration Officer, Payment Collection Officer, Loan Officer, or Accounts Officer.`;
     logStructuredServerError({
       correlationId,
       endpoint,
@@ -1837,6 +1932,9 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
     role: 'STAFF',
     duty,
     roleTitle: duty,
+    position: duty,
+    assignedProgramme,
+    status: requestedStatus,
     firebaseUid: fbProvision.uid,
   });
 
@@ -1877,6 +1975,10 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
   const accessCodeSaltedHash = serverAuthManager.getAccountAccessCodeSaltedHash(acct.id);
   const authStorageFields = serverAuthManager.getAccountAuthStorageFields(acct.id) || {};
 
+  if (acct.status === 'suspended') {
+    await setFirebaseAuthUserDisabled(acct.id, true).catch(() => {});
+  }
+
   const firestoreResult = await withServerTimeout(
     writeFirestoreUserProfile({
       uid: acct.id,
@@ -1886,7 +1988,10 @@ const handleCreateStaffAccount = apiHandler(async (req: Request, res: Response) 
       role: 'STAFF',
       roleTitle: acct.roleTitle,
       duty: acct.duty || acct.roleTitle,
-      status: 'active',
+      position: acct.position || acct.duty || acct.roleTitle,
+      dashboardRoute: acct.dashboardRoute,
+      assignedProgramme: acct.assignedProgramme,
+      status: acct.status === 'suspended' ? 'suspended' : 'active',
       createdBy: session.userId,
       createdAt: acct.createdAt || new Date().toISOString(),
       accessCodeHash: accessCodeSaltedHash,
@@ -2258,7 +2363,11 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
   const cleanAccessCode = String(body.accessCode || '').trim();
   const cleanInitialPassword = String(body.password || body.initialPassword || '').trim();
   const secretCredential = cleanInitialPassword || cleanAccessCode;
-  const duty = String(body.operationalResponsibility || body.duty || body.roleTitle || 'Admin / General Branch Administrator').trim();
+  const rawPosition = String(body.position || body.operationalResponsibility || body.duty || body.roleTitle || 'Account Manager').trim();
+  const canonicalPos = normalizeCanonicalPosition(rawPosition, 'ADMIN');
+  const duty = canonicalPos || rawPosition;
+  const assignedProgramme = String(body.assignedProgramme || 'All Savings & Loan Programmes').trim();
+  const requestedStatus: 'active' | 'suspended' = body.status === 'suspended' ? 'suspended' : 'active';
 
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   if (!cleanName || !cleanEmail || !emailRegex.test(cleanEmail) || !cleanPhone) {
@@ -2285,7 +2394,7 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
   }
 
   if (!serverAuthManager.isValidOperationalDuty(duty, 'ADMIN')) {
-    const msg = `Invalid operational duty "${duty}". Please select an approved administrative duty from the allowed list.`;
+    const msg = `Invalid administrative position "${duty}". Please select Account Manager, Operations Manager, or Auditor.`;
     logStructuredServerError({
       correlationId,
       endpoint,
@@ -2397,6 +2506,11 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
   const result = serverAuthManager.appointAdministrator(session, {
     ...body,
     operationalResponsibility: duty,
+    position: duty,
+    duty,
+    roleTitle: duty,
+    assignedProgramme,
+    status: requestedStatus,
     firebaseUid: fbProvision.uid,
   });
 
@@ -2434,6 +2548,10 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
   const accessCodeSaltedHash = serverAuthManager.getAccountAccessCodeSaltedHash(acct.id);
   const authStorageFields = serverAuthManager.getAccountAuthStorageFields(acct.id) || {};
 
+  if (acct.status === 'suspended') {
+    await setFirebaseAuthUserDisabled(acct.id, true).catch(() => {});
+  }
+
   const firestoreResult = await withServerTimeout(
     writeFirestoreUserProfile({
       uid: acct.id,
@@ -2443,7 +2561,10 @@ const handleAppointAdminAccount = apiHandler(async (req: Request, res: Response)
       role: 'ADMIN',
       roleTitle: acct.roleTitle,
       duty: acct.duty || acct.roleTitle,
-      status: 'active',
+      position: acct.position || acct.duty || acct.roleTitle,
+      dashboardRoute: acct.dashboardRoute,
+      assignedProgramme: acct.assignedProgramme,
+      status: acct.status === 'suspended' ? 'suspended' : 'active',
       createdBy: session.userId,
       createdAt: acct.createdAt || new Date().toISOString(),
       accessCodeHash: accessCodeSaltedHash,
@@ -2675,33 +2796,57 @@ app.get('/api/auth/accounts', apiHandler(async (req: Request, res: Response) => 
     );
 
     for (const adm of fsAdmins) {
-      if (adm.email && !serverAuthManager.findAccountByIdentifier(String(adm.email))) {
+      const admId = String(adm.uid || adm.id || '');
+      const admEmail = String(adm.email || '');
+      if (
+        admEmail &&
+        !serverAuthManager.isDeletedAccount(admId) &&
+        !serverAuthManager.isDeletedAccount(admEmail) &&
+        !serverAuthManager.findAccountByIdentifier(admEmail)
+      ) {
+        const pos = String(adm.position || adm.duty || adm.roleTitle || 'Account Manager');
         serverAuthManager.syncProvisionedAccount({
-          id: String(adm.uid || adm.id),
-          email: String(adm.email),
-          fullName: String(adm.fullName || adm.email),
+          id: admId,
+          email: admEmail,
+          fullName: String(adm.fullName || admEmail),
           phone: String(adm.phone || ''),
           role: 'ADMIN',
-          roleTitle: String(adm.roleTitle || adm.duty || 'Executive Administrator'),
-          duty: String(adm.duty || adm.roleTitle || 'Executive Administrator'),
+          roleTitle: pos,
+          duty: pos,
+          position: pos,
+          dashboardRoute: adm.dashboardRoute ? String(adm.dashboardRoute) : undefined,
+          assignedProgramme: adm.assignedProgramme ? String(adm.assignedProgramme) : undefined,
           staffCode: adm.staffCode ? String(adm.staffCode) : undefined,
           status: adm.active === false || adm.status === 'suspended' ? 'suspended' : 'active',
+          fromFirestore: true,
         });
       }
     }
 
     for (const stf of fsStaff) {
-      if (stf.email && !serverAuthManager.findAccountByIdentifier(String(stf.email))) {
+      const stfId = String(stf.uid || stf.id || '');
+      const stfEmail = String(stf.email || '');
+      if (
+        stfEmail &&
+        !serverAuthManager.isDeletedAccount(stfId) &&
+        !serverAuthManager.isDeletedAccount(stfEmail) &&
+        !serverAuthManager.findAccountByIdentifier(stfEmail)
+      ) {
+        const pos = String(stf.position || stf.duty || stf.roleTitle || 'Customer Registration Officer');
         serverAuthManager.syncProvisionedAccount({
-          id: String(stf.uid || stf.id),
-          email: String(stf.email),
-          fullName: String(stf.fullName || stf.email),
+          id: stfId,
+          email: stfEmail,
+          fullName: String(stf.fullName || stfEmail),
           phone: String(stf.phone || ''),
           role: 'STAFF',
-          roleTitle: String(stf.roleTitle || stf.duty || 'Operations Officer'),
-          duty: String(stf.duty || stf.roleTitle || 'Operations Officer'),
+          roleTitle: pos,
+          duty: pos,
+          position: pos,
+          dashboardRoute: stf.dashboardRoute ? String(stf.dashboardRoute) : undefined,
+          assignedProgramme: stf.assignedProgramme ? String(stf.assignedProgramme) : undefined,
           staffCode: stf.staffCode ? String(stf.staffCode) : undefined,
           status: stf.active === false || stf.status === 'suspended' ? 'suspended' : 'active',
+          fromFirestore: true,
         });
       }
     }
@@ -2795,6 +2940,14 @@ const handleToggleAccountStatus = apiHandler(async (req: Request, res: Response)
     });
   }
 
+  if (serverAuthManager.isAuditorSession(session)) {
+    return res.status(403).json({
+      success: false,
+      message: 'Read-Only Restriction: Auditors are strictly prohibited from modifying account status.',
+      error: 'Read-Only Restriction: Auditors cannot suspend or modify accounts.',
+    });
+  }
+
   const targetUserId = req.params?.id || req.body?.targetUserId || req.body?.userId || req.body?.id;
   const status = req.body?.status;
 
@@ -2832,6 +2985,9 @@ const handleToggleAccountStatus = apiHandler(async (req: Request, res: Response)
           role: updatedAcc.role === 'ADMIN' ? 'ADMIN' : 'STAFF',
           roleTitle: updatedAcc.roleTitle,
           duty: updatedAcc.duty || updatedAcc.roleTitle,
+          position: updatedAcc.position || updatedAcc.duty || updatedAcc.roleTitle,
+          dashboardRoute: updatedAcc.dashboardRoute,
+          assignedProgramme: updatedAcc.assignedProgramme,
           status: updatedAcc.status === 'active' ? 'active' : 'suspended',
           createdBy: updatedAcc.createdBy || session.email,
           createdAt: updatedAcc.createdAt || new Date().toISOString(),
@@ -2862,8 +3018,198 @@ app.post('/api/super-admin/toggle-status', handleToggleAccountStatus);
 app.patch('/api/super-admin/accounts/:id/status', handleToggleAccountStatus);
 
 /**
+ * Shared handler for permanently deleting an Admin or Staff account from
+ * serverAuthManager, Firebase Authentication, and Firestore (`users`, `admins`, `staff`).
+ */
+const handleDeleteAccount = apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+      error: 'Authentication required.',
+    });
+  }
+
+  if (serverAuthManager.isAuditorSession(session)) {
+    return res.status(403).json({
+      success: false,
+      message: 'Read-Only Restriction: Auditors are strictly prohibited from deleting accounts.',
+      error: 'Read-Only Restriction: Auditors cannot delete accounts.',
+    });
+  }
+
+  const targetUserId = String(
+    req.params?.id || req.body?.targetUserId || req.body?.userId || req.body?.id || ''
+  ).trim();
+  const targetEmail = String(req.body?.email || '').trim().toLowerCase();
+
+  if (!targetUserId && !targetEmail) {
+    return res.status(400).json({
+      success: false,
+      message: 'targetUserId or email is required to delete an account.',
+      error: 'MISSING_REQUIRED_FIELDS',
+    });
+  }
+
+  const callerFbToken = extractCallerFirebaseToken(req);
+
+  const result = serverAuthManager.deleteUserAccount(session, targetUserId || targetEmail, targetEmail);
+  if (!result.success) {
+    return res.status(403).json({
+      success: false,
+      message: result.error || 'Failed to delete account.',
+      error: result.error,
+    });
+  }
+
+  const effectiveUid = result.deletedId || targetUserId;
+  const effectiveEmail = result.deletedEmail || targetEmail;
+
+  await withServerTimeout(
+    deleteFirebaseAccountAndFirestoreProfile(effectiveUid, effectiveEmail, callerFbToken),
+    2500
+  ).catch(() => {});
+
+  return res.status(200).json(
+    buildApiResponse(
+      {
+        message: 'Account permanently deleted from authentication and Firestore records.',
+        data: result,
+        ...result,
+      },
+      true
+    )
+  );
+});
+
+app.post('/api/auth/delete-account', handleDeleteAccount);
+app.post('/api/super-admin/delete-account', handleDeleteAccount);
+app.delete('/api/auth/accounts/:id', handleDeleteAccount);
+
+/**
+ * Shared handler for updating/editing an Admin or Staff account's profile, role, position,
+ * assigned programme, status, permissions, and optional password/access code.
+ */
+const handleUpdateAccount = apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+      error: 'Authentication required.',
+    });
+  }
+
+  if (serverAuthManager.isAuditorSession(session)) {
+    return res.status(403).json({
+      success: false,
+      message: 'Read-Only Restriction: Auditors are strictly prohibited from modifying accounts.',
+      error: 'Read-Only Restriction: Auditors cannot modify accounts.',
+    });
+  }
+
+  const targetUserId = String(
+    req.params?.id || req.body?.targetUserId || req.body?.userId || req.body?.id || ''
+  ).trim();
+
+  if (!targetUserId) {
+    return res.status(400).json({
+      success: false,
+      message: 'targetUserId is required to update an account.',
+      error: 'MISSING_REQUIRED_FIELDS',
+    });
+  }
+
+  const callerFbToken = extractCallerFirebaseToken(req);
+  await ensureAccountHydratedFromFirestore(targetUserId, callerFbToken);
+
+  const body = req.body || {};
+  const result = serverAuthManager.updateUserAccount(session, targetUserId, {
+    fullName: body.fullName,
+    email: body.email,
+    phone: body.phone,
+    role: body.role,
+    position: body.position,
+    duty: body.duty,
+    roleTitle: body.roleTitle,
+    dashboardRoute: body.dashboardRoute,
+    assignedProgramme: body.assignedProgramme,
+    status: body.status,
+    permissions: body.permissions,
+    password: body.password || body.newPassword,
+    accessCode: body.accessCode || body.newAccessCode,
+  });
+
+  if (!result.success || !result.account) {
+    return res.status(400).json({
+      success: false,
+      message: result.error || 'Failed to update account.',
+      error: result.error,
+    });
+  }
+
+  const updatedAcc = result.account;
+  const authStorageFields = serverAuthManager.getAccountAuthStorageFields(updatedAcc.id) || {};
+  const newSecret = String(body.password || body.newPassword || body.accessCode || body.newAccessCode || '').trim();
+
+  // If role tier changed between ADMIN and STAFF, remove the stale document in the previous role collection
+  if (result.previousRole && result.previousRole !== updatedAcc.role) {
+    const staleCollection = updatedAcc.role === 'ADMIN' ? 'staff' : 'admins';
+    await withServerTimeout(deleteFirestoreDocument(staleCollection, updatedAcc.id, callerFbToken), 2500).catch(() => {});
+  }
+
+  await Promise.all([
+    updateFirebaseAuthUserCredentials(updatedAcc.id, {
+      email: updatedAcc.email,
+      displayName: updatedAcc.fullName,
+      ...(newSecret.length >= 6 ? { password: newSecret } : {}),
+      disabled: updatedAcc.status !== 'active',
+    }).catch(() => {}),
+    withServerTimeout(
+      writeFirestoreUserProfile({
+        uid: updatedAcc.id,
+        email: updatedAcc.email,
+        fullName: updatedAcc.fullName,
+        phone: updatedAcc.phone,
+        role: updatedAcc.role === 'ADMIN' ? 'ADMIN' : 'STAFF',
+        roleTitle: updatedAcc.roleTitle,
+        duty: updatedAcc.duty || updatedAcc.roleTitle,
+        position: updatedAcc.position || updatedAcc.duty || updatedAcc.roleTitle,
+        dashboardRoute: updatedAcc.dashboardRoute,
+        assignedProgramme: updatedAcc.assignedProgramme,
+        status: updatedAcc.status === 'active' ? 'active' : 'suspended',
+        createdBy: updatedAcc.createdBy || session.userId,
+        createdAt: updatedAcc.createdAt || new Date().toISOString(),
+        staffCode: updatedAcc.staffCode,
+        permissions: updatedAcc.permissions as unknown as Record<string, boolean>,
+        ...authStorageFields,
+        callerIdToken: callerFbToken,
+      }),
+      3000
+    ).catch(() => {}),
+  ]);
+
+  return res.status(200).json(
+    buildApiResponse(
+      {
+        message: 'Account updated successfully.',
+        data: { account: updatedAcc },
+        account: updatedAcc,
+      },
+      true
+    )
+  );
+});
+
+app.post('/api/auth/update-account', handleUpdateAccount);
+app.post('/api/super-admin/update-account', handleUpdateAccount);
+app.put('/api/auth/accounts/:id', handleUpdateAccount);
+
+
+/**
  * POST /api/financial/transfers/approve
- * Server-side financial approval checking self-approval prohibition.
+ * Server-side financial approval checking self-approval prohibition and Auditor read-only restriction.
  */
 app.post('/api/financial/transfers/approve', apiHandler(async (req: Request, res: Response) => {
   const session = await authenticateRequest(req);
@@ -2872,6 +3218,14 @@ app.post('/api/financial/transfers/approve', apiHandler(async (req: Request, res
       success: false,
       message: 'Authentication required.',
       error: 'Authentication required.',
+    });
+  }
+
+  if (serverAuthManager.isAuditorSession(session)) {
+    return res.status(403).json({
+      success: false,
+      message: 'Read-Only Restriction: Auditors are strictly prohibited from approving financial transfers.',
+      error: 'Read-Only Restriction: Auditors cannot approve financial transfers.',
     });
   }
 
@@ -3005,6 +3359,14 @@ app.post('/api/customers', apiHandler(async (req: Request, res: Response) => {
     });
   }
 
+  if (serverAuthManager.isAuditorSession(session)) {
+    return res.status(403).json({
+      success: false,
+      message: 'Read-Only Restriction: Auditors are strictly prohibited from creating or modifying customer records.',
+      error: 'Read-Only Restriction: Auditors cannot create or edit customer records.',
+    });
+  }
+
   const account = serverAuthManager.findAccountByIdentifier(session.email);
   if (account && account.status !== 'active') {
     return res.status(403).json({
@@ -3044,6 +3406,207 @@ app.post('/api/customers', apiHandler(async (req: Request, res: Response) => {
     data: { customer, customers },
     customer,
     customers,
+  });
+}));
+
+/**
+ * GET /api/operations/collections
+ * Retrieves recorded savings contributions and loan repayments for authorized positions.
+ */
+app.get('/api/operations/collections', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+      error: 'Authentication required.',
+    });
+  }
+
+  const collections = serverAuthManager.getCollectionsList();
+  return res.status(200).json({
+    success: true,
+    message: 'Collection transactions retrieved successfully.',
+    data: { collections },
+    collections,
+  });
+}));
+
+/**
+ * POST /api/operations/collections
+ * Records a savings contribution or loan repayment with duplicate reference & submission prevention.
+ */
+app.post('/api/operations/collections', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+      error: 'Authentication required.',
+    });
+  }
+
+  const result = serverAuthManager.recordCollectionTransaction(session, req.body || {});
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({
+      success: false,
+      message: result.error || 'Failed to record collection transaction.',
+      error: result.error,
+    });
+  }
+
+  return res.status(201).json({
+    success: true,
+    message: 'Collection transaction recorded and confirmed.',
+    data: { record: result.record, collections: serverAuthManager.getCollectionsList() },
+    record: result.record,
+    collections: serverAuthManager.getCollectionsList(),
+  });
+}));
+
+/**
+ * GET /api/operations/loans
+ * Retrieves loan applications and repayment schedules.
+ */
+app.get('/api/operations/loans', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+      error: 'Authentication required.',
+    });
+  }
+
+  const loans = serverAuthManager.getLoanApplicationsList();
+  return res.status(200).json({
+    success: true,
+    message: 'Loan records retrieved successfully.',
+    data: { loans },
+    loans,
+  });
+}));
+
+/**
+ * POST /api/operations/loans
+ * Creates or updates a loan application (Loan Officer, Operations Manager, Account Manager, Super Admin).
+ */
+app.post('/api/operations/loans', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+      error: 'Authentication required.',
+    });
+  }
+
+  const result = serverAuthManager.createLoanApplicationRecord(session, req.body || {});
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({
+      success: false,
+      message: result.error || 'Failed to process loan application.',
+      error: result.error,
+    });
+  }
+
+  return res.status(result.statusCode || 201).json({
+    success: true,
+    message: 'Loan application saved successfully.',
+    data: { record: result.record, loans: serverAuthManager.getLoanApplicationsList() },
+    record: result.record,
+    loans: serverAuthManager.getLoanApplicationsList(),
+  });
+}));
+
+/**
+ * GET /api/operations/reconciliations
+ * Retrieves financial reconciliation records.
+ */
+app.get('/api/operations/reconciliations', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+      error: 'Authentication required.',
+    });
+  }
+
+  const reconciliations = serverAuthManager.getReconciliationsList();
+  return res.status(200).json({
+    success: true,
+    message: 'Reconciliation records retrieved successfully.',
+    data: { reconciliations },
+    reconciliations,
+  });
+}));
+
+/**
+ * POST /api/operations/reconciliations
+ * Submits a financial reconciliation report (Accounts Officer, Account Manager, Operations Manager, Super Admin).
+ */
+app.post('/api/operations/reconciliations', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+      error: 'Authentication required.',
+    });
+  }
+
+  const result = serverAuthManager.submitReconciliationRecord(session, req.body || {});
+  if (!result.success) {
+    return res.status(result.statusCode || 400).json({
+      success: false,
+      message: result.error || 'Failed to submit reconciliation record.',
+      error: result.error,
+    });
+  }
+
+  return res.status(201).json({
+    success: true,
+    message: 'Reconciliation report submitted successfully.',
+    data: { record: result.record, reconciliations: serverAuthManager.getReconciliationsList() },
+    record: result.record,
+    reconciliations: serverAuthManager.getReconciliationsList(),
+  });
+}));
+
+/**
+ * POST /api/financial/reverse
+ * Reverses a confirmed financial transaction. Strictly restricted to Lifetime Super Admin.
+ */
+app.post('/api/financial/reverse', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+      error: 'Authentication required.',
+    });
+  }
+
+  const { transactionId, reason } = req.body || {};
+  const result = serverAuthManager.reverseFinancialTransaction(
+    session,
+    String(transactionId || ''),
+    String(reason || '')
+  );
+  if (!result.success) {
+    return res.status(result.statusCode || 403).json({
+      success: false,
+      message: result.error || 'Transaction reversal denied.',
+      error: result.error,
+    });
+  }
+
+  return res.status(200).json({
+    success: true,
+    message: 'Transaction reversed by Lifetime Super Admin.',
+    data: { record: result.record },
+    record: result.record,
   });
 }));
 

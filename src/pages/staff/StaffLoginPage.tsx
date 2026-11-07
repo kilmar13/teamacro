@@ -22,11 +22,12 @@ import { authService, LoginResult } from '../../services/authService';
 import { normalizeError } from '../../utils/errorNormalizer';
 import { BrandLogo } from '../../components/common/BrandLogo';
 import { ThemeSelector } from '../../components/common/ThemeSelector';
+import { getDedicatedRouteForUser } from '../../utils/roleRouting';
 
 interface StaffLoginPageProps {
   config: BankConfig;
   onNavigate: (route: string) => void;
-  onLoginSuccess: (user: User) => void;
+  onLoginSuccess: (user: User, redirectRoute?: string) => void;
 }
 
 export const StaffLoginPage: React.FC<StaffLoginPageProps> = ({
@@ -95,8 +96,9 @@ export const StaffLoginPage: React.FC<StaffLoginPageProps> = ({
 
       // Login Successful directly without MFA
       if (res.user) {
-        onLoginSuccess(res.user);
-        onNavigate(res.redirectRoute || '/staff');
+        const targetRoute = res.redirectRoute || getDedicatedRouteForUser(res.user);
+        onLoginSuccess(res.user, targetRoute);
+        onNavigate(targetRoute);
       }
     } catch (err: any) {
       setErrorMsg(normalizeError(err, 'Authentication gateway connection failed.'));
@@ -121,8 +123,9 @@ export const StaffLoginPage: React.FC<StaffLoginPageProps> = ({
         return;
       }
 
-      onLoginSuccess(res.user);
-      onNavigate(res.redirectRoute || '/supa-admin');
+      const targetRoute = res.redirectRoute || getDedicatedRouteForUser(res.user);
+      onLoginSuccess(res.user, targetRoute);
+      onNavigate(targetRoute);
     } catch (err: any) {
       setMfaError(normalizeError(err, 'MFA validation failed.'));
     } finally {

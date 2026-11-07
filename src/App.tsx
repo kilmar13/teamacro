@@ -36,11 +36,24 @@ import { AdminPortal } from './pages/admin/AdminPortal';
 import { AdminLoginPage } from './pages/admin/AdminLoginPage';
 import { ProtectedRoute } from './components/auth/ProtectedRoute';
 
+// Dedicated Admin Position Dashboards (3 Positions)
+import { AccountManagerDashboard } from './pages/admin/positions/AccountManagerDashboard';
+import { OperationsManagerDashboard } from './pages/admin/positions/OperationsManagerDashboard';
+import { AuditorDashboard } from './pages/admin/positions/AuditorDashboard';
+
+// Dedicated Staff Position Dashboards (4 Positions)
+import { CustomerRegistrationDashboard } from './pages/staff/positions/CustomerRegistrationDashboard';
+import { PaymentCollectionDashboard } from './pages/staff/positions/PaymentCollectionDashboard';
+import { LoanOfficerDashboard } from './pages/staff/positions/LoanOfficerDashboard';
+import { AccountsOfficerDashboard } from './pages/staff/positions/AccountsOfficerDashboard';
+
 import { ThemeProvider } from './context/ThemeContext';
 import { BankConfig, User } from './types/banking';
 import { ledgerEngine } from './services/ledgerEngine';
 import { authService } from './services/authService';
 import { testFirestoreConnection } from './services/firebase';
+import { getDedicatedRouteForUser, normalizeCanonicalPosition } from './utils/roleRouting';
+import { ShieldAlert, ArrowRight, Lock } from 'lucide-react';
 
 export default function App() {
   const [config, setConfig] = useState<BankConfig>(() => ledgerEngine.getConfig());
@@ -133,6 +146,90 @@ export default function App() {
     handleNavigate('/home');
   };
 
+  // Helper to verify whether currentUser can access a specific dedicated position route
+  const renderPositionRoute = (
+    requiredRoute: string,
+    portalTier: 'ADMIN' | 'STAFF',
+    renderDashboard: () => React.ReactNode
+  ) => {
+    if (!currentUser) {
+      return portalTier === 'ADMIN' ? (
+        <AdminLoginPage
+          config={config}
+          onNavigate={handleNavigate}
+          onLoginSuccess={(user, targetRoute) => {
+            handleLogin(user);
+            handleNavigate(targetRoute || getDedicatedRouteForUser(user));
+          }}
+        />
+      ) : (
+        <StaffLoginPage
+          config={config}
+          onNavigate={handleNavigate}
+          onLoginSuccess={(user, targetRoute) => {
+            handleLogin(user);
+            handleNavigate(targetRoute || getDedicatedRouteForUser(user));
+          }}
+        />
+      );
+    }
+
+    const isSuperAdmin =
+      currentUser.role === 'LIFETIME_SUPER_ADMIN' ||
+      currentUser.role === 'SUPER_ADMIN' ||
+      Boolean(currentUser.isLifetimeSuperAdmin);
+
+    const assignedRoute = getDedicatedRouteForUser(currentUser);
+
+    if (!isSuperAdmin && assignedRoute !== requiredRoute) {
+      const userPos =
+        normalizeCanonicalPosition(currentUser.position || currentUser.roleTitle || currentUser.duty) ||
+        currentUser.roleTitle ||
+        currentUser.role;
+      return (
+        <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6">
+          <div className="max-w-md w-full bg-slate-900 border border-rose-500/40 rounded-2xl p-8 text-center space-y-5 shadow-2xl">
+            <div className="w-14 h-14 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-rose-400 flex items-center justify-center mx-auto">
+              <ShieldAlert className="w-7 h-7" />
+            </div>
+            <div className="space-y-2">
+              <div className="text-[11px] font-mono uppercase tracking-widest text-rose-400">
+                ROLE-BASED URL ACCESS CONTROL
+              </div>
+              <h1 className="text-xl font-extrabold text-white">
+                Unauthorised Position Workspace
+              </h1>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                Your account (<strong className="text-slate-200">{currentUser.fullName}</strong>) is assigned to{' '}
+                <strong className="text-emerald-400">{userPos}</strong> and is strictly bound to{' '}
+                <code className="text-emerald-300 font-mono">{assignedRoute}</code>. Manual navigation to{' '}
+                <code className="text-rose-300 font-mono">{requiredRoute}</code> is blocked.
+              </p>
+            </div>
+            <div className="pt-2 flex flex-col gap-2.5">
+              <button
+                onClick={() => handleNavigate(assignedRoute)}
+                className="w-full py-3 px-4 rounded-xl bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <span>Go to My Assigned Dashboard ({assignedRoute})</span>
+                <ArrowRight className="w-4 h-4" />
+              </button>
+              <button
+                onClick={handleLogout}
+                className="w-full py-2.5 px-4 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer"
+              >
+                <Lock className="w-3.5 h-3.5" />
+                <span>Sign Out & Switch Account</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    return renderDashboard();
+  };
+
   // Render the corresponding route view with strictly separated portals
   const renderView = () => {
     switch (currentRoute) {
@@ -141,11 +238,119 @@ export default function App() {
       case '/home':
         return <HomePage config={config} onNavigate={handleNavigate} />;
 
+      // =======================================================================
+      // DEDICATED ADMIN POSITION ROUTES (3 POSITIONS)
+      // =======================================================================
+      case '/admin/accountmanager':
+        return renderPositionRoute('/admin/accountmanager', 'ADMIN', () => (
+          <AccountManagerDashboard
+            currentUser={currentUser}
+            onLogout={handleLogout}
+            onNavigate={handleNavigate}
+          />
+        ));
+
+      case '/admin/operationsmanager':
+        return renderPositionRoute('/admin/operationsmanager', 'ADMIN', () => (
+          <OperationsManagerDashboard
+            currentUser={currentUser}
+            onLogout={handleLogout}
+            onNavigate={handleNavigate}
+          />
+        ));
+
+      case '/admin/auditor':
+        return renderPositionRoute('/admin/auditor', 'ADMIN', () => (
+          <AuditorDashboard
+            currentUser={currentUser}
+            onLogout={handleLogout}
+            onNavigate={handleNavigate}
+          />
+        ));
+
+      // =======================================================================
+      // DEDICATED STAFF POSITION ROUTES (4 POSITIONS)
+      // =======================================================================
+      case '/staff/customer-registration':
+        return renderPositionRoute('/staff/customer-registration', 'STAFF', () => (
+          <CustomerRegistrationDashboard
+            currentUser={currentUser}
+            onLogout={handleLogout}
+            onNavigate={handleNavigate}
+          />
+        ));
+
+      case '/staff/payment-collection':
+        return renderPositionRoute('/staff/payment-collection', 'STAFF', () => (
+          <PaymentCollectionDashboard
+            currentUser={currentUser}
+            onLogout={handleLogout}
+            onNavigate={handleNavigate}
+          />
+        ));
+
+      case '/staff/loan-officer':
+        return renderPositionRoute('/staff/loan-officer', 'STAFF', () => (
+          <LoanOfficerDashboard
+            currentUser={currentUser}
+            onLogout={handleLogout}
+            onNavigate={handleNavigate}
+          />
+        ));
+
+      case '/staff/accounts-officer':
+        return renderPositionRoute('/staff/accounts-officer', 'STAFF', () => (
+          <AccountsOfficerDashboard
+            currentUser={currentUser}
+            onLogout={handleLogout}
+            onNavigate={handleNavigate}
+          />
+        ));
+
       // Canonical Route 2: Staff Backend & Workspaces
       case '/staff':
       case '/staff/login':
       case '/login':
         if (currentUser) {
+          const dedicated = getDedicatedRouteForUser(currentUser);
+          if (dedicated && dedicated !== '/staff' && currentUser.role !== 'LIFETIME_SUPER_ADMIN') {
+            if (dedicated === '/staff/customer-registration') {
+              return (
+                <CustomerRegistrationDashboard
+                  currentUser={currentUser}
+                  onLogout={handleLogout}
+                  onNavigate={handleNavigate}
+                />
+              );
+            }
+            if (dedicated === '/staff/payment-collection') {
+              return (
+                <PaymentCollectionDashboard
+                  currentUser={currentUser}
+                  onLogout={handleLogout}
+                  onNavigate={handleNavigate}
+                />
+              );
+            }
+            if (dedicated === '/staff/loan-officer') {
+              return (
+                <LoanOfficerDashboard
+                  currentUser={currentUser}
+                  onLogout={handleLogout}
+                  onNavigate={handleNavigate}
+                />
+              );
+            }
+            if (dedicated === '/staff/accounts-officer') {
+              return (
+                <AccountsOfficerDashboard
+                  currentUser={currentUser}
+                  onLogout={handleLogout}
+                  onNavigate={handleNavigate}
+                />
+              );
+            }
+          }
           return (
             <StaffPortal
               config={config}
@@ -159,9 +364,9 @@ export default function App() {
           <StaffLoginPage
             config={config}
             onNavigate={handleNavigate}
-            onLoginSuccess={(user) => {
+            onLoginSuccess={(user, targetRoute) => {
               handleLogin(user);
-              handleNavigate('/staff');
+              handleNavigate(targetRoute || getDedicatedRouteForUser(user));
             }}
           />
         );
@@ -192,26 +397,61 @@ export default function App() {
 
       // Canonical Route 4: Admin Backend (Strictly Separated Authentication)
       case '/admin':
-        if (
-          currentUser &&
-          (currentUser.role === 'ADMIN' || currentUser.role === 'LIFETIME_SUPER_ADMIN')
-        ) {
-          return (
-            <AdminPortal
-              config={config}
-              onNavigate={handleNavigate}
-              currentUser={currentUser}
-              onLogout={handleLogout}
-            />
-          );
+        if (currentUser) {
+          const dedicated = getDedicatedRouteForUser(currentUser);
+          if (dedicated && dedicated !== '/admin' && currentUser.role !== 'LIFETIME_SUPER_ADMIN') {
+            if (dedicated === '/admin/accountmanager') {
+              return (
+                <AccountManagerDashboard
+                  currentUser={currentUser}
+                  onLogout={handleLogout}
+                  onNavigate={handleNavigate}
+                />
+              );
+            }
+            if (dedicated === '/admin/operationsmanager') {
+              return (
+                <OperationsManagerDashboard
+                  currentUser={currentUser}
+                  onLogout={handleLogout}
+                  onNavigate={handleNavigate}
+                />
+              );
+            }
+            if (dedicated === '/admin/auditor') {
+              return (
+                <AuditorDashboard
+                  currentUser={currentUser}
+                  onLogout={handleLogout}
+                  onNavigate={handleNavigate}
+                />
+              );
+            }
+          }
+          if (
+            currentUser.role === 'ADMIN' ||
+            currentUser.role === 'ACCOUNT_MANAGER' ||
+            currentUser.role === 'OPERATIONS_MANAGER' ||
+            currentUser.role === 'AUDITOR' ||
+            currentUser.role === 'LIFETIME_SUPER_ADMIN'
+          ) {
+            return (
+              <AdminPortal
+                config={config}
+                onNavigate={handleNavigate}
+                currentUser={currentUser}
+                onLogout={handleLogout}
+              />
+            );
+          }
         }
         return (
           <AdminLoginPage
             config={config}
             onNavigate={handleNavigate}
-            onLoginSuccess={(user) => {
+            onLoginSuccess={(user, targetRoute) => {
               handleLogin(user);
-              handleNavigate('/admin');
+              handleNavigate(targetRoute || getDedicatedRouteForUser(user));
             }}
           />
         );
@@ -276,8 +516,9 @@ export default function App() {
     currentRoute === '/supa-admin' ||
     currentRoute === '/superadmin' ||
     currentRoute === '/admin' ||
+    currentRoute.startsWith('/admin/') ||
     currentRoute === '/staff' ||
-    currentRoute === '/staff/login' ||
+    currentRoute.startsWith('/staff/') ||
     currentRoute === '/login';
 
   // Prevent search indexing of internal operational and administrative routes

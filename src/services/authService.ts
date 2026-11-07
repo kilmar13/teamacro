@@ -1,6 +1,6 @@
 import { User, StaffRole } from '../types/banking';
 import { ledgerEngine } from './ledgerEngine';
-import { doc, getDoc, setDoc, collection, getDocs } from 'firebase/firestore';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 import {
   createUserWithEmailAndPassword,
   signInWithEmailAndPassword,
@@ -15,10 +15,12 @@ import {
 } from './firebase';
 import { safeApiFetch, getActiveSessionToken, setActiveSessionToken } from '../utils/apiClient';
 import { normalizeError } from '../utils/errorNormalizer';
+import { getDedicatedRouteForUser, normalizeCanonicalPosition } from '../utils/roleRouting';
 
 export interface AuthSessionResponse {
   authenticated: boolean;
   user?: User;
+  redirectRoute?: string;
   sessionToken?: string;
   expiresAt?: number;
   error?: string;
@@ -69,6 +71,7 @@ const SESSION_STORAGE_KEY = 'teamacro_auth_session_token';
 class AuthService {
   private activeToken: string | null = null;
   private cachedUser: User | null = null;
+  private deletedAccountKeys: Set<string> = new Set();
 
   constructor() {
     this.activeToken = getActiveSessionToken();
@@ -152,16 +155,23 @@ class AuthService {
       };
     }
 
+    const redirectRoute = res.redirectRoute || getDedicatedRouteForUser(res.user);
+    const enrichedUser: User = {
+      ...res.user,
+      position: res.user.position || res.user.duty || res.user.roleTitle,
+      dashboardRoute: res.user.dashboardRoute || redirectRoute,
+    };
+
     this.setStoredToken(res.sessionToken);
-    this.cachedUser = res.user;
-    ledgerEngine.setCurrentUser(res.user);
+    this.cachedUser = enrichedUser;
+    ledgerEngine.setCurrentUser(enrichedUser);
 
     return {
       success: true,
       requireMfa: false,
       sessionToken: res.sessionToken,
-      redirectRoute: res.redirectRoute || '/staff',
-      user: res.user,
+      redirectRoute,
+      user: enrichedUser,
       message: res.message || 'Authentication successful.',
     };
   }
@@ -187,7 +197,10 @@ class AuthService {
     if (res.sessionToken) {
       this.setStoredToken(res.sessionToken);
     }
+    const redirectRoute = res.redirectRoute || getDedicatedRouteForUser(res.user);
     if (res.user) {
+      res.user.position = res.user.position || res.user.duty || res.user.roleTitle;
+      res.user.dashboardRoute = res.user.dashboardRoute || redirectRoute;
       this.cachedUser = res.user;
       ledgerEngine.setCurrentUser(res.user);
     }
@@ -195,7 +208,7 @@ class AuthService {
     return {
       success: true,
       sessionToken: res.sessionToken,
-      redirectRoute: res.redirectRoute || '/staff',
+      redirectRoute,
       user: res.user,
       message: normalizeError(res.message, 'MFA verified successfully.'),
     };
@@ -217,11 +230,18 @@ class AuthService {
     }
 
     if (res.user) {
-      this.cachedUser = res.user;
-      ledgerEngine.setCurrentUser(res.user);
+      const redirectRoute = res.redirectRoute || getDedicatedRouteForUser(res.user);
+      const enrichedUser: User = {
+        ...res.user,
+        position: res.user.position || res.user.duty || res.user.roleTitle,
+        dashboardRoute: res.user.dashboardRoute || redirectRoute,
+      };
+      this.cachedUser = enrichedUser;
+      ledgerEngine.setCurrentUser(enrichedUser);
       return {
         authenticated: true,
-        user: res.user,
+        user: enrichedUser,
+        redirectRoute,
         sessionToken: res.sessionToken,
         expiresAt: res.expiresAt,
         message: res.message ? normalizeError(res.message) : undefined,
@@ -830,7 +850,13 @@ class AuthService {
     fullName: string;
     email: string;
     phone: string;
+    position?: string;
+    duty?: string;
+    roleTitle?: string;
     operationalResponsibility?: string;
+    assignedProgramme?: string;
+    permissions?: Record<string, boolean>;
+    status?: 'active' | 'suspended';
     accessCode: string;
     password?: string;
     initialPassword?: string;
@@ -868,6 +894,8 @@ class AuthService {
     }
 
     const account = res.account || res.data?.account;
+    if (payload.email) this.deletedAccountKeys.delete(payload.email.trim().toLowerCase());
+    if (account?.id) this.deletedAccountKeys.delete(String(account.id).trim().toLowerCase());
 
     // Immediately reflect in local ledgerEngine directory for UI rendering
     try {
@@ -884,7 +912,7 @@ class AuthService {
           fullName: payload.fullName,
           email: payload.email,
           phone: payload.phone,
-          operationalResponsibility: payload.operationalResponsibility,
+          operationalResponsibility: payload.position || payload.operationalResponsibility || payload.duty,
           assignedModules: payload.assignedModules,
         },
         actor
@@ -909,8 +937,13 @@ class AuthService {
     fullName: string;
     email: string;
     phone: string;
+    position?: string;
+    duty?: string;
     roleTitle?: string;
     operationalResponsibility?: string;
+    assignedProgramme?: string;
+    permissions?: Record<string, boolean>;
+    status?: 'active' | 'suspended';
     accessCode: string;
     password?: string;
     initialPassword?: string;
@@ -951,6 +984,8 @@ class AuthService {
     }
 
     const account = res.account || res.data?.account;
+    if (payload.email) this.deletedAccountKeys.delete(payload.email.trim().toLowerCase());
+    if (account?.id) this.deletedAccountKeys.delete(String(account.id).trim().toLowerCase());
 
     // Immediately reflect in local ledgerEngine directory for UI rendering
     try {
@@ -960,6 +995,7 @@ class AuthService {
         role: 'LIFETIME_SUPER_ADMIN',
         isLifetimeSuperAdmin: true,
       };
+      const resolvedPos = payload.position || payload.roleTitle || payload.operationalResponsibility || 'Customer Registration Officer';
       ledgerEngine.createStaffUser(
         {
           id: account?.id,
@@ -968,8 +1004,8 @@ class AuthService {
           email: payload.email,
           phone: payload.phone,
           role: 'STAFF',
-          roleTitle: payload.roleTitle || payload.operationalResponsibility || 'Customer Registration Officer',
-          operationalResponsibility: payload.operationalResponsibility || payload.roleTitle || 'Customer Registration Officer',
+          roleTitle: resolvedPos,
+          operationalResponsibility: resolvedPos,
           assignedModules: payload.assignedModules || ['DASHBOARD'],
         },
         actor
@@ -1094,73 +1130,167 @@ class AuthService {
 
     for (const acc of localDirectory) {
       if (acc.email) {
-        byEmail.set(acc.email.toLowerCase(), acc);
+        const emailKey = acc.email.toLowerCase();
+        const idKey = String(acc.id || '').toLowerCase();
+        if (this.deletedAccountKeys.has(emailKey) || (idKey && this.deletedAccountKeys.has(idKey))) {
+          continue;
+        }
+        byEmail.set(emailKey, acc);
       }
     }
     for (const srv of serverAccounts) {
       if (srv.email) {
-        const prev = byEmail.get(srv.email.toLowerCase()) || {};
-        byEmail.set(srv.email.toLowerCase(), {
+        const emailKey = srv.email.toLowerCase();
+        const idKey = String(srv.id || '').toLowerCase();
+        if (this.deletedAccountKeys.has(emailKey) || (idKey && this.deletedAccountKeys.has(idKey))) {
+          byEmail.delete(emailKey);
+          continue;
+        }
+        const prev = byEmail.get(emailKey) || {};
+        const pos = normalizeCanonicalPosition(srv.position || srv.duty || srv.roleTitle, srv.role) || srv.position || srv.duty || srv.roleTitle;
+        byEmail.set(emailKey, {
           ...prev,
           ...srv,
+          position: pos,
+          duty: pos,
+          roleTitle: pos,
+          dashboardRoute: srv.dashboardRoute || getDedicatedRouteForUser(srv),
           staffCode: srv.staffCode || prev.staffCode || `TMC-${srv.id?.slice(-4) || '001'}`,
-          operationalResponsibility: srv.duty || srv.roleTitle || prev.operationalResponsibility,
+          operationalResponsibility: pos || prev.operationalResponsibility,
         });
       }
-    }
-
-    // Also merge directly from Firestore /admins and /staff collections when authenticated
-    try {
-      const [adminsSnap, staffSnap] = await Promise.all([
-        getDocs(collection(db, 'admins')).catch(() => null),
-        getDocs(collection(db, 'staff')).catch(() => null),
-      ]);
-      if (adminsSnap) {
-        adminsSnap.forEach((docSnap) => {
-          const d = docSnap.data();
-          if (d?.email) {
-            const key = String(d.email).toLowerCase();
-            const prev = byEmail.get(key) || {};
-            const id = d.uid || d.id || docSnap.id;
-            byEmail.set(key, {
-              ...prev,
-              ...d,
-              id,
-              role: 'ADMIN',
-              roleTitle: d.roleTitle || d.duty || prev.roleTitle || 'Branch Administrator',
-              operationalResponsibility: d.duty || d.roleTitle || prev.operationalResponsibility,
-              staffCode: d.staffCode || prev.staffCode || `TMC-ADM-${String(id).slice(-4).toUpperCase()}`,
-              status: d.status || (d.active === false ? 'suspended' : 'active'),
-            });
-          }
-        });
-      }
-      if (staffSnap) {
-        staffSnap.forEach((docSnap) => {
-          const d = docSnap.data();
-          if (d?.email) {
-            const key = String(d.email).toLowerCase();
-            const prev = byEmail.get(key) || {};
-            const id = d.uid || d.id || docSnap.id;
-            byEmail.set(key, {
-              ...prev,
-              ...d,
-              id,
-              role: 'STAFF',
-              roleTitle: d.roleTitle || d.duty || prev.roleTitle || 'Operations Staff',
-              operationalResponsibility: d.duty || d.roleTitle || prev.operationalResponsibility,
-              staffCode: d.staffCode || prev.staffCode || `TMC-STF-${String(id).slice(-4).toUpperCase()}`,
-              status: d.status || (d.active === false ? 'suspended' : 'active'),
-            });
-          }
-        });
-      }
-    } catch {
-      // Non-fatal if offline
     }
 
     return Array.from(byEmail.values());
   }
+
+  /**
+   * POST /api/auth/delete-account
+   * Permanently deletes an Admin or Staff account from backend, Firebase Auth, Firestore, and local ledger directory.
+   */
+  public async deleteAccount(
+    targetUserId: string,
+    email?: string
+  ): Promise<{ success: boolean; message?: string; error?: string }> {
+    const cleanId = String(targetUserId || '').trim();
+    const cleanEmail = String(email || '').trim().toLowerCase();
+
+    if (
+      cleanId === 'OWNER_ROOT_3YPAFKI2' ||
+      cleanId === 'LIFETIME_ROOT_SUPER_ADMIN_001' ||
+      cleanEmail === 'eromoseledavidson68@gmail.com'
+    ) {
+      return {
+        success: false,
+        message: 'Security Invariant: The Permanent Lifetime Super Admin account cannot be deleted.',
+        error: 'Security Invariant: The Permanent Lifetime Super Admin account cannot be deleted.',
+      };
+    }
+
+    const res = await safeApiFetch('/api/auth/delete-account', {
+      method: 'POST',
+      body: JSON.stringify({
+        targetUserId: cleanId,
+        email: cleanEmail,
+      }),
+    });
+
+    if (!res.success) {
+      return {
+        success: false,
+        message: res.message || res.error || 'Failed to delete account.',
+        error: res.error || res.message || 'Failed to delete account.',
+      };
+    }
+
+    if (cleanId) this.deletedAccountKeys.add(cleanId.toLowerCase());
+    if (cleanEmail) this.deletedAccountKeys.add(cleanEmail);
+
+    // Immediately remove from client-side local ledger storage
+    ledgerEngine.deleteStaffOrAdminUser(cleanId, cleanEmail);
+
+    return {
+      success: true,
+      message: res.message || 'Account permanently deleted.',
+    };
+  }
+
+  /**
+   * POST /api/auth/update-account
+   * Updates an Admin or Staff account's fullName, email, phone, role, position, assignedProgramme,
+   * status, permissions, and optional new password/accessCode across backend, Firebase Auth, Firestore, and local ledger.
+   */
+  public async updateAccount(
+    targetUserId: string,
+    updates: {
+      fullName?: string;
+      email?: string;
+      phone?: string;
+      role?: 'ADMIN' | 'STAFF' | string;
+      position?: string;
+      duty?: string;
+      roleTitle?: string;
+      operationalResponsibility?: string;
+      dashboardRoute?: string;
+      assignedProgramme?: string;
+      status?: 'active' | 'suspended';
+      permissions?: Record<string, boolean>;
+      password?: string;
+      accessCode?: string;
+    }
+  ): Promise<{ success: boolean; message?: string; error?: string; account?: any }> {
+    const cleanId = String(targetUserId || '').trim();
+    if (!cleanId) {
+      return {
+        success: false,
+        message: 'Target account ID is required.',
+        error: 'Target account ID is required.',
+      };
+    }
+
+    const res = await safeApiFetch('/api/auth/update-account', {
+      method: 'POST',
+      body: JSON.stringify({
+        targetUserId: cleanId,
+        ...updates,
+      }),
+    });
+
+    if (!res.success) {
+      return {
+        success: false,
+        message: res.message || res.error || 'Failed to update account.',
+        error: res.error || res.message || 'Failed to update account.',
+      };
+    }
+
+    const updatedAcc = res.account || res.data?.account || { id: cleanId, ...updates };
+    const effectiveRole = updatedAcc.role === 'ADMIN' ? 'ADMIN' : 'STAFF';
+    const effectivePosition =
+      updatedAcc.position || updatedAcc.duty || updatedAcc.roleTitle || updates.position || updates.duty;
+
+    // Sync client-side local ledger storage
+    ledgerEngine.updateStaffUser(cleanId, {
+      fullName: updatedAcc.fullName,
+      email: updatedAcc.email,
+      phone: updatedAcc.phone,
+      role: effectiveRole as StaffRole,
+      roleTitle: effectivePosition,
+      position: effectivePosition,
+      dashboardRoute: updatedAcc.dashboardRoute,
+      assignedProgramme: updatedAcc.assignedProgramme,
+      operationalResponsibility: effectivePosition,
+      status: updatedAcc.status === 'suspended' ? 'suspended' : 'active',
+      permissions: updatedAcc.permissions,
+    });
+
+    return {
+      success: true,
+      message: res.message || 'Account updated successfully.',
+      account: updatedAcc,
+    };
+  }
+
 
 
   /**
