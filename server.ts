@@ -25,6 +25,7 @@ import {
   updateFirebaseAuthUserCredentials,
   deleteFirestoreDocument,
   writeFirestoreDocument,
+  invalidateFirestoreCache,
 } from './src/server/firebaseAdmin.js';
 import {
   getDedicatedRouteForUser,
@@ -483,11 +484,18 @@ function generateCorrelationId(req?: Request): string {
   return `req_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 8)}`;
 }
 
+let lastAccountsHydratedAt = 0;
+let lastCustomersHydratedAt = 0;
+const HYDRATION_COOLDOWN_MS = 15_000;
+
 function apiHandler(fn: (req: Request, res: Response, next: NextFunction) => Promise<any> | any) {
   return async (req: Request, res: Response, next: NextFunction) => {
     try {
       if (req.headers['x-test-simulate-cold-start'] === 'true') {
         serverAuthManager.simulateServerlessColdStart();
+        invalidateFirestoreCache();
+        lastAccountsHydratedAt = 0;
+        lastCustomersHydratedAt = 0;
       }
       await fn(req, res, next);
     } catch (err: any) {
@@ -999,115 +1007,130 @@ app.post('/api/auth/login', apiHandler(async (req: Request, res: Response) => {
     });
   }
 
-  // Synchronize authoritative ownership and cold-start Firestore accounts before credential check
-  try {
-    const fsOwnership = await withServerTimeout(getFirestoreSystemOwnership(), 1200);
-    if (fsOwnership?.isInitialized && fsOwnership.ownerUserId) {
-      serverAuthManager.syncOwnershipRecord(fsOwnership);
-    }
-  } catch {
-    // Non-fatal if Firestore ownership lookup times out
+  const isColdStartSimulated = req.headers['x-test-simulate-cold-start'] === 'true';
+  const warmCandidate = !isColdStartSimulated
+    ? serverAuthManager.findAccountByIdentifier(cleanIdentifier)
+    : undefined;
+
+  let result: ReturnType<typeof serverAuthManager.authenticateCredentials> = {
+    success: false,
+  };
+
+  // Fast-path: If the account is already warm in memory with a password hash, verify immediately (~5ms)
+  if (warmCandidate && warmCandidate.passwordHash && warmCandidate.passwordSalt) {
+    result = serverAuthManager.authenticateCredentials(cleanIdentifier, cleanPassword, ip);
   }
 
-  // Hydrate account and invitations from Firestore so stateless serverless instances always enforce latest status & credentials
-  try {
-    const [fsUsers, fsAdmins, fsStaff, fsInvitations] = await withServerTimeout(
-      Promise.all([
-        listFirestoreCollection('users'),
-        listFirestoreCollection('admins'),
-        listFirestoreCollection('staff'),
-        listFirestoreInvitations(),
-      ]),
-      1800
-    );
-    for (const inv of fsInvitations) {
-      serverAuthManager.upsertInvitationFromFirestore(inv);
-    }
-    const userMap = new Map<string, Record<string, any>>();
-    for (const u of fsUsers) {
-      const uid = String(u.uid || u.id || '');
-      if (uid) userMap.set(uid, u);
-    }
-    for (const adm of fsAdmins) {
-      const uid = String(adm.uid || adm.id || '');
-      const merged = { ...(userMap.get(uid) || {}), ...adm };
-      if (merged.email && (
-        String(merged.email).toLowerCase() === cleanIdentifier.toLowerCase() ||
-        String(merged.staffCode || '').toLowerCase() === cleanIdentifier.toLowerCase() ||
-        uid === cleanIdentifier
-      )) {
-        const isRootOwner = serverAuthManager.isVerifiedOwner(uid, String(merged.email));
-        const pos = String(merged.position || merged.duty || merged.roleTitle || (isRootOwner ? 'Lifetime Super Admin' : 'Account Manager'));
-        serverAuthManager.syncProvisionedAccount({
-          id: uid,
-          email: String(merged.email),
-          fullName: String(merged.fullName || merged.email),
-          phone: String(merged.phone || ''),
-          role: isRootOwner ? 'LIFETIME_SUPER_ADMIN' : 'ADMIN',
-          roleTitle: pos,
-          duty: pos,
-          position: pos,
-          dashboardRoute: merged.dashboardRoute ? String(merged.dashboardRoute) : undefined,
-          assignedProgramme: merged.assignedProgramme ? String(merged.assignedProgramme) : undefined,
-          staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
-          status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
-          passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
-          passwordSalt: merged.passwordSalt ? String(merged.passwordSalt) : undefined,
-          accessCodeHash: merged.accessCodeHash ? String(merged.accessCodeHash) : undefined,
-          accessCodeSalt: merged.accessCodeSalt ? String(merged.accessCodeSalt) : undefined,
-          accessCodeMasked: merged.accessCodeMasked ? String(merged.accessCodeMasked) : undefined,
-          mfaRequired: typeof merged.mfaRequired === 'boolean' ? merged.mfaRequired : undefined,
-          totpSecret: merged.totpSecret ? String(merged.totpSecret) : undefined,
-          recoveryCodeHashes: Array.isArray(merged.recoveryCodeHashes) ? merged.recoveryCodeHashes : undefined,
-          consumedTotpSteps: Array.isArray(merged.consumedTotpSteps) ? merged.consumedTotpSteps : undefined,
-          securityVersion: typeof merged.securityVersion === 'number' ? merged.securityVersion : undefined,
-          permissions: merged.permissions && typeof merged.permissions === 'object' ? merged.permissions : undefined,
-          fromFirestore: true,
-        });
+  // Hydrate from Firestore only if fast-path did not succeed or cold-start is simulated
+  if (!result.success || !result.account) {
+    try {
+      const fsOwnership = await withServerTimeout(getFirestoreSystemOwnership(), 1200);
+      if (fsOwnership?.isInitialized && fsOwnership.ownerUserId) {
+        serverAuthManager.syncOwnershipRecord(fsOwnership);
       }
+    } catch {
+      // Non-fatal if Firestore ownership lookup times out
     }
-    for (const stf of fsStaff) {
-      const uid = String(stf.uid || stf.id || '');
-      const merged = { ...(userMap.get(uid) || {}), ...stf };
-      if (merged.email && (
-        String(merged.email).toLowerCase() === cleanIdentifier.toLowerCase() ||
-        String(merged.staffCode || '').toLowerCase() === cleanIdentifier.toLowerCase() ||
-        uid === cleanIdentifier
-      )) {
-        const pos = String(merged.position || merged.duty || merged.roleTitle || 'Customer Registration Officer');
-        serverAuthManager.syncProvisionedAccount({
-          id: uid,
-          email: String(merged.email),
-          fullName: String(merged.fullName || merged.email),
-          phone: String(merged.phone || ''),
-          role: 'STAFF',
-          roleTitle: pos,
-          duty: pos,
-          position: pos,
-          dashboardRoute: merged.dashboardRoute ? String(merged.dashboardRoute) : undefined,
-          assignedProgramme: merged.assignedProgramme ? String(merged.assignedProgramme) : undefined,
-          staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
-          status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
-          passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
-          passwordSalt: merged.passwordSalt ? String(merged.passwordSalt) : undefined,
-          accessCodeHash: merged.accessCodeHash ? String(merged.accessCodeHash) : undefined,
-          accessCodeSalt: merged.accessCodeSalt ? String(merged.accessCodeSalt) : undefined,
-          accessCodeMasked: merged.accessCodeMasked ? String(merged.accessCodeMasked) : undefined,
-          mfaRequired: typeof merged.mfaRequired === 'boolean' ? merged.mfaRequired : undefined,
-          totpSecret: merged.totpSecret ? String(merged.totpSecret) : undefined,
-          recoveryCodeHashes: Array.isArray(merged.recoveryCodeHashes) ? merged.recoveryCodeHashes : undefined,
-          consumedTotpSteps: Array.isArray(merged.consumedTotpSteps) ? merged.consumedTotpSteps : undefined,
-          securityVersion: typeof merged.securityVersion === 'number' ? merged.securityVersion : undefined,
-          permissions: merged.permissions && typeof merged.permissions === 'object' ? merged.permissions : undefined,
-          fromFirestore: true,
-        });
-      }
-    }
-  } catch {
-    // Non-fatal if cold-start collection list times out
-  }
 
-  let result = serverAuthManager.authenticateCredentials(cleanIdentifier, cleanPassword, ip);
+    try {
+      const [fsUsers, fsAdmins, fsStaff, fsInvitations] = await withServerTimeout(
+        Promise.all([
+          listFirestoreCollection('users'),
+          listFirestoreCollection('admins'),
+          listFirestoreCollection('staff'),
+          listFirestoreInvitations(),
+        ]),
+        1800
+      );
+      for (const inv of fsInvitations) {
+        serverAuthManager.upsertInvitationFromFirestore(inv);
+      }
+      const userMap = new Map<string, Record<string, any>>();
+      for (const u of fsUsers) {
+        const uid = String(u.uid || u.id || '');
+        if (uid) userMap.set(uid, u);
+      }
+      for (const adm of fsAdmins) {
+        const uid = String(adm.uid || adm.id || '');
+        const merged = { ...(userMap.get(uid) || {}), ...adm };
+        if (merged.email && (
+          String(merged.email).toLowerCase() === cleanIdentifier.toLowerCase() ||
+          String(merged.staffCode || '').toLowerCase() === cleanIdentifier.toLowerCase() ||
+          uid === cleanIdentifier
+        )) {
+          const isRootOwner = serverAuthManager.isVerifiedOwner(uid, String(merged.email));
+          const pos = String(merged.position || merged.duty || merged.roleTitle || (isRootOwner ? 'Lifetime Super Admin' : 'Account Manager'));
+          serverAuthManager.syncProvisionedAccount({
+            id: uid,
+            email: String(merged.email),
+            fullName: String(merged.fullName || merged.email),
+            phone: String(merged.phone || ''),
+            role: isRootOwner ? 'LIFETIME_SUPER_ADMIN' : 'ADMIN',
+            roleTitle: pos,
+            duty: pos,
+            position: pos,
+            dashboardRoute: merged.dashboardRoute ? String(merged.dashboardRoute) : undefined,
+            assignedProgramme: merged.assignedProgramme ? String(merged.assignedProgramme) : undefined,
+            staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
+            status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
+            passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
+            passwordSalt: merged.passwordSalt ? String(merged.passwordSalt) : undefined,
+            accessCodeHash: merged.accessCodeHash ? String(merged.accessCodeHash) : undefined,
+            accessCodeSalt: merged.accessCodeSalt ? String(merged.accessCodeSalt) : undefined,
+            accessCodeMasked: merged.accessCodeMasked ? String(merged.accessCodeMasked) : undefined,
+            mfaRequired: typeof merged.mfaRequired === 'boolean' ? merged.mfaRequired : undefined,
+            totpSecret: merged.totpSecret ? String(merged.totpSecret) : undefined,
+            recoveryCodeHashes: Array.isArray(merged.recoveryCodeHashes) ? merged.recoveryCodeHashes : undefined,
+            consumedTotpSteps: Array.isArray(merged.consumedTotpSteps) ? merged.consumedTotpSteps : undefined,
+            securityVersion: typeof merged.securityVersion === 'number' ? merged.securityVersion : undefined,
+            permissions: merged.permissions && typeof merged.permissions === 'object' ? merged.permissions : undefined,
+            fromFirestore: true,
+          });
+        }
+      }
+      for (const stf of fsStaff) {
+        const uid = String(stf.uid || stf.id || '');
+        const merged = { ...(userMap.get(uid) || {}), ...stf };
+        if (merged.email && (
+          String(merged.email).toLowerCase() === cleanIdentifier.toLowerCase() ||
+          String(merged.staffCode || '').toLowerCase() === cleanIdentifier.toLowerCase() ||
+          uid === cleanIdentifier
+        )) {
+          const pos = String(merged.position || merged.duty || merged.roleTitle || 'Customer Registration Officer');
+          serverAuthManager.syncProvisionedAccount({
+            id: uid,
+            email: String(merged.email),
+            fullName: String(merged.fullName || merged.email),
+            phone: String(merged.phone || ''),
+            role: 'STAFF',
+            roleTitle: pos,
+            duty: pos,
+            position: pos,
+            dashboardRoute: merged.dashboardRoute ? String(merged.dashboardRoute) : undefined,
+            assignedProgramme: merged.assignedProgramme ? String(merged.assignedProgramme) : undefined,
+            staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
+            status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
+            passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
+            passwordSalt: merged.passwordSalt ? String(merged.passwordSalt) : undefined,
+            accessCodeHash: merged.accessCodeHash ? String(merged.accessCodeHash) : undefined,
+            accessCodeSalt: merged.accessCodeSalt ? String(merged.accessCodeSalt) : undefined,
+            accessCodeMasked: merged.accessCodeMasked ? String(merged.accessCodeMasked) : undefined,
+            mfaRequired: typeof merged.mfaRequired === 'boolean' ? merged.mfaRequired : undefined,
+            totpSecret: merged.totpSecret ? String(merged.totpSecret) : undefined,
+            recoveryCodeHashes: Array.isArray(merged.recoveryCodeHashes) ? merged.recoveryCodeHashes : undefined,
+            consumedTotpSteps: Array.isArray(merged.consumedTotpSteps) ? merged.consumedTotpSteps : undefined,
+            securityVersion: typeof merged.securityVersion === 'number' ? merged.securityVersion : undefined,
+            permissions: merged.permissions && typeof merged.permissions === 'object' ? merged.permissions : undefined,
+            fromFirestore: true,
+          });
+        }
+      }
+    } catch {
+      // Non-fatal if cold-start collection list times out
+    }
+
+    result = serverAuthManager.authenticateCredentials(cleanIdentifier, cleanPassword, ip);
+  }
 
   // If account was not found or password hash was not yet synced in local serverless memory (e.g. Vercel cold start)
   // and identifier is an email, verify against Firebase Authentication + Cloud Firestore authoritative records.
@@ -2785,74 +2808,81 @@ app.get('/api/auth/accounts', apiHandler(async (req: Request, res: Response) => 
   }
 
   const callerFbToken = extractCallerFirebaseToken(req);
+  const forceRefresh =
+    req.query.refresh === 'true' ||
+    req.headers['x-test-simulate-cold-start'] === 'true' ||
+    Date.now() - lastAccountsHydratedAt > HYDRATION_COOLDOWN_MS;
 
-  // Hydrate any Admin/Staff profiles stored in Firestore so cold-started serverless instances return the full directory
-  try {
-    const [fsAdmins, fsStaff] = await withServerTimeout(
-      Promise.all([
-        listFirestoreCollection('admins', callerFbToken),
-        listFirestoreCollection('staff', callerFbToken),
-      ]),
-      1800
-    );
+  // Hydrate any Admin/Staff profiles stored in Firestore when cold-started or TTL expired
+  if (forceRefresh) {
+    try {
+      const [fsAdmins, fsStaff] = await withServerTimeout(
+        Promise.all([
+          listFirestoreCollection('admins', callerFbToken),
+          listFirestoreCollection('staff', callerFbToken),
+        ]),
+        1800
+      );
 
-    for (const adm of fsAdmins) {
-      const admId = String(adm.uid || adm.id || '');
-      const admEmail = String(adm.email || '');
-      if (
-        admEmail &&
-        !serverAuthManager.isDeletedAccount(admId) &&
-        !serverAuthManager.isDeletedAccount(admEmail) &&
-        !serverAuthManager.findAccountByIdentifier(admEmail)
-      ) {
-        const pos = String(adm.position || adm.duty || adm.roleTitle || 'Account Manager');
-        serverAuthManager.syncProvisionedAccount({
-          id: admId,
-          email: admEmail,
-          fullName: String(adm.fullName || admEmail),
-          phone: String(adm.phone || ''),
-          role: 'ADMIN',
-          roleTitle: pos,
-          duty: pos,
-          position: pos,
-          dashboardRoute: adm.dashboardRoute ? String(adm.dashboardRoute) : undefined,
-          assignedProgramme: adm.assignedProgramme ? String(adm.assignedProgramme) : undefined,
-          staffCode: adm.staffCode ? String(adm.staffCode) : undefined,
-          status: adm.active === false || adm.status === 'suspended' ? 'suspended' : 'active',
-          fromFirestore: true,
-        });
+      for (const adm of fsAdmins) {
+        const admId = String(adm.uid || adm.id || '');
+        const admEmail = String(adm.email || '');
+        if (
+          admEmail &&
+          !serverAuthManager.isDeletedAccount(admId) &&
+          !serverAuthManager.isDeletedAccount(admEmail) &&
+          !serverAuthManager.findAccountByIdentifier(admEmail)
+        ) {
+          const pos = String(adm.position || adm.duty || adm.roleTitle || 'Account Manager');
+          serverAuthManager.syncProvisionedAccount({
+            id: admId,
+            email: admEmail,
+            fullName: String(adm.fullName || admEmail),
+            phone: String(adm.phone || ''),
+            role: 'ADMIN',
+            roleTitle: pos,
+            duty: pos,
+            position: pos,
+            dashboardRoute: adm.dashboardRoute ? String(adm.dashboardRoute) : undefined,
+            assignedProgramme: adm.assignedProgramme ? String(adm.assignedProgramme) : undefined,
+            staffCode: adm.staffCode ? String(adm.staffCode) : undefined,
+            status: adm.active === false || adm.status === 'suspended' ? 'suspended' : 'active',
+            fromFirestore: true,
+          });
+        }
       }
-    }
 
-    for (const stf of fsStaff) {
-      const stfId = String(stf.uid || stf.id || '');
-      const stfEmail = String(stf.email || '');
-      if (
-        stfEmail &&
-        !serverAuthManager.isDeletedAccount(stfId) &&
-        !serverAuthManager.isDeletedAccount(stfEmail) &&
-        !serverAuthManager.findAccountByIdentifier(stfEmail)
-      ) {
-        const pos = String(stf.position || stf.duty || stf.roleTitle || 'Customer Registration Officer');
-        serverAuthManager.syncProvisionedAccount({
-          id: stfId,
-          email: stfEmail,
-          fullName: String(stf.fullName || stfEmail),
-          phone: String(stf.phone || ''),
-          role: 'STAFF',
-          roleTitle: pos,
-          duty: pos,
-          position: pos,
-          dashboardRoute: stf.dashboardRoute ? String(stf.dashboardRoute) : undefined,
-          assignedProgramme: stf.assignedProgramme ? String(stf.assignedProgramme) : undefined,
-          staffCode: stf.staffCode ? String(stf.staffCode) : undefined,
-          status: stf.active === false || stf.status === 'suspended' ? 'suspended' : 'active',
-          fromFirestore: true,
-        });
+      for (const stf of fsStaff) {
+        const stfId = String(stf.uid || stf.id || '');
+        const stfEmail = String(stf.email || '');
+        if (
+          stfEmail &&
+          !serverAuthManager.isDeletedAccount(stfId) &&
+          !serverAuthManager.isDeletedAccount(stfEmail) &&
+          !serverAuthManager.findAccountByIdentifier(stfEmail)
+        ) {
+          const pos = String(stf.position || stf.duty || stf.roleTitle || 'Customer Registration Officer');
+          serverAuthManager.syncProvisionedAccount({
+            id: stfId,
+            email: stfEmail,
+            fullName: String(stf.fullName || stfEmail),
+            phone: String(stf.phone || ''),
+            role: 'STAFF',
+            roleTitle: pos,
+            duty: pos,
+            position: pos,
+            dashboardRoute: stf.dashboardRoute ? String(stf.dashboardRoute) : undefined,
+            assignedProgramme: stf.assignedProgramme ? String(stf.assignedProgramme) : undefined,
+            staffCode: stf.staffCode ? String(stf.staffCode) : undefined,
+            status: stf.active === false || stf.status === 'suspended' ? 'suspended' : 'active',
+            fromFirestore: true,
+          });
+        }
       }
+      lastAccountsHydratedAt = Date.now();
+    } catch {
+      // Non-fatal if Firestore list times out
     }
-  } catch {
-    // Non-fatal if Firestore list times out
   }
 
   const accounts = serverAuthManager.getPublicAccountsList(session);
@@ -3318,22 +3348,30 @@ app.get('/api/customers', apiHandler(async (req: Request, res: Response) => {
       ? req.headers.authorization.substring(7).trim()
       : undefined;
 
-  try {
-    const fsCustomers = await withServerTimeout(
-      listFirestoreCollection('customers', callerFbToken),
-      1200
-    );
-    for (const data of fsCustomers) {
-      if (data && (data.fullName || data.phone)) {
-        try {
-          serverAuthManager.saveCustomerRecord(data, undefined, { fromFirestoreSync: true });
-        } catch {
-          // Ignore malformed records
+  const forceCustomerRefresh =
+    req.query.refresh === 'true' ||
+    req.headers['x-test-simulate-cold-start'] === 'true' ||
+    Date.now() - lastCustomersHydratedAt > HYDRATION_COOLDOWN_MS;
+
+  if (forceCustomerRefresh) {
+    try {
+      const fsCustomers = await withServerTimeout(
+        listFirestoreCollection('customers', callerFbToken),
+        1200
+      );
+      for (const data of fsCustomers) {
+        if (data && (data.fullName || data.phone)) {
+          try {
+            serverAuthManager.saveCustomerRecord(data, undefined, { fromFirestoreSync: true });
+          } catch {
+            // Ignore malformed records
+          }
         }
       }
+      lastCustomersHydratedAt = Date.now();
+    } catch {
+      // Non-fatal if Firestore read is unavailable or times out
     }
-  } catch {
-    // Non-fatal if Firestore read is unavailable or times out
   }
 
   const customers = serverAuthManager.getCustomersList();
@@ -3516,6 +3554,7 @@ const handleSaveCustomerRequest = apiHandler(async (req: Request, res: Response)
 
   const mergedPayload = targetId ? { ...payload, id: targetId } : payload;
   const customer = serverAuthManager.saveCustomerRecord(mergedPayload, session);
+  lastCustomersHydratedAt = Date.now();
 
   // Authoritatively persist to Cloud Firestore /customers/{customer.id}
   await withServerTimeout(

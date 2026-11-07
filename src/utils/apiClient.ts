@@ -10,6 +10,9 @@
  */
 
 import { normalizeError } from './errorNormalizer';
+import { auth } from '../services/firebase';
+
+let cachedFbToken: { uid: string; token: string; expiresAt: number } | null = null;
 
 export interface ApiResponse<T = any> {
   success: boolean;
@@ -136,14 +139,20 @@ export async function safeApiFetch<T = any>(
   }
 
   let fbIdToken: string | null = null;
-  if (typeof window !== 'undefined') {
-    try {
-      const { auth } = await import('../services/firebase');
-      if (auth && auth.currentUser) {
+  if (typeof window !== 'undefined' && auth?.currentUser) {
+    const currentUid = auth.currentUser.uid;
+    const now = Date.now();
+    if (cachedFbToken && cachedFbToken.uid === currentUid && now < cachedFbToken.expiresAt) {
+      fbIdToken = cachedFbToken.token;
+    } else {
+      try {
         fbIdToken = await auth.currentUser.getIdToken(false);
+        if (fbIdToken) {
+          cachedFbToken = { uid: currentUid, token: fbIdToken, expiresAt: now + 60_000 };
+        }
+      } catch {
+        // Firebase auth offline or not initialized in this environment
       }
-    } catch {
-      // Firebase auth offline or not initialized in this environment
     }
   }
 

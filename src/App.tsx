@@ -4,48 +4,97 @@
  * A Smarter Way to Manage Savings, Contributions and Loans
  */
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, Suspense, lazy } from 'react';
 import { Header } from './components/layout/Header';
 import { Footer } from './components/layout/Footer';
 import { AnnouncementBanner } from './components/layout/AnnouncementBanner';
 
-// Public Pages
+// Primary Landing & Authentication Pages (Eagerly loaded for instant first paint)
 import { HomePage } from './pages/public/HomePage';
-import { PersonalBankingPage } from './pages/public/PersonalBankingPage';
-import { BusinessBankingPage } from './pages/public/BusinessBankingPage';
-import { CorporateBankingPage } from './pages/public/CorporateBankingPage';
-import { DigitalBankingPage } from './pages/public/DigitalBankingPage';
-import { OpenAccountPage } from './pages/public/OpenAccountPage';
-import { AboutPage } from './pages/public/AboutPage';
-import { BranchesPage } from './pages/public/BranchesPage';
-import { TariffsPage } from './pages/public/TariffsPage';
-import { SecurityPage } from './pages/public/SecurityPage';
-import { ContactPage } from './pages/public/ContactPage';
-import { GovernancePage } from './pages/public/GovernancePage';
-import { HelpCenterPage } from './pages/public/HelpCenterPage';
-import { PrivacyPage, TermsPage } from './pages/public/PrivacyPage';
-
-// Portal Applications
-import { CustomerPortal } from './pages/customer/CustomerPortal';
-import { StaffPortal } from './pages/staff/StaffPortal';
 import { StaffLoginPage } from './pages/staff/StaffLoginPage';
-import { SuperAdminPortal } from './pages/admin/SuperAdminPortal';
 import { SuperAdminLoginPage } from './pages/admin/SuperAdminLoginPage';
 import { SuperAdminSetupPage } from './pages/admin/SuperAdminSetupPage';
-import { AdminPortal } from './pages/admin/AdminPortal';
 import { AdminLoginPage } from './pages/admin/AdminLoginPage';
 import { ProtectedRoute } from './components/auth/ProtectedRoute';
 
-// Dedicated Admin Position Dashboards (3 Positions)
-import { AccountManagerDashboard } from './pages/admin/positions/AccountManagerDashboard';
-import { OperationsManagerDashboard } from './pages/admin/positions/OperationsManagerDashboard';
-import { AuditorDashboard } from './pages/admin/positions/AuditorDashboard';
+// Code-Split Public Pages (Loaded on demand)
+const PersonalBankingPage = lazy(() =>
+  import('./pages/public/PersonalBankingPage').then((m) => ({ default: m.PersonalBankingPage }))
+);
+const BusinessBankingPage = lazy(() =>
+  import('./pages/public/BusinessBankingPage').then((m) => ({ default: m.BusinessBankingPage }))
+);
+const CorporateBankingPage = lazy(() =>
+  import('./pages/public/CorporateBankingPage').then((m) => ({ default: m.CorporateBankingPage }))
+);
+const DigitalBankingPage = lazy(() =>
+  import('./pages/public/DigitalBankingPage').then((m) => ({ default: m.DigitalBankingPage }))
+);
+const OpenAccountPage = lazy(() =>
+  import('./pages/public/OpenAccountPage').then((m) => ({ default: m.OpenAccountPage }))
+);
+const AboutPage = lazy(() =>
+  import('./pages/public/AboutPage').then((m) => ({ default: m.AboutPage }))
+);
+const BranchesPage = lazy(() =>
+  import('./pages/public/BranchesPage').then((m) => ({ default: m.BranchesPage }))
+);
+const TariffsPage = lazy(() =>
+  import('./pages/public/TariffsPage').then((m) => ({ default: m.TariffsPage }))
+);
+const SecurityPage = lazy(() =>
+  import('./pages/public/SecurityPage').then((m) => ({ default: m.SecurityPage }))
+);
+const ContactPage = lazy(() =>
+  import('./pages/public/ContactPage').then((m) => ({ default: m.ContactPage }))
+);
+const GovernancePage = lazy(() =>
+  import('./pages/public/GovernancePage').then((m) => ({ default: m.GovernancePage }))
+);
+const HelpCenterPage = lazy(() =>
+  import('./pages/public/HelpCenterPage').then((m) => ({ default: m.HelpCenterPage }))
+);
+const PrivacyPage = lazy(() =>
+  import('./pages/public/PrivacyPage').then((m) => ({ default: m.PrivacyPage }))
+);
+const TermsPage = lazy(() =>
+  import('./pages/public/PrivacyPage').then((m) => ({ default: m.TermsPage }))
+);
 
-// Dedicated Staff Position Dashboards (4 Positions)
-import { CustomerRegistrationDashboard } from './pages/staff/positions/CustomerRegistrationDashboard';
-import { PaymentCollectionDashboard } from './pages/staff/positions/PaymentCollectionDashboard';
-import { LoanOfficerDashboard } from './pages/staff/positions/LoanOfficerDashboard';
-import { AccountsOfficerDashboard } from './pages/staff/positions/AccountsOfficerDashboard';
+// Code-Split Portal Applications & Dedicated Position Dashboards
+const CustomerPortal = lazy(() =>
+  import('./pages/customer/CustomerPortal').then((m) => ({ default: m.CustomerPortal }))
+);
+const StaffPortal = lazy(() =>
+  import('./pages/staff/StaffPortal').then((m) => ({ default: m.StaffPortal }))
+);
+const SuperAdminPortal = lazy(() =>
+  import('./pages/admin/SuperAdminPortal').then((m) => ({ default: m.SuperAdminPortal }))
+);
+const AdminPortal = lazy(() =>
+  import('./pages/admin/AdminPortal').then((m) => ({ default: m.AdminPortal }))
+);
+const AccountManagerDashboard = lazy(() =>
+  import('./pages/admin/positions/AccountManagerDashboard').then((m) => ({ default: m.AccountManagerDashboard }))
+);
+const OperationsManagerDashboard = lazy(() =>
+  import('./pages/admin/positions/OperationsManagerDashboard').then((m) => ({ default: m.OperationsManagerDashboard }))
+);
+const AuditorDashboard = lazy(() =>
+  import('./pages/admin/positions/AuditorDashboard').then((m) => ({ default: m.AuditorDashboard }))
+);
+const CustomerRegistrationDashboard = lazy(() =>
+  import('./pages/staff/positions/CustomerRegistrationDashboard').then((m) => ({ default: m.CustomerRegistrationDashboard }))
+);
+const PaymentCollectionDashboard = lazy(() =>
+  import('./pages/staff/positions/PaymentCollectionDashboard').then((m) => ({ default: m.PaymentCollectionDashboard }))
+);
+const LoanOfficerDashboard = lazy(() =>
+  import('./pages/staff/positions/LoanOfficerDashboard').then((m) => ({ default: m.LoanOfficerDashboard }))
+);
+const AccountsOfficerDashboard = lazy(() =>
+  import('./pages/staff/positions/AccountsOfficerDashboard').then((m) => ({ default: m.AccountsOfficerDashboard }))
+);
 
 import { ThemeProvider } from './context/ThemeContext';
 import { BankConfig, User } from './types/banking';
@@ -85,9 +134,11 @@ export default function App() {
 
   const [currentRoute, setCurrentRoute] = useState<string>(getInitialRoute);
 
-  // Sync hash and pathname routing & test Firestore connection on boot
+  // Sync hash and pathname routing & defer Firestore connection check so initial paint is unblocked
   useEffect(() => {
-    testFirestoreConnection();
+    const fsTimer = setTimeout(() => {
+      testFirestoreConnection();
+    }, 1500);
 
     const handleLocationChange = () => {
       const hash = window.location.hash.replace('#', '');
@@ -117,6 +168,7 @@ export default function App() {
     window.addEventListener('hashchange', handleLocationChange);
     window.addEventListener('popstate', handleLocationChange);
     return () => {
+      clearTimeout(fsTimer);
       window.removeEventListener('hashchange', handleLocationChange);
       window.removeEventListener('popstate', handleLocationChange);
     };
@@ -552,7 +604,17 @@ export default function App() {
         )}
 
         {/* Main Body */}
-        <main className="flex-1">{renderView()}</main>
+        <main className="flex-1">
+          <Suspense
+            fallback={
+              <div className="min-h-[60vh] flex items-center justify-center">
+                <div className="w-8 h-8 rounded-full border-2 border-[#1E5BD8] border-t-transparent animate-spin" />
+              </div>
+            }
+          >
+            {renderView()}
+          </Suspense>
+        </main>
 
         {/* Footer */}
         {!isStandaloneManagement && <Footer config={config} onNavigate={handleNavigate} />}

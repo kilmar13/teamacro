@@ -1402,6 +1402,62 @@ function fromFirestoreRestFields(fields?: Record<string, any>): Record<string, a
   return result;
 }
 
+// ============================================================================
+// HIGH-SPEED IN-MEMORY WRITE-THROUGH FIRESTORE READ CACHE
+// Eliminates redundant 300ms-1500ms network round-trips on repeated requests
+// while immediately invalidating on any write, update, or deletion.
+// ============================================================================
+const COLLECTION_CACHE_TTL_MS = 20_000;
+const DOCUMENT_CACHE_TTL_MS = 15_000;
+const OWNERSHIP_CACHE_TTL_MS = 60_000;
+
+const collectionListCache = new Map<
+  string,
+  { expiresAt: number; docs: Array<Record<string, any>>; inflight?: Promise<Array<Record<string, any>>> }
+>();
+
+const documentReadCache = new Map<
+  string,
+  { expiresAt: number; doc: Record<string, any> | null; inflight?: Promise<Record<string, any> | null> }
+>();
+
+let cachedSystemOwnership: {
+  expiresAt: number;
+  data: {
+    isInitialized: boolean;
+    lockdownEnforced: boolean;
+    ownerUserId: string | null;
+    ownerEmail: string | null;
+    ownerFullName: string | null;
+    ownerPhone?: string | null;
+    establishedAt: string | null;
+    setupVersion: number;
+  } | null;
+  inflight?: Promise<any>;
+} | null = null;
+
+export function invalidateFirestoreCache(collectionName?: string, docId?: string): void {
+  if (!collectionName) {
+    collectionListCache.clear();
+    documentReadCache.clear();
+    cachedSystemOwnership = null;
+    return;
+  }
+  collectionListCache.delete(collectionName);
+  if (docId) {
+    documentReadCache.delete(`${collectionName}/${docId}`);
+  } else {
+    for (const key of Array.from(documentReadCache.keys())) {
+      if (key.startsWith(`${collectionName}/`)) {
+        documentReadCache.delete(key);
+      }
+    }
+  }
+  if (collectionName === 'system_ownership' || collectionName === 'systemSettings') {
+    cachedSystemOwnership = null;
+  }
+}
+
 /**
  * Writes the corresponding user profile to Cloud Firestore (`users/{uid}` and `admins/{uid}` or `staff/{uid}`).
  * Stores only salted hashes of access codes — never plaintext passwords or access codes.
@@ -1509,6 +1565,10 @@ export async function writeFirestoreUserProfile(
     ...sharedAuthFields,
   };
 
+  // Invalidate cached collection lists and update document cache immediately
+  invalidateFirestoreCache('users', profile.uid);
+  invalidateFirestoreCache(roleCollection, profile.uid);
+
   // 1. Primary Path: Firebase Admin Firestore SDK
   if (db) {
     try {
@@ -1610,6 +1670,7 @@ export async function writeFirestoreDocument(
   data: Record<string, any>,
   bearerToken?: string
 ): Promise<boolean> {
+  invalidateFirestoreCache(collectionName, docId);
   const { db, config } = getFirebaseAdminServices();
 
   if (db) {
@@ -1656,106 +1717,166 @@ export async function writeFirestoreDocument(
 }
 
 /**
- * Reads a document from Cloud Firestore via Admin SDK or REST API.
+ * Reads a document from Cloud Firestore via Admin SDK or REST API (with fast TTL cache & request coalescing).
  */
 export async function readFirestoreDocument(
   collectionName: string,
   docId: string,
   bearerToken?: string
 ): Promise<Record<string, any> | null> {
-  const { db, config } = getFirebaseAdminServices();
+  const cacheKey = `${collectionName}/${docId}`;
+  const now = Date.now();
+  const cached = documentReadCache.get(cacheKey);
+  if (cached && now < cached.expiresAt) {
+    return cached.doc;
+  }
+  if (cached?.inflight) {
+    return cached.inflight;
+  }
 
-  if (db) {
+  const fetchPromise = (async (): Promise<Record<string, any> | null> => {
+    const { db, config } = getFirebaseAdminServices();
+
+    if (db) {
+      try {
+        const snap = await withTimeout(db.collection(collectionName).doc(docId).get(), 2500);
+        if (snap.exists) {
+          const doc = { id: snap.id, ...(snap.data() || {}) };
+          documentReadCache.set(cacheKey, { expiresAt: Date.now() + DOCUMENT_CACHE_TTL_MS, doc });
+          return doc;
+        }
+        documentReadCache.set(cacheKey, { expiresAt: Date.now() + DOCUMENT_CACHE_TTL_MS, doc: null });
+        return null;
+      } catch {
+        // Fall through to REST API
+      }
+    }
+
+    const adminToken = await getServiceAccountAccessToken(config);
+    const effectiveToken = adminToken || bearerToken;
+
     try {
-      const snap = await withTimeout(db.collection(collectionName).doc(docId).get(), 2500);
-      if (snap.exists) {
-        return { id: snap.id, ...(snap.data() || {}) };
+      const url = `https://firestore.googleapis.com/v1/projects/${config.projectId}/databases/${config.firestoreDatabaseId}/documents/${encodeURIComponent(collectionName)}/${encodeURIComponent(docId)}`;
+      const headers: Record<string, string> = {};
+      if (effectiveToken) {
+        headers['Authorization'] = `Bearer ${effectiveToken}`;
+      }
+      const res = await withTimeout(fetch(url, { headers }), 2500);
+      if (res.ok) {
+        const data: any = await res.json();
+        if (data?.fields) {
+          const doc = { id: docId, ...fromFirestoreRestFields(data.fields) };
+          documentReadCache.set(cacheKey, { expiresAt: Date.now() + DOCUMENT_CACHE_TTL_MS, doc });
+          return doc;
+        }
+      } else if (res.status === 404) {
+        documentReadCache.set(cacheKey, { expiresAt: Date.now() + DOCUMENT_CACHE_TTL_MS, doc: null });
+        return null;
       }
     } catch {
-      // Fall through to REST API
+      // Ignore read timeout
     }
-  }
 
-  const adminToken = await getServiceAccountAccessToken(config);
-  const effectiveToken = adminToken || bearerToken;
+    documentReadCache.delete(cacheKey);
+    return null;
+  })();
 
-  try {
-    const url = `https://firestore.googleapis.com/v1/projects/${config.projectId}/databases/${config.firestoreDatabaseId}/documents/${encodeURIComponent(collectionName)}/${encodeURIComponent(docId)}`;
-    const headers: Record<string, string> = {};
-    if (effectiveToken) {
-      headers['Authorization'] = `Bearer ${effectiveToken}`;
-    }
-    const res = await withTimeout(fetch(url, { headers }), 2500);
-    if (res.ok) {
-      const data: any = await res.json();
-      if (data?.fields) {
-        return { id: docId, ...fromFirestoreRestFields(data.fields) };
-      }
-    }
-  } catch {
-    // Ignore read timeout
-  }
+  documentReadCache.set(cacheKey, {
+    expiresAt: 0,
+    doc: cached?.doc ?? null,
+    inflight: fetchPromise,
+  });
 
-  return null;
+  return fetchPromise;
 }
 
 /**
- * Lists documents from a Firestore collection via Admin SDK or REST API.
+ * Lists documents from a Firestore collection via Admin SDK or REST API (with fast TTL cache & request coalescing).
  */
 export async function listFirestoreCollection(
   collectionName: string,
   bearerToken?: string
 ): Promise<Array<Record<string, any>>> {
-  const { db, config } = getFirebaseAdminServices();
-
-  if (db) {
-    try {
-      const snap = await withTimeout(db.collection(collectionName).limit(200).get(), 2500);
-      return snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
-    } catch {
-      // Fall through to REST API
-    }
+  const now = Date.now();
+  const cached = collectionListCache.get(collectionName);
+  if (cached && now < cached.expiresAt) {
+    return cached.docs;
+  }
+  if (cached?.inflight) {
+    return cached.inflight;
   }
 
-  const adminToken = await getServiceAccountAccessToken(config);
-  const effectiveToken = adminToken || bearerToken;
+  const fetchPromise = (async (): Promise<Array<Record<string, any>>> => {
+    const { db, config } = getFirebaseAdminServices();
 
-  try {
-    const url = `https://firestore.googleapis.com/v1/projects/${config.projectId}/databases/${config.firestoreDatabaseId}/documents:runQuery`;
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (effectiveToken) {
-      headers['Authorization'] = `Bearer ${effectiveToken}`;
-    }
-    const res = await withTimeout(
-      fetch(url, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({
-          structuredQuery: {
-            from: [{ collectionId: collectionName }],
-            limit: 200,
-          },
-        }),
-      }),
-      2500
-    );
-    if (res.ok) {
-      const rows: any[] = await res.json();
-      if (Array.isArray(rows)) {
-        return rows
-          .filter((r) => r?.document?.fields)
-          .map((r) => {
-            const nameParts = String(r.document.name || '').split('/');
-            const id = nameParts[nameParts.length - 1];
-            return { id, ...fromFirestoreRestFields(r.document.fields) };
-          });
+    if (db) {
+      try {
+        const snap = await withTimeout(db.collection(collectionName).limit(200).get(), 2500);
+        const docs = snap.docs.map((d) => ({ id: d.id, ...(d.data() || {}) }));
+        collectionListCache.set(collectionName, {
+          expiresAt: Date.now() + COLLECTION_CACHE_TTL_MS,
+          docs,
+        });
+        return docs;
+      } catch {
+        // Fall through to REST API
       }
     }
-  } catch {
-    // Ignore collection list timeout
-  }
 
-  return [];
+    const adminToken = await getServiceAccountAccessToken(config);
+    const effectiveToken = adminToken || bearerToken;
+
+    try {
+      const url = `https://firestore.googleapis.com/v1/projects/${config.projectId}/databases/${config.firestoreDatabaseId}/documents:runQuery`;
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (effectiveToken) {
+        headers['Authorization'] = `Bearer ${effectiveToken}`;
+      }
+      const res = await withTimeout(
+        fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            structuredQuery: {
+              from: [{ collectionId: collectionName }],
+              limit: 200,
+            },
+          }),
+        }),
+        2500
+      );
+      if (res.ok) {
+        const rows: any[] = await res.json();
+        if (Array.isArray(rows)) {
+          const docs = rows
+            .filter((r) => r?.document?.fields)
+            .map((r) => {
+              const nameParts = String(r.document.name || '').split('/');
+              const id = nameParts[nameParts.length - 1];
+              return { id, ...fromFirestoreRestFields(r.document.fields) };
+            });
+          collectionListCache.set(collectionName, {
+            expiresAt: Date.now() + COLLECTION_CACHE_TTL_MS,
+            docs,
+          });
+          return docs;
+        }
+      }
+    } catch {
+      // Ignore collection list timeout
+    }
+
+    collectionListCache.delete(collectionName);
+    return cached?.docs ?? [];
+  })();
+
+  collectionListCache.set(collectionName, {
+    expiresAt: 0,
+    docs: cached?.docs ?? [],
+    inflight: fetchPromise,
+  });
+
+  return fetchPromise;
 }
 
 /**
@@ -1772,41 +1893,71 @@ export async function getFirestoreSystemOwnership(bearerToken?: string): Promise
   establishedAt: string | null;
   setupVersion: number;
 } | null> {
-  const [sysOwnPrimary, sysSettingsPrimary, sysOwnList] = await Promise.all([
-    readFirestoreDocument('system_ownership', 'lifetimeSuperAdmin', bearerToken),
-    readFirestoreDocument('systemSettings', 'lifetimeSuperAdmin', bearerToken),
-    listFirestoreCollection('system_ownership', bearerToken),
-  ]);
-
-  const candidate =
-    sysOwnPrimary ||
-    sysOwnList.find((d) => d.isInitialized === true || d.initialized === true || d.ownerUid || d.ownerUserId) ||
-    sysSettingsPrimary;
-
-  if (!candidate) {
-    return null;
+  const now = Date.now();
+  if (cachedSystemOwnership && now < cachedSystemOwnership.expiresAt && cachedSystemOwnership.data) {
+    return cachedSystemOwnership.data;
+  }
+  if (cachedSystemOwnership?.inflight) {
+    return cachedSystemOwnership.inflight;
   }
 
-  const ownerUserId =
-    candidate.ownerUserId || candidate.ownerUid || candidate.uid || null;
-  const ownerEmail = candidate.ownerEmail
-    ? String(candidate.ownerEmail).trim().toLowerCase()
-    : null;
-  const ownerFullName = candidate.ownerFullName || candidate.fullName || null;
-  const isInitialized = Boolean(
-    (candidate.isInitialized === true || candidate.initialized === true) && ownerUserId
-  );
+  const fetchPromise = (async () => {
+    const [sysOwnPrimary, sysSettingsPrimary, sysOwnList] = await Promise.all([
+      readFirestoreDocument('system_ownership', 'lifetimeSuperAdmin', bearerToken),
+      readFirestoreDocument('systemSettings', 'lifetimeSuperAdmin', bearerToken),
+      listFirestoreCollection('system_ownership', bearerToken),
+    ]);
 
-  return {
-    isInitialized,
-    lockdownEnforced: Boolean(candidate.lockdownEnforced ?? isInitialized),
-    ownerUserId,
-    ownerEmail,
-    ownerFullName,
-    ownerPhone: candidate.phone || candidate.ownerPhone || null,
-    establishedAt: candidate.establishedAt || candidate.createdAt || null,
-    setupVersion: Number(candidate.setupVersion || 1),
+    const candidate =
+      sysOwnPrimary ||
+      sysOwnList.find((d) => d.isInitialized === true || d.initialized === true || d.ownerUid || d.ownerUserId) ||
+      sysSettingsPrimary;
+
+    if (!candidate) {
+      cachedSystemOwnership = null;
+      return null;
+    }
+
+    const ownerUserId =
+      candidate.ownerUserId || candidate.ownerUid || candidate.uid || null;
+    const ownerEmail = candidate.ownerEmail
+      ? String(candidate.ownerEmail).trim().toLowerCase()
+      : null;
+    const ownerFullName = candidate.ownerFullName || candidate.fullName || null;
+    const isInitialized = Boolean(
+      (candidate.isInitialized === true || candidate.initialized === true) && ownerUserId
+    );
+
+    const resolved = {
+      isInitialized,
+      lockdownEnforced: Boolean(candidate.lockdownEnforced ?? isInitialized),
+      ownerUserId,
+      ownerEmail,
+      ownerFullName,
+      ownerPhone: candidate.phone || candidate.ownerPhone || null,
+      establishedAt: candidate.establishedAt || candidate.createdAt || null,
+      setupVersion: Number(candidate.setupVersion || 1),
+    };
+
+    if (isInitialized) {
+      cachedSystemOwnership = {
+        expiresAt: Date.now() + OWNERSHIP_CACHE_TTL_MS,
+        data: resolved,
+      };
+    } else {
+      cachedSystemOwnership = null;
+    }
+
+    return resolved;
+  })();
+
+  cachedSystemOwnership = {
+    expiresAt: 0,
+    data: cachedSystemOwnership?.data ?? null,
+    inflight: fetchPromise,
   };
+
+  return fetchPromise;
 }
 
 /**
@@ -1826,6 +1977,8 @@ export async function saveFirestoreSystemOwnership(
   },
   bearerToken?: string
 ): Promise<boolean> {
+  invalidateFirestoreCache('system_ownership');
+  invalidateFirestoreCache('systemSettings');
   const docPayload = {
     isInitialized: ownership.isInitialized,
     initialized: ownership.isInitialized,
@@ -2043,6 +2196,7 @@ export async function deleteFirestoreDocument(
   ) {
     return false;
   }
+  invalidateFirestoreCache(collectionName, docId);
   const { db, config } = getFirebaseAdminServices();
   if (db) {
     try {
@@ -2156,6 +2310,10 @@ export async function deleteFirebaseAccountAndFirestoreProfile(
       deletedFromFirestore: false,
     };
   }
+
+  invalidateFirestoreCache('users', cleanUid);
+  invalidateFirestoreCache('admins', cleanUid);
+  invalidateFirestoreCache('staff', cleanUid);
 
   if (cleanUid) {
     const cached = provisionedAuthUsersByUid.get(cleanUid);

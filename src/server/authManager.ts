@@ -351,27 +351,36 @@ class ServerAuthManager {
     }
   }
 
-  // Atomic file persistence for local development only. Production relies exclusively on Cloud Firestore.
+  private pendingFileSaves = new Map<string, { timer: NodeJS.Timeout; data: any }>();
+
+  // Debounced non-blocking file persistence for local development only. Production relies exclusively on Cloud Firestore.
   private atomicSaveFile(filePath: string, data: any): void {
     if (this.isProductionMode()) {
       return;
     }
-    try {
-      this.ensureDataDirectory();
-      const tmpPath = `${filePath}.${Date.now()}.${Math.random().toString(36).substring(2, 6)}.tmp`;
-      fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: 0o664 });
-      fs.renameSync(tmpPath, filePath);
-      fs.chmodSync(filePath, 0o664);
-      try {
-        if (typeof process.getuid === 'function' && process.getuid() === 0) {
-          fs.chownSync(filePath, 1000, 1000);
-        }
-      } catch {
-        // Ignore chown errors on non-Linux or restricted environments
-      }
-    } catch (err) {
-      console.warn(`[STORAGE WARNING] Failed writing to ${filePath} (falling back to memory):`, err);
+    const existing = this.pendingFileSaves.get(filePath);
+    if (existing) {
+      existing.data = data;
+      return;
     }
+    const timer = setTimeout(async () => {
+      const entry = this.pendingFileSaves.get(filePath);
+      this.pendingFileSaves.delete(filePath);
+      const payloadToWrite = entry ? entry.data : data;
+      try {
+        this.ensureDataDirectory();
+        const tmpPath = `${filePath}.${Date.now()}.${Math.random().toString(36).substring(2, 6)}.tmp`;
+        await fs.promises.writeFile(tmpPath, JSON.stringify(payloadToWrite, null, 2), {
+          encoding: 'utf-8',
+          mode: 0o664,
+        });
+        await fs.promises.rename(tmpPath, filePath);
+      } catch (err) {
+        console.warn(`[STORAGE WARNING] Failed writing to ${filePath} (falling back to memory):`, err);
+      }
+    }, 60);
+    if (typeof timer.unref === 'function') timer.unref();
+    this.pendingFileSaves.set(filePath, { timer, data });
   }
 
   private loadStateFromStorage(): void {
@@ -4460,9 +4469,14 @@ class ServerAuthManager {
     }
 
     const id = data.id || `STAFF_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
-    const passSalt = data.passwordSalt || generateSalt();
+    const passSalt = data.passwordSalt || (rawPass || !data.fromFirestore ? generateSalt() : '');
     const effectivePass = rawPass || `Teamacro@${crypto.randomBytes(3).toString('hex')}!`;
-    const passHash = data.passwordHash && data.passwordSalt ? data.passwordHash : hashPassword(effectivePass, passSalt);
+    const passHash =
+      data.passwordHash && data.passwordSalt
+        ? data.passwordHash
+        : rawPass || !data.fromFirestore
+        ? hashPassword(effectivePass, passSalt)
+        : '';
 
     let codeSalt: string | undefined = resolvedAccessSalt;
     let codeHash: string | undefined = resolvedAccessHash;
