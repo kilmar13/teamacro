@@ -3683,33 +3683,47 @@ if (!isServerlessRuntime) {
   const isProd = process.env.NODE_ENV === 'production';
 
   if (!isProd) {
-    // In development mode, always use Vite dev server middleware first so live edits
-    // and concurrent `vite build` runs never interrupt or drop preview connections.
+    // In development mode, initialize Vite dev server middleware immediately after port 3000 binds
+    // so container startup readiness probes never time out waiting for esbuild pre-bundling.
     // Use dynamic module specifier so @vercel/nft never bundles 'vite' into serverless functions.
-    const vitePkgName = 'vite';
-    const vitePromise = import(/* @vite-ignore */ vitePkgName)
-      .then(({ createServer: createViteServer }: any) =>
-        createViteServer({
-          server: {
-            middlewareMode: true,
-            hmr: false,
-            allowedHosts: true,
-          },
-          appType: 'spa',
-        })
-      )
-      .then((vite) => {
-        console.log('[DEV] Vite dev server middleware initialized and mounted');
-        return vite;
-      })
-      .catch((err) => {
-        console.warn('[DEV] Vite dev server middleware fallback to static:', err?.message || err);
-        return null;
-      });
+    let viteInstance: any = null;
+    let vitePromise: Promise<any> | null = null;
+
+    const getViteServer = () => {
+      if (viteInstance) return Promise.resolve(viteInstance);
+      if (!vitePromise) {
+        const vitePkgName = 'vite';
+        vitePromise = import(/* @vite-ignore */ vitePkgName)
+          .then(({ createServer: createViteServer }: any) =>
+            createViteServer({
+              server: {
+                middlewareMode: true,
+                hmr: false,
+                allowedHosts: true,
+              },
+              appType: 'spa',
+            })
+          )
+          .then((vite) => {
+            viteInstance = vite;
+            console.log('[DEV] Vite dev server middleware initialized and mounted');
+            return vite;
+          })
+          .catch((err) => {
+            console.warn('[DEV] Vite dev server middleware fallback to static:', err?.message || err);
+            return null;
+          });
+      }
+      return vitePromise;
+    };
+
+    app.head('/', (_req: Request, res: Response) => {
+      res.status(200).end();
+    });
 
     app.use(async (req: Request, res: Response, next: NextFunction) => {
       try {
-        const vite = await vitePromise;
+        const vite = viteInstance || (await getViteServer());
         if (vite) {
           return vite.middlewares(req, res, next);
         }
@@ -3717,6 +3731,10 @@ if (!isServerlessRuntime) {
         console.warn('[DEV] Vite middleware handler note:', err);
       }
       next();
+    });
+
+    setImmediate(() => {
+      getViteServer();
     });
   }
 
