@@ -20,10 +20,13 @@ import {
   Scale,
   Users,
   X,
+  ExternalLink,
 } from 'lucide-react';
-import { User } from '../../../types/banking';
+import { User, CustomerRecord } from '../../../types/banking';
 import { safeApiFetch } from '../../../utils/apiClient';
 import { ASSIGNABLE_PROGRAMMES } from '../../../utils/roleRouting';
+import { CentralCustomerDirectory } from '../../../components/internal/CentralCustomerDirectory';
+import { CustomerProfileModal } from '../../../components/internal/CustomerProfileModal';
 
 interface AccountManagerDashboardProps {
   currentUser: User | null;
@@ -41,7 +44,8 @@ export const AccountManagerDashboard: React.FC<AccountManagerDashboardProps> = (
   >('overview');
   const [collections, setCollections] = useState<any[]>([]);
   const [loans, setLoans] = useState<any[]>([]);
-  const [customers, setCustomers] = useState<any[]>([]);
+  const [customers, setCustomers] = useState<CustomerRecord[]>([]);
+  const [profileCustomer, setProfileCustomer] = useState<CustomerRecord | null>(null);
   const [reconciliations, setReconciliations] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -656,46 +660,17 @@ export const AccountManagerDashboard: React.FC<AccountManagerDashboardProps> = (
           </div>
         )}
 
-        {/* CUSTOMER BALANCES & STATEMENTS TAB */}
+        {/* CUSTOMER BALANCES & CENTRAL DIRECTORY TAB */}
         {activeTab === 'balances' && (
-          <div className="bg-[#0D1E4C] border border-white/10 rounded-xl p-5 space-y-4">
-            <h2 className="text-base font-bold text-white">
-              Customer Account Balances & Statements ({customers.length})
-            </h2>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="border-b border-white/10 text-[11px] uppercase text-slate-400">
-                    <th className="py-2.5 px-3">Customer Code</th>
-                    <th className="py-2.5 px-3">Full Name</th>
-                    <th className="py-2.5 px-3">Account Number</th>
-                    <th className="py-2.5 px-3">Phone</th>
-                    <th className="py-2.5 px-3">Programmes</th>
-                    <th className="py-2.5 px-3">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5 text-xs">
-                  {customers.map((c) => (
-                    <tr key={c.id} className="hover:bg-white/5">
-                      <td className="py-3 px-3 font-mono text-emerald-300">{c.customerCode}</td>
-                      <td className="py-3 px-3 font-semibold text-white">{c.fullName}</td>
-                      <td className="py-3 px-3 font-mono text-slate-200">{c.accountNumber}</td>
-                      <td className="py-3 px-3 text-slate-300">{c.phone}</td>
-                      <td className="py-3 px-3 text-slate-300">
-                        {Array.isArray(c.enrolledProgrammes) && c.enrolledProgrammes.length > 0
-                          ? c.enrolledProgrammes.join(', ')
-                          : 'Daily Contribution (Ajo)'}
-                      </td>
-                      <td className="py-3 px-3">
-                        <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-bold uppercase">
-                          {c.status || 'active'}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+          <div className="text-slate-900">
+            <CentralCustomerDirectory
+              title="Central Customer Directory & Account Statements (Account Manager)"
+              subtitle="Click any customer name to inspect their full profile, separate Next of Kin & Guarantor sections, original registering staff member, and financial activity history."
+              canCreateCustomer={true}
+              canEditCustomer={true}
+              canRecordActivity={true}
+              onCustomersChanged={(list) => setCustomers(list)}
+            />
           </div>
         )}
 
@@ -950,6 +925,19 @@ export const AccountManagerDashboard: React.FC<AccountManagerDashboardProps> = (
             </form>
           </div>
         </div>
+      )}
+
+      {profileCustomer && (
+        <CustomerProfileModal
+          customer={profileCustomer}
+          onClose={() => setProfileCustomer(null)}
+          canEdit={true}
+          canRecordActivity={true}
+          onCustomerUpdated={(updated) => {
+            setProfileCustomer(updated);
+            setCustomers((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+          }}
+        />
       )}
     </div>
   );

@@ -1276,56 +1276,156 @@ export class LedgerEngine {
   static saveCustomer(customerData: any, staff?: any): CustomerRecord {
     const customers = this.getCustomers();
     const count = customers.length + 1;
-    const id = customerData.id || `cust_${String(count).padStart(3, '0')}`;
-    const customerCode = customerData.customerCode || `TMC-CST-${1000 + count}`;
+    const existingIdx = customers.findIndex(
+      (c) =>
+        (customerData.id && c.id === customerData.id) ||
+        (customerData.customerCode && c.customerCode === customerData.customerCode) ||
+        (customerData.phone &&
+          (c.phone || '').replace(/\s+/g, '') === String(customerData.phone).replace(/\s+/g, ''))
+    );
+    const existing = existingIdx >= 0 ? customers[existingIdx] : null;
+
+    const id = existing?.id || customerData.id || `cust_${String(count).padStart(3, '0')}`;
+    const customerCode = existing?.customerCode || customerData.customerCode || `TMC-CST-${1000 + count}`;
     const actor = staff || this.getCurrentStaff() || this.getCurrentUser();
-    const nowDate = new Date().toISOString().split('T')[0];
+    const nowIso = new Date().toISOString();
+    const nowDate = nowIso.split('T')[0];
+
+    const regByStaffId =
+      existing && existing.registeredByStaffId && existing.registeredByStaffId !== 'SYSTEM'
+        ? existing.registeredByStaffId
+        : actor?.id || customerData.registeredByStaffId || customerData.assignedStaffId || 'SYSTEM';
+    const regByName =
+      existing?.registeredByName ||
+      customerData.registeredByName ||
+      actor?.fullName ||
+      'System Registration Officer';
+    const regByStaffCode =
+      existing?.registeredByStaffCode ||
+      customerData.registeredByStaffCode ||
+      actor?.staffCode ||
+      (actor?.role === 'LIFETIME_SUPER_ADMIN'
+        ? 'TMC-ROOT-0001'
+        : `TMC-STF-${String(regByStaffId).slice(-4).toUpperCase()}`);
+    const regByPosition =
+      existing?.registeredByPosition ||
+      customerData.registeredByPosition ||
+      actor?.position ||
+      actor?.roleTitle ||
+      'Customer Registration Officer';
+    const regByRole =
+      existing?.registeredByRole || customerData.registeredByRole || actor?.role || 'STAFF';
+    const regByDepartment =
+      existing?.registeredByDepartment ||
+      customerData.registeredByDepartment ||
+      'Customer Onboarding & KYC Department — Lagos Head Office';
+
+    const existingActivities = Array.isArray(existing?.activityHistory)
+      ? existing.activityHistory
+      : Array.isArray(customerData.activityHistory)
+      ? customerData.activityHistory
+      : [
+          {
+            id: `ACT_REG_${id}`,
+            timestamp: existing?.registeredAt || customerData.registeredAt || nowIso,
+            category: 'REGISTRATION' as const,
+            action: 'Customer Registration',
+            description: `Customer profile registered by ${regByName} (${regByPosition}, Staff ID: ${regByStaffCode}).`,
+            actorId: regByStaffId,
+            actorName: regByName,
+            actorStaffCode: regByStaffCode,
+            actorRole: regByRole,
+            actorPosition: regByPosition,
+            actorDepartment: regByDepartment,
+          },
+        ];
 
     const newCustomer: CustomerRecord = {
+      ...(existing || {}),
       ...customerData,
       id,
       customerCode,
-      fullName: String(customerData.fullName || '').trim(),
-      phone: String(customerData.phone || '').trim(),
-      email: customerData.email ? String(customerData.email).trim() : '',
-      address: String(customerData.address || customerData.residentialAddress || 'Lagos, Nigeria').trim(),
-      ninOrBvn: String(customerData.ninOrBvn || customerData.kycIdNumber || '').trim(),
-      state: String(customerData.state || 'Lagos').trim(),
-      lga: String(customerData.lga || 'Metropolitan').trim(),
-      occupation: String(customerData.occupation || 'Member').trim(),
-      nextOfKinName: String(customerData.nextOfKinName || '').trim(),
-      nextOfKinPhone: String(customerData.nextOfKinPhone || customerData.phone || '').trim(),
-      nextOfKinRelationship: String(customerData.nextOfKinRelationship || 'Relative').trim(),
-      registrationDate: customerData.registrationDate || nowDate,
-      registeredByStaffId: actor?.id || customerData.assignedStaffId || 'SYSTEM',
-      status: 'active',
-      enrolledProgrammes: Array.isArray(customerData.enrolledProgrammes) ? customerData.enrolledProgrammes : [],
+      fullName: String(customerData.fullName || existing?.fullName || '').trim(),
+      phone: String(customerData.phone || existing?.phone || '').trim(),
+      altPhone: String(customerData.altPhone ?? existing?.altPhone ?? '').trim(),
+      email: customerData.email ? String(customerData.email).trim() : existing?.email || '',
+      address: String(
+        customerData.address ?? customerData.residentialAddress ?? existing?.address ?? ''
+      ).trim(),
+      ninOrBvn: String(
+        customerData.ninOrBvn ?? customerData.kycIdNumber ?? existing?.ninOrBvn ?? ''
+      ).trim(),
+      idType: String(customerData.idType ?? existing?.idType ?? '').trim(),
+      dateOfBirth: String(customerData.dateOfBirth ?? existing?.dateOfBirth ?? '').trim(),
+      gender: String(customerData.gender ?? existing?.gender ?? '').trim(),
+      state: String(customerData.state ?? existing?.state ?? '').trim(),
+      lga: String(customerData.lga ?? existing?.lga ?? '').trim(),
+      occupation: String(customerData.occupation ?? existing?.occupation ?? '').trim(),
+      // Next of Kin
+      nextOfKinName: String(customerData.nextOfKinName ?? existing?.nextOfKinName ?? '').trim(),
+      nextOfKinPhone: String(customerData.nextOfKinPhone ?? existing?.nextOfKinPhone ?? '').trim(),
+      nextOfKinRelationship: String(
+        customerData.nextOfKinRelationship ?? existing?.nextOfKinRelationship ?? ''
+      ).trim(),
+      nextOfKinAddress: String(
+        customerData.nextOfKinAddress ?? existing?.nextOfKinAddress ?? ''
+      ).trim(),
+      // Guarantor
+      guarantorName: String(customerData.guarantorName ?? existing?.guarantorName ?? '').trim(),
+      guarantorPhone: String(customerData.guarantorPhone ?? existing?.guarantorPhone ?? '').trim(),
+      guarantorRelationship: String(
+        customerData.guarantorRelationship ?? existing?.guarantorRelationship ?? ''
+      ).trim(),
+      guarantorAddress: String(
+        customerData.guarantorAddress ?? existing?.guarantorAddress ?? ''
+      ).trim(),
+      guarantorOccupation: String(
+        customerData.guarantorOccupation ?? existing?.guarantorOccupation ?? ''
+      ).trim(),
+      guarantorVerificationStatus: String(
+        customerData.guarantorVerificationStatus ??
+          existing?.guarantorVerificationStatus ??
+          (customerData.guarantorName || existing?.guarantorName
+            ? 'Pending Verification'
+            : 'Not Provided')
+      ).trim(),
+      // Permanent Registration Information
+      registrationDate: existing?.registrationDate || customerData.registrationDate || nowDate,
+      registeredAt: existing?.registeredAt || customerData.registeredAt || nowIso,
+      registeredByStaffId: regByStaffId,
+      registeredByName: regByName,
+      registeredByStaffCode: regByStaffCode,
+      registeredByPosition: regByPosition,
+      registeredByRole: regByRole,
+      registeredByDepartment: regByDepartment,
+      status: String(customerData.status || existing?.status || 'active').toLowerCase(),
+      enrolledProgrammes: Array.isArray(customerData.enrolledProgrammes)
+        ? customerData.enrolledProgrammes
+        : Array.isArray(existing?.enrolledProgrammes)
+        ? existing.enrolledProgrammes
+        : [],
+      activityHistory: existingActivities,
     };
 
-    const existingIdx = customers.findIndex(
-      (c) =>
-        c.id === newCustomer.id ||
-        (newCustomer.phone && (c.phone || '').replace(/\s+/g, '') === newCustomer.phone.replace(/\s+/g, ''))
-    );
     if (existingIdx >= 0) {
-      customers[existingIdx] = { ...customers[existingIdx], ...newCustomer };
+      customers[existingIdx] = newCustomer;
     } else {
       customers.unshift(newCustomer);
     }
     saveToStorage(STORAGE_KEYS.CUSTOMERS, customers);
 
-    // Ensure a corresponding CustomerAccount exists so SuperAdminPortal & CustomerPortal reflect immediately
+    // Ensure a corresponding CustomerAccount exists
     this.ensureCustomerBankAccount(newCustomer);
 
     this.recordAuditLog(
       actor?.id || 'SYSTEM',
       actor?.fullName || 'System Staff',
-      'Registered Customer',
+      existing ? 'Updated Customer Profile' : 'Registered Customer',
       'Customer Management',
-      `Successfully enrolled customer ${newCustomer.fullName} (${newCustomer.customerCode})`
+      `${existing ? 'Updated' : 'Successfully enrolled'} customer ${newCustomer.fullName} (${newCustomer.customerCode})`
     );
 
-    // Asynchronously persist to backend /api/customers if in browser environment with active session
+    // Persist to backend /api/customers and Firestore
     if (typeof window !== 'undefined' && typeof fetch === 'function') {
       import('../utils/apiClient')
         .then(({ safeApiFetch, getActiveSessionToken }) => {
@@ -1356,8 +1456,10 @@ export class LedgerEngine {
       const serverCustomers: any[] = res.customers || res.data?.customers || [];
       const localCustomers = this.getCustomers();
 
-      // Also push any local customers that aren't on the server yet
-      const serverPhones = new Set(serverCustomers.map((c) => String(c.phone || '').replace(/\s+/g, '')));
+      // Push any local customers that aren't on the server yet
+      const serverPhones = new Set(
+        serverCustomers.map((c) => String(c.phone || '').replace(/\s+/g, ''))
+      );
       for (const localCust of localCustomers) {
         const cleanLocalPhone = String(localCust.phone || '').replace(/\s+/g, '');
         if (cleanLocalPhone && !serverPhones.has(cleanLocalPhone)) {
@@ -1369,7 +1471,6 @@ export class LedgerEngine {
       }
 
       if (Array.isArray(serverCustomers) && serverCustomers.length > 0) {
-        let changed = false;
         const merged = [...localCustomers];
         for (const sc of serverCustomers) {
           if (!sc || (!sc.fullName && !sc.phone)) continue;
@@ -1380,34 +1481,53 @@ export class LedgerEngine {
               (cleanPhone && String(lc.phone || '').replace(/\s+/g, '') === cleanPhone)
           );
           const normalized: CustomerRecord = {
+            ...(existsIdx >= 0 ? merged[existsIdx] : {}),
             ...sc,
             id: sc.id || `cust_${merged.length + 1}`,
             customerCode: sc.customerCode || `TMC-CST-${1000 + merged.length + 1}`,
             fullName: sc.fullName || 'Customer',
             phone: sc.phone || '',
+            altPhone: sc.altPhone || '',
             email: sc.email || '',
-            address: sc.address || 'Lagos, Nigeria',
+            address: sc.address || '',
             ninOrBvn: sc.ninOrBvn || '',
-            state: sc.state || 'Lagos',
-            lga: sc.lga || 'Metropolitan',
-            occupation: sc.occupation || 'Member',
+            idType: sc.idType || '',
+            dateOfBirth: sc.dateOfBirth || '',
+            gender: sc.gender || '',
+            state: sc.state || '',
+            lga: sc.lga || '',
+            occupation: sc.occupation || '',
             nextOfKinName: sc.nextOfKinName || '',
-            nextOfKinPhone: sc.nextOfKinPhone || sc.phone || '',
-            nextOfKinRelationship: sc.nextOfKinRelationship || 'Relative',
+            nextOfKinPhone: sc.nextOfKinPhone || '',
+            nextOfKinRelationship: sc.nextOfKinRelationship || '',
+            nextOfKinAddress: sc.nextOfKinAddress || '',
+            guarantorName: sc.guarantorName || '',
+            guarantorPhone: sc.guarantorPhone || '',
+            guarantorRelationship: sc.guarantorRelationship || '',
+            guarantorAddress: sc.guarantorAddress || '',
+            guarantorOccupation: sc.guarantorOccupation || '',
+            guarantorVerificationStatus: sc.guarantorVerificationStatus || 'Not Provided',
             registrationDate: sc.registrationDate || new Date().toISOString().split('T')[0],
+            registeredAt: sc.registeredAt || sc.createdAt || sc.registrationDate,
             registeredByStaffId: sc.registeredByStaffId || 'SYSTEM',
+            registeredByName: sc.registeredByName || 'System Registration Officer',
+            registeredByStaffCode: sc.registeredByStaffCode || 'TMC-SYS-0001',
+            registeredByPosition: sc.registeredByPosition || 'Customer Registration Officer',
+            registeredByRole: sc.registeredByRole || 'STAFF',
+            registeredByDepartment:
+              sc.registeredByDepartment || 'Customer Onboarding & KYC Department — Lagos Head Office',
             status: ((sc.status || 'active').toLowerCase() as 'active' | 'suspended' | 'dormant'),
             enrolledProgrammes: Array.isArray(sc.enrolledProgrammes) ? sc.enrolledProgrammes : [],
+            activityHistory: Array.isArray(sc.activityHistory) ? sc.activityHistory : [],
           };
           if (existsIdx === -1) {
             merged.unshift(normalized);
             this.ensureCustomerBankAccount(normalized);
-            changed = true;
+          } else {
+            merged[existsIdx] = normalized;
           }
         }
-        if (changed) {
-          saveToStorage(STORAGE_KEYS.CUSTOMERS, merged);
-        }
+        saveToStorage(STORAGE_KEYS.CUSTOMERS, merged);
         return merged;
       }
     } catch {
@@ -1420,10 +1540,23 @@ export class LedgerEngine {
     const customers = this.getCustomers();
     const idx = customers.findIndex((c) => c.id === id);
     if (idx === -1) return null;
-    customers[idx] = { ...customers[idx], ...updates };
+    const existing = customers[idx];
+    // Strictly preserve original registering officer fields
+    customers[idx] = {
+      ...existing,
+      ...updates,
+      registeredByStaffId: existing.registeredByStaffId,
+      registeredByName: existing.registeredByName,
+      registeredByStaffCode: existing.registeredByStaffCode,
+      registeredByPosition: existing.registeredByPosition,
+      registeredByRole: existing.registeredByRole,
+      registeredByDepartment: existing.registeredByDepartment,
+      registrationDate: existing.registrationDate,
+      registeredAt: existing.registeredAt,
+    };
     saveToStorage(STORAGE_KEYS.CUSTOMERS, customers);
 
-    const actor = this.getCurrentStaff();
+    const actor = this.getCurrentStaff() || this.getCurrentUser();
     this.recordAuditLog(
       actor?.id || 'SYSTEM',
       actor?.fullName || 'System Staff',

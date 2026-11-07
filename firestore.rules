@@ -220,11 +220,17 @@ service cloud.firestore {
     }
 
     // =========================================================================
-    // 2.5. CUSTOMERS COLLECTION
+    // 2.5. CUSTOMERS COLLECTION (PERMANENT INTERNAL CUSTOMER REGISTRY)
     // =========================================================================
     match /customers/{customerId} {
       allow get, list: if true;
-      allow create, update: if isValidId(customerId) && isValidCustomer(incoming());
+      allow create: if isValidId(customerId) && isValidCustomer(incoming());
+      allow update: if isValidId(customerId) &&
+        isValidCustomer(incoming()) &&
+        (!('registeredByStaffId' in existing()) ||
+         existing().registeredByStaffId == '' ||
+         existing().registeredByStaffId == 'SYSTEM_UNASSIGNED' ||
+         incoming().registeredByStaffId == existing().registeredByStaffId);
       allow delete: if isValidId(customerId) && isSuperAdmin();
     }
 

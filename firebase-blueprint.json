@@ -298,7 +298,7 @@
     },
     "Customer": {
       "title": "Customer",
-      "description": "Registered TEAMACRO customer profile for Fixed Target, Daily Ajo, Everyhome Food, Leocash, and Loans.",
+      "description": "Permanent internal TEAMACRO customer profile shared across authorised Super Admin, Admin, and Staff portals with separate Next of Kin & Guarantor sections, immutable registering staff attribution, and chronological activity history.",
       "type": "object",
       "properties": {
         "id": {
@@ -315,17 +315,94 @@
         },
         "phone": {
           "type": "string",
-          "description": "Customer phone number."
+          "description": "Primary customer phone number."
+        },
+        "altPhone": {
+          "type": "string",
+          "description": "Alternative phone number if provided."
         },
         "email": {
           "type": "string",
           "format": "email",
           "description": "Customer email address."
         },
+        "address": {
+          "type": "string",
+          "description": "Residential or business address."
+        },
+        "nextOfKinName": {
+          "type": "string",
+          "description": "Next of Kin full name."
+        },
+        "nextOfKinPhone": {
+          "type": "string",
+          "description": "Next of Kin phone number."
+        },
+        "nextOfKinRelationship": {
+          "type": "string",
+          "description": "Next of Kin relationship with customer."
+        },
+        "nextOfKinAddress": {
+          "type": "string",
+          "description": "Next of Kin residential address."
+        },
+        "guarantorName": {
+          "type": "string",
+          "description": "Guarantor full name."
+        },
+        "guarantorPhone": {
+          "type": "string",
+          "description": "Guarantor phone number."
+        },
+        "guarantorRelationship": {
+          "type": "string",
+          "description": "Guarantor relationship with customer."
+        },
+        "guarantorAddress": {
+          "type": "string",
+          "description": "Guarantor residential address."
+        },
+        "guarantorVerificationStatus": {
+          "type": "string",
+          "enum": ["Verified", "Pending Verification", "Unverified", "Not provided"],
+          "description": "Guarantor verification status."
+        },
+        "registeredByStaffId": {
+          "type": "string",
+          "description": "Immutable UID of the original staff member who registered the customer."
+        },
+        "registeredByStaffCode": {
+          "type": "string",
+          "description": "Immutable Staff ID code of the original registering officer."
+        },
+        "registeredByName": {
+          "type": "string",
+          "description": "Immutable full name of the original registering officer."
+        },
+        "registeredByPosition": {
+          "type": "string",
+          "description": "Immutable staff position of the original registering officer."
+        },
+        "registeredByDepartment": {
+          "type": "string",
+          "description": "Immutable department or branch of the original registering officer."
+        },
+        "registeredAt": {
+          "type": "string",
+          "description": "Immutable ISO registration date and time."
+        },
+        "registrationDate": {
+          "type": "string",
+          "description": "ISO registration date."
+        },
         "status": {
           "type": "string",
-          "enum": ["active", "suspended", "dormant"],
+          "enum": ["active", "suspended", "dormant", "inactive"],
           "description": "Customer status."
+        },
+        "activityHistory": {
+          "type": "array",
+          "description": "Chronological internal customer activity history timeline."
         }
       },
       "required": ["id", "fullName", "phone"]

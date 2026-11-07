@@ -64,6 +64,8 @@ import {
   getDedicatedRouteForUser,
   isReadOnlyAuditor,
 } from '../../utils/roleRouting';
+import { CentralCustomerDirectory } from '../../components/internal/CentralCustomerDirectory';
+import { CustomerProfileModal } from '../../components/internal/CustomerProfileModal';
 
 interface SuperAdminPortalProps {
   config: BankConfig;
@@ -80,6 +82,7 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
 }) => {
   type TabType =
     | 'overview'
+    | 'customers'
     | 'approvals'
     | 'staff_admin_mgmt'
     | 'discreet_monitoring'
@@ -91,6 +94,7 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
     | 'cms_settings';
 
   const [activeTab, setActiveTab] = useState<TabType>('overview');
+  const [selectedCustomerProfile, setSelectedCustomerProfile] = useState<CustomerRecord | null>(null);
 
   // Authoritative Lifetime Super Admin Session
   const sessionUser = ledgerEngine.getCurrentUser();
@@ -1356,6 +1360,18 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
           </button>
 
           <button
+            onClick={() => setActiveTab('customers')}
+            className={`px-4 py-2.5 rounded-t-xl transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer ${
+              activeTab === 'customers'
+                ? 'bg-[#F4F7FB] dark:bg-[#060D1F] text-[#0B2A5B] dark:text-white border-t-2 border-[#2563EB]'
+                : 'text-slate-300 hover:text-white hover:bg-white/10'
+            }`}
+          >
+            <Users size={14} />
+            <span>Customer Directory ({customers.length})</span>
+          </button>
+
+          <button
             onClick={() => setActiveTab('approvals')}
             className={`px-4 py-2.5 rounded-t-xl transition-colors whitespace-nowrap flex items-center gap-1.5 cursor-pointer ${
               activeTab === 'approvals'
@@ -1551,7 +1567,7 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => setShowRegisterCustomerModal(true)}
+                  onClick={() => setActiveTab('customers')}
                   className="px-5 py-2.5 rounded-full bg-[#1E5BD8] hover:bg-[#0B2A5B] text-white font-bold text-xs flex items-center gap-1.5 shadow-sm cursor-pointer transition-colors"
                 >
                   <UserPlus size={14} /> + Register New Customer
@@ -1654,184 +1670,30 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
               </div>
             </div>
 
-            {/* Registered Customer Directory */}
-            <div className="bg-white dark:bg-[#0B162C] border border-slate-200 dark:border-slate-800 shadow-xs overflow-hidden">
-              <div className="p-5 border-b border-slate-200 dark:border-slate-800 flex flex-wrap items-center justify-between gap-3">
-                <div>
-                  <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#2563EB]">
-                    REGISTRY // SYNCHRONISED CUSTOMER LEDGER
-                  </div>
-                  <h3 className="font-display text-base font-extrabold text-[#0B2A5B] dark:text-white flex items-center gap-2 mt-0.5">
-                    <Users size={18} className="text-[#2563EB]" />
-                    Registered Customer Directory ({customers.length} Enrolled)
-                  </h3>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Real-time registry of all customers created across Staff, Admin, Super Admin, and Account Application portals.
-                  </p>
-                </div>
-                <button
-                  onClick={() => setShowRegisterCustomerModal(true)}
-                  className="px-4 py-2 bg-[#1E5BD8] hover:bg-[#0B2A5B] text-white font-bold text-xs uppercase tracking-wider flex items-center gap-1.5 shadow-xs cursor-pointer transition-colors"
-                >
-                  <UserPlus size={14} /> + Register New Customer
-                </button>
-              </div>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="bg-[#0B2A5B] text-white font-bold uppercase tracking-wider text-[11px]">
-                      <th className="p-3.5">Customer Name</th>
-                      <th className="p-3.5">Customer Code</th>
-                      <th className="p-3.5">Phone</th>
-                      <th className="p-3.5">Email / NIN</th>
-                      <th className="p-3.5">Address</th>
-                      <th className="p-3.5">Status</th>
-                      <th className="p-3.5">Registered Date</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
-                    {customers.length === 0 ? (
-                      <tr>
-                        <td colSpan={7} className="p-8 text-center text-slate-400">
-                          No customer profiles registered yet. Click &ldquo;+ Register New Customer&rdquo; to enroll a customer.
-                        </td>
-                      </tr>
-                    ) : (
-                      customers.map((c) => (
-                        <tr key={c.id} className="hover:bg-[#F4F7FB] dark:hover:bg-slate-800/60 transition-colors">
-                          <td className="p-3.5 font-bold text-[#0B2A5B] dark:text-white">{c.fullName}</td>
-                          <td className="p-3.5 font-mono text-[11px] font-bold text-[#2563EB]">
-                            {c.customerCode || c.id}
-                          </td>
-                          <td className="p-3.5 text-slate-700 dark:text-slate-300">{c.phone}</td>
-                          <td className="p-3.5 text-slate-500">
-                            <div>{c.email || '—'}</div>
-                            {c.ninOrBvn && <div className="font-mono text-[10px] text-slate-400">NIN/BVN: {c.ninOrBvn}</div>}
-                          </td>
-                          <td className="p-3.5 text-slate-600 dark:text-slate-400">{c.address || '—'}</td>
-                          <td className="p-3.5">
-                            <span className="px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300">
-                              {String(c.status || 'ACTIVE').toUpperCase()}
-                            </span>
-                          </td>
-                          <td className="p-3.5 text-slate-500">{formatLagosDate(c.registrationDate || c.createdAt || c.joinedDate || new Date().toISOString())}</td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-
-            {showRegisterCustomerModal && (
-              <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-                <div className="bg-white dark:bg-slate-800 rounded-2xl max-w-lg w-full border border-[#E0E4EE] dark:border-slate-700 shadow-2xl overflow-hidden">
-                  <div className="p-5 bg-[#091747] text-white flex items-center justify-between">
-                    <div>
-                      <h3 className="font-bold text-base">Register New Customer</h3>
-                      <p className="text-xs text-slate-300">Create a verified customer profile synchronized across all portals</p>
-                    </div>
-                    <button onClick={() => setShowRegisterCustomerModal(false)} className="text-slate-300 hover:text-white cursor-pointer">
-                      <X size={18} />
-                    </button>
-                  </div>
-                  <form onSubmit={handleRegisterCustomer} className="p-6 space-y-4 text-xs">
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Full Legal Name *</label>
-                        <input
-                          type="text"
-                          required
-                          value={newCustomerForm.fullName}
-                          onChange={(e) => setNewCustomerForm({ ...newCustomerForm, fullName: e.target.value })}
-                          placeholder="e.g. Adebayo Ogunlesi"
-                          className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Phone Number *</label>
-                        <input
-                          type="tel"
-                          required
-                          value={newCustomerForm.phone}
-                          onChange={(e) => setNewCustomerForm({ ...newCustomerForm, phone: e.target.value })}
-                          placeholder="0803 000 0000"
-                          className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Email Address</label>
-                        <input
-                          type="email"
-                          value={newCustomerForm.email}
-                          onChange={(e) => setNewCustomerForm({ ...newCustomerForm, email: e.target.value })}
-                          placeholder="customer@email.com"
-                          className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">NIN or BVN</label>
-                        <input
-                          type="text"
-                          value={newCustomerForm.ninOrBvn}
-                          onChange={(e) => setNewCustomerForm({ ...newCustomerForm, ninOrBvn: e.target.value })}
-                          placeholder="11-digit NIN or BVN"
-                          className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-                        />
-                      </div>
-                    </div>
-                    <div>
-                      <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Residential / Business Address</label>
-                      <input
-                        type="text"
-                        value={newCustomerForm.address}
-                        onChange={(e) => setNewCustomerForm({ ...newCustomerForm, address: e.target.value })}
-                        placeholder="Street, Area, State"
-                        className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-                      />
-                    </div>
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                      <div>
-                        <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Next of Kin Name</label>
-                        <input
-                          type="text"
-                          value={newCustomerForm.nextOfKinName}
-                          onChange={(e) => setNewCustomerForm({ ...newCustomerForm, nextOfKinName: e.target.value })}
-                          placeholder="Next of Kin Full Name"
-                          className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-                        />
-                      </div>
-                      <div>
-                        <label className="block font-bold text-slate-700 dark:text-slate-300 mb-1">Next of Kin Phone</label>
-                        <input
-                          type="tel"
-                          value={newCustomerForm.nextOfKinPhone}
-                          onChange={(e) => setNewCustomerForm({ ...newCustomerForm, nextOfKinPhone: e.target.value })}
-                          placeholder="0803 000 0000"
-                          className="w-full px-3 py-2 rounded-lg border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900"
-                        />
-                      </div>
-                    </div>
-                    <div className="flex justify-end gap-2 pt-3 border-t border-slate-200 dark:border-slate-700">
-                      <button
-                        type="button"
-                        onClick={() => setShowRegisterCustomerModal(false)}
-                        className="px-4 py-2 rounded-lg border border-slate-300 dark:border-slate-600 font-semibold cursor-pointer"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="submit"
-                        className="px-4 py-2 rounded-lg bg-[#263F91] hover:bg-[#1a2c6b] text-white font-bold cursor-pointer"
-                      >
-                        Complete Registration
-                      </button>
-                    </div>
-                  </form>
-                </div>
-              </div>
-            )}
+            {/* Central Customer Directory in Overview */}
+            <CentralCustomerDirectory
+              title="Central Customer Directory — Root Authority Oversight"
+              subtitle="Permanent, shared Firestore customer registry across all Staff, Admin, and Super Admin portals. Click any customer's name to inspect Next of Kin, Guarantor, original registering officer, and activity history."
+              canCreateCustomer={true}
+              canEditCustomer={true}
+              canRecordActivity={true}
+              onCustomersChanged={(updated) => setCustomers(updated)}
+            />
           </div>
+        )}
+
+        {/* ============================================================== */}
+        {/* 1B. DEDICATED CENTRAL CUSTOMER DIRECTORY TAB */}
+        {/* ============================================================== */}
+        {activeTab === 'customers' && (
+          <CentralCustomerDirectory
+            title="Central Customer Directory — Root Authority Oversight"
+            subtitle="Permanent, shared Firestore customer registry across all Staff, Admin, and Super Admin portals. Click any customer's name to inspect Next of Kin, Guarantor, original registering officer, and activity history."
+            canCreateCustomer={true}
+            canEditCustomer={true}
+            canRecordActivity={true}
+            onCustomersChanged={(updated) => setCustomers(updated)}
+          />
         )}
 
         {/* ============================================================== */}
@@ -1927,9 +1789,26 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
                               </span>
                             </td>
                             <td className="p-3">
-                              <span className="font-semibold text-slate-900 dark:text-slate-100 block">
-                                {req.customerName}
-                              </span>
+                              {(() => {
+                                const matchedCust = customers.find(
+                                  (c) =>
+                                    c.id === req.customerId ||
+                                    c.fullName.toLowerCase() === (req.customerName || '').toLowerCase()
+                                );
+                                return matchedCust ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => setSelectedCustomerProfile(matchedCust)}
+                                    className="font-bold text-[#2563EB] hover:underline text-left block cursor-pointer"
+                                  >
+                                    {req.customerName}
+                                  </button>
+                                ) : (
+                                  <span className="font-semibold text-slate-900 dark:text-slate-100 block">
+                                    {req.customerName}
+                                  </span>
+                                );
+                              })()}
                               <span className="text-[11px] text-slate-500 font-mono">
                                 {req.destinationDetails?.bankName || 'Direct Account'} · {req.destinationDetails?.accountNumber || req.accountNumber || 'N/A'}
                               </span>
@@ -4233,6 +4112,19 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
             </div>
           </div>
         </div>
+      )}
+
+      {selectedCustomerProfile && (
+        <CustomerProfileModal
+          customer={selectedCustomerProfile}
+          onClose={() => setSelectedCustomerProfile(null)}
+          canEdit={true}
+          canRecordActivity={true}
+          onCustomerUpdated={(updated) => {
+            setSelectedCustomerProfile(updated);
+            loadData();
+          }}
+        />
       )}
     </div>
   );

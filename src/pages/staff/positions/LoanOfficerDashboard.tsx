@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   Briefcase, Search, Plus, RefreshCw, LogOut, AlertTriangle,
-  CheckCircle2, FileText, Calendar, ShieldCheck, ArrowLeft
+  CheckCircle2, FileText, Calendar, ShieldCheck, ArrowLeft, Users, ExternalLink
 } from 'lucide-react';
 import { User, CustomerRecord } from '../../../types/banking';
 import { safeApiFetch } from '../../../utils/apiClient';
 import { ASSIGNABLE_PROGRAMMES } from '../../../utils/roleRouting';
+import { CentralCustomerDirectory } from '../../../components/internal/CentralCustomerDirectory';
+import { CustomerProfileModal } from '../../../components/internal/CustomerProfileModal';
 
 interface LoanOfficerDashboardProps {
   currentUser: User | null;
@@ -18,8 +20,9 @@ export const LoanOfficerDashboard: React.FC<LoanOfficerDashboardProps> = ({
   onLogout,
   onNavigate,
 }) => {
-  const [activeTab, setActiveTab] = useState<'applications' | 'new-loan' | 'schedules' | 'overdue'>('applications');
+  const [activeTab, setActiveTab] = useState<'applications' | 'directory' | 'new-loan' | 'schedules' | 'overdue'>('applications');
   const [customers, setCustomers] = useState<CustomerRecord[]>([]);
+  const [profileCustomer, setProfileCustomer] = useState<CustomerRecord | null>(null);
   const [loans, setLoans] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [banner, setBanner] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);

@@ -1346,9 +1346,17 @@ function toFirestoreRestFields(obj: Record<string, any>): Record<string, any> {
       fields[k] = {
         arrayValue: {
           values: v.map((item) => {
+            if (item === null || item === undefined) return { nullValue: null };
             if (typeof item === 'string') return { stringValue: item };
-            if (typeof item === 'number') return { doubleValue: item };
+            if (typeof item === 'number') {
+              return Number.isInteger(item)
+                ? { integerValue: String(item) }
+                : { doubleValue: item };
+            }
             if (typeof item === 'boolean') return { booleanValue: item };
+            if (typeof item === 'object' && !Array.isArray(item)) {
+              return { mapValue: { fields: toFirestoreRestFields(item) } };
+            }
             return { stringValue: String(item) };
           }),
         },
@@ -1381,10 +1389,12 @@ function fromFirestoreRestFields(fields?: Record<string, any>): Record<string, a
     else if ('arrayValue' in valObj) {
       const arr = valObj.arrayValue?.values || [];
       result[k] = arr.map((item: any) => {
+        if (!item || typeof item !== 'object') return null;
         if ('stringValue' in item) return item.stringValue;
         if ('booleanValue' in item) return Boolean(item.booleanValue);
         if ('integerValue' in item) return Number(item.integerValue);
         if ('doubleValue' in item) return Number(item.doubleValue);
+        if ('mapValue' in item) return fromFirestoreRestFields(item.mapValue?.fields);
         return null;
       });
     }

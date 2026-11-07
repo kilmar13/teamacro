@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   FileSpreadsheet, Search, RefreshCw, LogOut, CheckCircle2, AlertTriangle,
-  Download, ShieldAlert, Scale, Layers, FileText, ArrowLeft
+  Download, ShieldAlert, Scale, Layers, FileText, ArrowLeft, Users, ExternalLink
 } from 'lucide-react';
 import { User, CustomerRecord } from '../../../types/banking';
 import { safeApiFetch } from '../../../utils/apiClient';
 import { ASSIGNABLE_PROGRAMMES } from '../../../utils/roleRouting';
+import { CentralCustomerDirectory } from '../../../components/internal/CentralCustomerDirectory';
+import { CustomerProfileModal } from '../../../components/internal/CustomerProfileModal';
 
 interface AccountsOfficerDashboardProps {
   currentUser: User | null;
@@ -18,8 +20,9 @@ export const AccountsOfficerDashboard: React.FC<AccountsOfficerDashboardProps> =
   onLogout,
   onNavigate,
 }) => {
-  const [activeTab, setActiveTab] = useState<'review' | 'reconcile' | 'discrepancies' | 'reports'>('review');
+  const [activeTab, setActiveTab] = useState<'review' | 'directory' | 'reconcile' | 'discrepancies' | 'reports'>('review');
   const [customers, setCustomers] = useState<CustomerRecord[]>([]);
+  const [profileCustomer, setProfileCustomer] = useState<CustomerRecord | null>(null);
   const [collections, setCollections] = useState<any[]>([]);
   const [loans, setLoans] = useState<any[]>([]);
   const [reconciliations, setReconciliations] = useState<any[]>([]);
@@ -202,6 +205,7 @@ export const AccountsOfficerDashboard: React.FC<AccountsOfficerDashboardProps> =
         <div className="max-w-7xl mx-auto px-6 flex gap-1 overflow-x-auto border-t border-slate-800/60">
           {[
             { id: 'review', label: 'Collections, Disbursements & Balances', icon: Layers },
+            { id: 'directory', label: 'Central Customer Directory', icon: Users },
             { id: 'reconcile', label: 'Assist With Reconciliation', icon: Scale },
             { id: 'discrepancies', label: 'Discrepancy Identification', icon: AlertTriangle },
             { id: 'reports', label: 'Financial Summaries & Reports', icon: FileText },
@@ -282,6 +286,19 @@ export const AccountsOfficerDashboard: React.FC<AccountsOfficerDashboardProps> =
           </div>
         </div>
 
+        {activeTab === 'directory' && (
+          <div className="text-slate-900">
+            <CentralCustomerDirectory
+              title="Central Customer Directory (Accounts Officer Access)"
+              subtitle="Click any customer name to inspect their full profile, separate Next of Kin & Guarantor sections, original registering staff member, and financial activity timeline."
+              canCreateCustomer={false}
+              canEditCustomer={true}
+              canRecordActivity={true}
+              onCustomersChanged={(list) => setCustomers(list)}
+            />
+          </div>
+        )}
+
         {activeTab === 'review' && (
           <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden">
             <div className="p-4 border-b border-slate-800 flex items-center justify-between gap-3">
@@ -302,8 +319,9 @@ export const AccountsOfficerDashboard: React.FC<AccountsOfficerDashboardProps> =
                 <thead>
                   <tr className="border-b border-slate-800 text-[11px] uppercase text-slate-400 bg-slate-950/60">
                     <th className="py-3 px-4">Customer Code</th>
-                    <th className="py-3 px-4">Customer Name</th>
+                    <th className="py-3 px-4">Customer Name (Click for Profile)</th>
                     <th className="py-3 px-4">Phone</th>
+                    <th className="py-3 px-4">Registered By</th>
                     <th className="py-3 px-4">Recorded Collections</th>
                     <th className="py-3 px-4">Status</th>
                   </tr>
@@ -323,8 +341,20 @@ export const AccountsOfficerDashboard: React.FC<AccountsOfficerDashboardProps> =
                       return (
                         <tr key={c.id} className="hover:bg-slate-800/30">
                           <td className="py-3 px-4 font-mono text-cyan-400">{c.customerCode || c.id}</td>
-                          <td className="py-3 px-4 font-medium text-white">{c.fullName}</td>
+                          <td className="py-3 px-4 font-medium text-white">
+                            <button
+                              type="button"
+                              onClick={() => setProfileCustomer(c)}
+                              className="font-bold text-cyan-300 hover:text-white hover:underline flex items-center gap-1 text-left"
+                            >
+                              <span>{c.fullName}</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </button>
+                          </td>
                           <td className="py-3 px-4 font-mono text-slate-300">{c.phone}</td>
+                          <td className="py-3 px-4 text-slate-300">
+                            {c.registeredByName || c.registeredByStaffId || 'Not provided'}
+                          </td>
                           <td className="py-3 px-4 font-mono text-emerald-400 font-bold">
                             ₦{custCols.toLocaleString()}
                           </td>
@@ -488,6 +518,19 @@ export const AccountsOfficerDashboard: React.FC<AccountsOfficerDashboardProps> =
           </div>
         )}
       </main>
+
+      {profileCustomer && (
+        <CustomerProfileModal
+          customer={profileCustomer}
+          onClose={() => setProfileCustomer(null)}
+          canEdit={true}
+          canRecordActivity={true}
+          onCustomerUpdated={(updated) => {
+            setProfileCustomer(updated);
+            setCustomers((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+          }}
+        />
+      )}
     </div>
   );
 };

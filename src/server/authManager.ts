@@ -4884,6 +4884,27 @@ class ServerAuthManager {
       status: 'SUCCESS',
     });
 
+    // Append to customer's activity history timeline while preserving original registering officer
+    this.appendCustomerActivity(
+      record.customerId || record.accountNumber || record.customerName,
+      actorSession,
+      {
+        category:
+          record.collectionType === 'LOAN_REPAYMENT'
+            ? 'PAYMENT_COLLECTION'
+            : 'SAVINGS_CONTRIBUTION',
+        action:
+          record.collectionType === 'LOAN_REPAYMENT'
+            ? 'Loan Repayment Collection'
+            : 'Savings Contribution Recorded',
+        description: `Recorded ${
+          record.collectionType === 'LOAN_REPAYMENT' ? 'loan repayment' : 'savings contribution'
+        } of ₦${amount.toLocaleString()} under ${record.programme} via ${record.paymentMethod} (Ref: ${reference}).`,
+        reference,
+        amount,
+      }
+    );
+
     return { success: true, statusCode: 201, record };
   }
 
@@ -4908,6 +4929,8 @@ class ServerAuthManager {
       purpose: string;
       guarantorName: string;
       guarantorPhone: string;
+      guarantorRelationship?: string;
+      guarantorAddress?: string;
       stage?: string;
     }
   ): { success: boolean; statusCode?: number; error?: string; record?: any } {
@@ -4980,6 +5003,8 @@ class ServerAuthManager {
       purpose: payload.purpose?.trim() || existing?.purpose || 'Working Capital Financing',
       guarantorName: payload.guarantorName?.trim() || existing?.guarantorName || 'Verified Guarantor',
       guarantorPhone: payload.guarantorPhone?.trim() || existing?.guarantorPhone || '+234 800 000 0000',
+      guarantorRelationship: payload.guarantorRelationship?.trim() || existing?.guarantorRelationship || '',
+      guarantorAddress: payload.guarantorAddress?.trim() || existing?.guarantorAddress || '',
       stage: requestedStage,
       repaymentStatus: requestedStage === 'ACTIVE_DISBURSED' ? 'ON_SCHEDULE' : 'AWAITING_DISBURSEMENT',
       nextDueDate: new Date(Date.now() + 30 * 86400000).toISOString().split('T')[0],
@@ -5001,6 +5026,18 @@ class ServerAuthManager {
       ip: actorSession.ip,
       status: 'SUCCESS',
     });
+
+    this.appendCustomerActivity(
+      record.customerId || record.accountNumber || record.customerName,
+      actorSession,
+      {
+        category: 'LOAN_ACTIVITY',
+        action: existing ? 'Loan Application Updated' : 'Loan Application Submitted',
+        description: `${existing ? 'Updated' : 'Originated'} loan facility ${record.loanCode} for ₦${principal.toLocaleString()} (${record.programme}, Stage: ${requestedStage}).`,
+        reference: record.loanCode,
+        amount: principal,
+      }
+    );
 
     return { success: true, statusCode: existing ? 200 : 201, record };
   }
@@ -5130,10 +5167,203 @@ class ServerAuthManager {
       status: 'SUCCESS',
     });
 
+    this.appendCustomerActivity(
+      target.customerId || target.accountNumber || target.customerName,
+      actorSession,
+      {
+        category: 'CORRECTION_REVERSAL',
+        action: 'Authorised Transaction Reversal',
+        description: `Reversed transaction ${target.reference} (₦${Number(target.amount || 0).toLocaleString()}): ${target.reversalReason}.`,
+        reference: target.reference,
+        amount: Number(target.amount || 0),
+      }
+    );
+
     return { success: true, statusCode: 200, record: target };
   }
 
-  public saveCustomerRecord(customerData: any): any {
+  public resolveActorEmployeeIdentity(
+    actorSession?: UserSession,
+    fallbackStaffId?: string,
+    fallbackName?: string,
+    fallbackPosition?: string,
+    fallbackStaffCode?: string,
+    fallbackDepartment?: string
+  ): {
+    staffId: string;
+    fullName: string;
+    staffCode: string;
+    position: string;
+    role: string;
+    department: string;
+  } {
+    if (actorSession) {
+      const acc =
+        this.findAccountByIdentifier(actorSession.userId) ||
+        this.findAccountByIdentifier(actorSession.email);
+      const role = actorSession.role || acc?.role || 'STAFF';
+      const pos =
+        normalizeCanonicalPosition(
+          acc?.position || acc?.duty || actorSession.position || actorSession.roleTitle,
+          role
+        ) ||
+        acc?.position ||
+        acc?.duty ||
+        actorSession.position ||
+        actorSession.roleTitle ||
+        (role === 'LIFETIME_SUPER_ADMIN'
+          ? 'Lifetime Super Admin & Chief Executive'
+          : role === 'ADMIN'
+          ? 'Account Manager'
+          : 'Customer Registration Officer');
+      const staffCode =
+        acc?.staffCode ||
+        (role === 'LIFETIME_SUPER_ADMIN'
+          ? 'TMC-ROOT-0001'
+          : role === 'ADMIN'
+          ? `TMC-ADM-${String(actorSession.userId).slice(-4).toUpperCase()}`
+          : `TMC-STF-${String(actorSession.userId).slice(-4).toUpperCase()}`);
+      const department =
+        role === 'LIFETIME_SUPER_ADMIN'
+          ? 'Executive Board & Root Governance — Lagos Head Office'
+          : pos === 'Account Manager' || pos === 'Accounts Officer'
+          ? 'Finance, Treasury & Reconciliation Department — Lagos Head Office'
+          : pos === 'Operations Manager'
+          ? 'Branch Operations & Programme Supervision — Lagos Head Office'
+          : pos === 'Auditor'
+          ? 'Internal Audit & Regulatory Compliance — Lagos Head Office'
+          : pos === 'Loan Officer'
+          ? 'Credit & Micro-Loan Operations Department — Lagos Head Office'
+          : pos === 'Payment Collection Officer'
+          ? 'Field Collections & Savings Operations — Lagos Head Office'
+          : 'Customer Onboarding & KYC Department — Lagos Head Office';
+
+      return {
+        staffId: actorSession.userId,
+        fullName: acc?.fullName || actorSession.fullName || 'Authorised Staff',
+        staffCode,
+        position: pos,
+        role,
+        department,
+      };
+    }
+
+    const cleanId = String(fallbackStaffId || '').trim();
+    const matchedAcc = cleanId ? this.findAccountByIdentifier(cleanId) : undefined;
+    const role = matchedAcc?.role || (cleanId === 'OWNER_ROOT_3YPAFKI2' ? 'LIFETIME_SUPER_ADMIN' : 'STAFF');
+    const pos =
+      fallbackPosition ||
+      normalizeCanonicalPosition(matchedAcc?.position || matchedAcc?.duty || matchedAcc?.roleTitle, role) ||
+      matchedAcc?.position ||
+      matchedAcc?.duty ||
+      matchedAcc?.roleTitle ||
+      (role === 'LIFETIME_SUPER_ADMIN'
+        ? 'Lifetime Super Admin & Chief Executive'
+        : 'Customer Registration Officer');
+    const staffCode =
+      fallbackStaffCode ||
+      matchedAcc?.staffCode ||
+      (role === 'LIFETIME_SUPER_ADMIN'
+        ? 'TMC-ROOT-0001'
+        : cleanId
+        ? `TMC-STF-${cleanId.slice(-4).toUpperCase()}`
+        : 'TMC-SYS-0001');
+    const department =
+      fallbackDepartment ||
+      (role === 'LIFETIME_SUPER_ADMIN'
+        ? 'Executive Board & Root Governance — Lagos Head Office'
+        : 'Customer Onboarding & KYC Department — Lagos Head Office');
+
+    return {
+      staffId: cleanId || 'SYSTEM',
+      fullName: fallbackName || matchedAcc?.fullName || 'System Registration Officer',
+      staffCode,
+      position: pos,
+      role,
+      department,
+    };
+  }
+
+  public findCustomerByIdentifier(identifier: string): any | null {
+    const clean = String(identifier || '').trim();
+    if (!clean) return null;
+    if (this.customers.has(clean)) return this.customers.get(clean);
+    const lower = clean.toLowerCase();
+    const cleanPhone = clean.replace(/\s+/g, '');
+    for (const c of this.customers.values()) {
+      if (
+        String(c.id || '').toLowerCase() === lower ||
+        String(c.customerCode || '').toLowerCase() === lower ||
+        String(c.accountNumber || '').toLowerCase() === lower ||
+        String(c.fullName || '').toLowerCase() === lower ||
+        (cleanPhone && String(c.phone || '').replace(/\s+/g, '') === cleanPhone)
+      ) {
+        return c;
+      }
+    }
+    return null;
+  }
+
+  public appendCustomerActivity(
+    customerIdentifier: string,
+    actorSession: UserSession,
+    activity: {
+      category:
+        | 'REGISTRATION'
+        | 'PROFILE_UPDATE'
+        | 'SAVINGS_CONTRIBUTION'
+        | 'LOAN_ACTIVITY'
+        | 'PAYMENT_COLLECTION'
+        | 'ACCOUNT_ADJUSTMENT'
+        | 'CORRECTION_REVERSAL';
+      action: string;
+      description: string;
+      reference?: string;
+      amount?: number;
+    }
+  ): any | null {
+    const customer = this.findCustomerByIdentifier(customerIdentifier);
+    if (!customer) return null;
+
+    const actor = this.resolveActorEmployeeIdentity(actorSession);
+    const nowIso = new Date().toISOString();
+    const newEntry = {
+      id: `ACT_${Date.now()}_${crypto.randomBytes(2).toString('hex').toUpperCase()}`,
+      timestamp: nowIso,
+      category: activity.category,
+      action: activity.action,
+      description: activity.description,
+      actorId: actor.staffId,
+      actorName: actor.fullName,
+      actorStaffCode: actor.staffCode,
+      actorRole: actor.role,
+      actorPosition: actor.position,
+      actorDepartment: actor.department,
+      ...(activity.reference ? { reference: activity.reference } : {}),
+      ...(typeof activity.amount === 'number' ? { amount: activity.amount } : {}),
+    };
+
+    const existingHistory = Array.isArray(customer.activityHistory) ? customer.activityHistory : [];
+    const updatedCustomer = {
+      ...customer,
+      lastModifiedByStaffId: actor.staffId,
+      lastModifiedByName: actor.fullName,
+      lastModifiedByPosition: actor.position,
+      updatedAt: nowIso,
+      activityHistory: [newEntry, ...existingHistory],
+    };
+
+    this.customers.set(customer.id, updatedCustomer);
+    this.persistCustomers();
+    writeFirestoreDocument('customers', customer.id, updatedCustomer).catch(() => {});
+    return updatedCustomer;
+  }
+
+  public saveCustomerRecord(
+    customerData: any,
+    actorSession?: UserSession,
+    options?: { fromFirestoreSync?: boolean }
+  ): any {
     if (!customerData || (!customerData.fullName && !customerData.phone)) {
       throw new Error('Customer full name and phone number are required.');
     }
@@ -5141,12 +5371,20 @@ class ServerAuthManager {
     const cleanedPhone = String(customerData.phone || '').replace(/\s+/g, '');
     const cleanEmail = String(customerData.email || '').trim().toLowerCase();
 
-    // Check if customer already exists by ID, phone, or email
+    // Check if customer already exists by ID, customerCode, phone, or email
     let existing: any = null;
     if (customerData.id && this.customers.has(customerData.id)) {
       existing = this.customers.get(customerData.id);
     } else {
       for (const c of this.customers.values()) {
+        if (
+          customerData.customerCode &&
+          c.customerCode &&
+          String(c.customerCode).toLowerCase() === String(customerData.customerCode).toLowerCase()
+        ) {
+          existing = c;
+          break;
+        }
         if (cleanedPhone && String(c.phone || '').replace(/\s+/g, '') === cleanedPhone) {
           existing = c;
           break;
@@ -5159,13 +5397,212 @@ class ServerAuthManager {
     }
 
     const count = this.customers.size + 1;
-    const id = existing?.id || customerData.id || `cust_${String(count).padStart(3, '0')}_${Date.now().toString(36).slice(-4)}`;
-    const customerCode = existing?.customerCode || customerData.customerCode || `TMC-CST-${1000 + count}`;
+    const id =
+      existing?.id ||
+      customerData.id ||
+      `cust_${String(count).padStart(3, '0')}_${Date.now().toString(36).slice(-4)}`;
+    const customerCode =
+      existing?.customerCode || customerData.customerCode || `TMC-CST-${1000 + count}`;
     const accountNumber =
       existing?.accountNumber ||
       customerData.accountNumber ||
       `2038${String(100000 + count * 137 + (Date.now() % 1000)).slice(-6)}`;
-    const nowDate = new Date().toISOString().split('T')[0];
+    const nowIso = new Date().toISOString();
+    const nowDate = nowIso.split('T')[0];
+
+    const isFromFirestore = Boolean(options?.fromFirestoreSync);
+
+    // Resolve original registering officer (IMMUTABLE once a customer record is created)
+    let regOfficer: {
+      staffId: string;
+      fullName: string;
+      staffCode: string;
+      position: string;
+      role: string;
+      department: string;
+    };
+
+    if (existing && existing.registeredByStaffId && existing.registeredByStaffId !== 'SYSTEM') {
+      // Preserve the original registering officer permanently even when Staff B updates the customer!
+      regOfficer = this.resolveActorEmployeeIdentity(
+        undefined,
+        existing.registeredByStaffId,
+        existing.registeredByName,
+        existing.registeredByPosition,
+        existing.registeredByStaffCode,
+        existing.registeredByDepartment
+      );
+      regOfficer.role = existing.registeredByRole || regOfficer.role;
+    } else if (!existing && actorSession && !isFromFirestore) {
+      // New registration by authenticated employee: capture identity directly from session (cannot be spoofed)
+      regOfficer = this.resolveActorEmployeeIdentity(actorSession);
+    } else {
+      // Hydrating from Firestore or legacy record
+      regOfficer = this.resolveActorEmployeeIdentity(
+        isFromFirestore ? undefined : actorSession,
+        customerData.registeredByStaffId || existing?.registeredByStaffId,
+        customerData.registeredByName || existing?.registeredByName,
+        customerData.registeredByPosition || existing?.registeredByPosition,
+        customerData.registeredByStaffCode || existing?.registeredByStaffCode,
+        customerData.registeredByDepartment || existing?.registeredByDepartment
+      );
+      if (customerData.registeredByRole || existing?.registeredByRole) {
+        regOfficer.role = customerData.registeredByRole || existing?.registeredByRole;
+      }
+    }
+
+    const registrationDate =
+      existing?.registrationDate || customerData.registrationDate || nowDate;
+    const registeredAt =
+      existing?.registeredAt ||
+      customerData.registeredAt ||
+      existing?.createdAt ||
+      customerData.createdAt ||
+      nowIso;
+
+    // Separate Next of Kin and Guarantor fields (never conflated; show empty string when not provided)
+    const nextOfKinName = String(
+      customerData.nextOfKinName ?? existing?.nextOfKinName ?? ''
+    ).trim();
+    const nextOfKinPhone = String(
+      customerData.nextOfKinPhone ?? existing?.nextOfKinPhone ?? ''
+    ).trim();
+    const nextOfKinRelationship = String(
+      customerData.nextOfKinRelationship ?? existing?.nextOfKinRelationship ?? ''
+    ).trim();
+    const nextOfKinAddress = String(
+      customerData.nextOfKinAddress ?? existing?.nextOfKinAddress ?? ''
+    ).trim();
+
+    const guarantorName = String(
+      customerData.guarantorName ?? existing?.guarantorName ?? ''
+    ).trim();
+    const guarantorPhone = String(
+      customerData.guarantorPhone ?? existing?.guarantorPhone ?? ''
+    ).trim();
+    const guarantorRelationship = String(
+      customerData.guarantorRelationship ?? existing?.guarantorRelationship ?? ''
+    ).trim();
+    const guarantorAddress = String(
+      customerData.guarantorAddress ?? existing?.guarantorAddress ?? ''
+    ).trim();
+    const guarantorOccupation = String(
+      customerData.guarantorOccupation ?? existing?.guarantorOccupation ?? ''
+    ).trim();
+    const guarantorVerificationStatus = String(
+      customerData.guarantorVerificationStatus ??
+        existing?.guarantorVerificationStatus ??
+        (guarantorName ? 'Pending Verification' : 'Not Provided')
+    ).trim();
+
+    // Merge activity history without allowing loss or deletion of existing audit trail
+    const byActivityId = new Map<string, any>();
+    const existingHistory = Array.isArray(existing?.activityHistory)
+      ? existing.activityHistory
+      : [];
+    const incomingHistory = Array.isArray(customerData.activityHistory)
+      ? customerData.activityHistory
+      : [];
+
+    for (const item of [...existingHistory, ...incomingHistory]) {
+      if (item && item.id) {
+        byActivityId.set(item.id, item);
+      }
+    }
+
+    // Ensure initial REGISTRATION entry always exists in activityHistory
+    const hasRegEntry = Array.from(byActivityId.values()).some(
+      (a) => a.category === 'REGISTRATION'
+    );
+    if (!hasRegEntry) {
+      const regEntryId = `ACT_REG_${id}`;
+      byActivityId.set(regEntryId, {
+        id: regEntryId,
+        timestamp: registeredAt,
+        category: 'REGISTRATION',
+        action: 'Customer Registration',
+        description: `Customer profile registered by ${regOfficer.fullName} (${regOfficer.position}, Staff ID: ${regOfficer.staffCode}).`,
+        actorId: regOfficer.staffId,
+        actorName: regOfficer.fullName,
+        actorStaffCode: regOfficer.staffCode,
+        actorRole: regOfficer.role,
+        actorPosition: regOfficer.position,
+        actorDepartment: regOfficer.department,
+      });
+    }
+
+    // If an authenticated employee is updating an existing customer, record their update separately
+    let lastModifiedByStaffId = existing?.lastModifiedByStaffId || regOfficer.staffId;
+    let lastModifiedByName = existing?.lastModifiedByName || regOfficer.fullName;
+    let lastModifiedByPosition = existing?.lastModifiedByPosition || regOfficer.position;
+
+    if (existing && actorSession && !isFromFirestore) {
+      const modifier = this.resolveActorEmployeeIdentity(actorSession);
+      lastModifiedByStaffId = modifier.staffId;
+      lastModifiedByName = modifier.fullName;
+      lastModifiedByPosition = modifier.position;
+
+      const changedFields: string[] = [];
+      if (customerData.fullName && customerData.fullName.trim() !== existing.fullName) {
+        changedFields.push('full name');
+      }
+      if (customerData.phone && customerData.phone.trim() !== existing.phone) {
+        changedFields.push('primary phone');
+      }
+      if (customerData.altPhone !== undefined && String(customerData.altPhone).trim() !== String(existing.altPhone || '')) {
+        changedFields.push('alternative phone');
+      }
+      if (customerData.email !== undefined && cleanEmail !== String(existing.email || '').toLowerCase()) {
+        changedFields.push('email');
+      }
+      if (customerData.address && customerData.address.trim() !== existing.address) {
+        changedFields.push('residential address');
+      }
+      if (customerData.ninOrBvn && customerData.ninOrBvn.trim() !== existing.ninOrBvn) {
+        changedFields.push('KYC identification (NIN/BVN)');
+      }
+      if (nextOfKinName !== (existing.nextOfKinName || '') || nextOfKinPhone !== (existing.nextOfKinPhone || '')) {
+        changedFields.push('Next of Kin details');
+      }
+      if (
+        guarantorName !== (existing.guarantorName || '') ||
+        guarantorPhone !== (existing.guarantorPhone || '') ||
+        guarantorVerificationStatus !== (existing.guarantorVerificationStatus || 'Not Provided')
+      ) {
+        changedFields.push('Guarantor details');
+      }
+      if (customerData.status && String(customerData.status).toLowerCase() !== String(existing.status || 'active').toLowerCase()) {
+        changedFields.push(`status (${existing.status} -> ${customerData.status})`);
+      }
+      if (customerData.enrolledProgrammes) {
+        changedFields.push('programme associations');
+      }
+
+      const updateSummary =
+        customerData.updateNote ||
+        (changedFields.length > 0
+          ? `Updated customer ${changedFields.join(', ')}.`
+          : 'Reviewed and updated customer profile information.');
+
+      const updateEntryId = `ACT_UPD_${Date.now()}_${crypto.randomBytes(2).toString('hex').toUpperCase()}`;
+      byActivityId.set(updateEntryId, {
+        id: updateEntryId,
+        timestamp: nowIso,
+        category: customerData.activityCategory || 'PROFILE_UPDATE',
+        action: customerData.activityAction || 'Customer Information Update',
+        description: `${updateSummary} (Original registering officer ${regOfficer.fullName} preserved).`,
+        actorId: modifier.staffId,
+        actorName: modifier.fullName,
+        actorStaffCode: modifier.staffCode,
+        actorRole: modifier.role,
+        actorPosition: modifier.position,
+        actorDepartment: modifier.department,
+      });
+    }
+
+    const sortedActivityHistory = Array.from(byActivityId.values()).sort(
+      (a, b) => new Date(b.timestamp || 0).getTime() - new Date(a.timestamp || 0).getTime()
+    );
 
     const record = {
       ...(existing || {}),
@@ -5175,35 +5612,79 @@ class ServerAuthManager {
       accountNumber,
       fullName: String(customerData.fullName || existing?.fullName || '').trim(),
       phone: String(customerData.phone || existing?.phone || '').trim(),
+      altPhone: String(customerData.altPhone ?? existing?.altPhone ?? '').trim(),
       email: cleanEmail || existing?.email || '',
-      address: String(customerData.address || customerData.residentialAddress || existing?.address || 'Lagos, Nigeria').trim(),
-      state: String(customerData.state || existing?.state || 'Lagos').trim(),
-      lga: String(customerData.lga || existing?.lga || 'Metropolitan').trim(),
-      ninOrBvn: String(customerData.ninOrBvn || customerData.kycIdNumber || customerData.bvn || customerData.nin || existing?.ninOrBvn || '').trim(),
-      occupation: String(customerData.occupation || existing?.occupation || 'Member').trim(),
-      nextOfKinName: String(customerData.nextOfKinName || existing?.nextOfKinName || '').trim(),
-      nextOfKinPhone: String(customerData.nextOfKinPhone || existing?.nextOfKinPhone || customerData.phone || '').trim(),
-      nextOfKinRelationship: String(customerData.nextOfKinRelationship || existing?.nextOfKinRelationship || 'Relative').trim(),
-      registrationDate: existing?.registrationDate || customerData.registrationDate || nowDate,
-      registeredByStaffId: customerData.registeredByStaffId || customerData.assignedStaffId || existing?.registeredByStaffId || 'SYSTEM',
-      status: (customerData.status || existing?.status || 'active').toLowerCase(),
+      address: String(
+        customerData.address ?? customerData.residentialAddress ?? existing?.address ?? ''
+      ).trim(),
+      state: String(customerData.state ?? existing?.state ?? '').trim(),
+      lga: String(customerData.lga ?? existing?.lga ?? '').trim(),
+      ninOrBvn: String(
+        customerData.ninOrBvn ??
+          customerData.kycIdNumber ??
+          customerData.bvn ??
+          customerData.nin ??
+          existing?.ninOrBvn ??
+          ''
+      ).trim(),
+      idType: String(customerData.idType ?? existing?.idType ?? '').trim(),
+      dateOfBirth: String(customerData.dateOfBirth ?? existing?.dateOfBirth ?? '').trim(),
+      gender: String(customerData.gender ?? existing?.gender ?? '').trim(),
+      occupation: String(customerData.occupation ?? existing?.occupation ?? '').trim(),
+      // Separate Next of Kin section
+      nextOfKinName,
+      nextOfKinPhone,
+      nextOfKinRelationship,
+      nextOfKinAddress,
+      // Separate Guarantor section
+      guarantorName,
+      guarantorPhone,
+      guarantorRelationship,
+      guarantorAddress,
+      guarantorOccupation,
+      guarantorVerificationStatus,
+      // Permanent Registration Information
+      registrationDate,
+      registeredAt,
+      createdAt: existing?.createdAt || customerData.createdAt || registeredAt,
+      registeredByStaffId: regOfficer.staffId,
+      registeredByName: regOfficer.fullName,
+      registeredByStaffCode: regOfficer.staffCode,
+      registeredByPosition: regOfficer.position,
+      registeredByRole: regOfficer.role,
+      registeredByDepartment: regOfficer.department,
+      lastModifiedByStaffId,
+      lastModifiedByName,
+      lastModifiedByPosition,
+      status: String(customerData.status || existing?.status || 'active').toLowerCase(),
       enrolledProgrammes: Array.isArray(customerData.enrolledProgrammes)
         ? customerData.enrolledProgrammes
         : Array.isArray(existing?.enrolledProgrammes)
         ? existing.enrolledProgrammes
         : [],
-      updatedAt: new Date().toISOString(),
+      activityHistory: sortedActivityHistory,
+      updatedAt: isFromFirestore ? customerData.updatedAt || existing?.updatedAt || nowIso : nowIso,
     };
+
+    delete record.updateNote;
+    delete record.activityCategory;
+    delete record.activityAction;
 
     this.customers.set(id, record);
     this.persistCustomers();
+
+    if (!isFromFirestore) {
+      writeFirestoreDocument('customers', id, record).catch(() => {});
+    }
+
     return record;
   }
 
   public getCustomersList(): any[] {
+    // Customers remain permanently visible regardless of how long ago they were registered or last viewed (>30 days included)
     return Array.from(this.customers.values()).sort((a, b) => {
-      const tA = new Date(a.updatedAt || a.registrationDate || 0).getTime();
-      const tB = new Date(b.updatedAt || b.registrationDate || 0).getTime();
+      const tA = new Date(a.registeredAt || a.registrationDate || a.updatedAt || 0).getTime();
+      const tB = new Date(b.registeredAt || b.registrationDate || b.updatedAt || 0).getTime();
       return tB - tA;
     });
   }

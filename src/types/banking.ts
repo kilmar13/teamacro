@@ -108,29 +108,89 @@ export interface StaffUser {
   lastActivityAt?: string;
 }
 
+export interface CustomerActivityEntry {
+  id: string;
+  customerId?: string;
+  timestamp: string;
+  category:
+    | 'REGISTRATION'
+    | 'PROFILE_UPDATE'
+    | 'SAVINGS_CONTRIBUTION'
+    | 'LOAN_ACTIVITY'
+    | 'PAYMENT_COLLECTION'
+    | 'ACCOUNT_ADJUSTMENT'
+    | 'CORRECTION_REVERSAL';
+  action: string;
+  description: string;
+  actorId: string;
+  actorName: string;
+  actorStaffCode?: string;
+  actorRole: string;
+  actorPosition?: string;
+  actorDepartment?: string;
+  performedByUserId?: string;
+  performedByName?: string;
+  performedByStaffCode?: string;
+  performedByRole?: string;
+  performedByPosition?: string;
+  reference?: string;
+  amount?: number;
+  metadata?: Record<string, any>;
+}
+
 export interface CustomerRecord {
   id: string;
   customerCode: string;
+  accountNumber?: string;
   fullName: string;
   email: string;
   phone: string;
   altPhone?: string;
   address: string;
   ninOrBvn: string;
+  idType?: string;
+  dateOfBirth?: string;
+  gender?: string;
   state: string;
   lga: string;
   occupation: string;
+  // A. Next of Kin Details
   nextOfKinName: string;
   nextOfKinPhone: string;
   nextOfKinRelationship: string;
+  nextOfKinRelation?: string;
+  nextOfKinAddress?: string;
+  // B. Guarantor Details (Separate from Next of Kin)
+  guarantorName?: string;
+  guarantorPhone?: string;
+  guarantorRelationship?: string;
+  guarantorAddress?: string;
+  guarantorOccupation?: string;
+  guarantorVerificationStatus?: 'Verified' | 'Pending Verification' | 'Unverified' | 'Not Provided' | 'VERIFIED' | 'PENDING' | 'UNVERIFIED' | 'NOT_PROVIDED' | string;
+  // C. Permanent Registration Information (Original Registering Officer)
   registrationDate: string;
+  registeredAt?: string;
   createdAt?: string;
   joinedDate?: string;
   registeredByStaffId: string;
-  status: 'active' | 'suspended' | 'dormant' | 'ACTIVE' | 'INACTIVE' | string;
+  registeredByName?: string;
+  registeredByStaffCode?: string;
+  registeredByPosition?: string;
+  registeredByRole?: string;
+  registeredByDepartment?: string;
+  lastModifiedByStaffId?: string;
+  lastModifiedByName?: string;
+  lastModifiedByPosition?: string;
+  lastModifiedByRole?: string;
+  lastModifiedAt?: string;
+  updatedAt?: string;
+  kycStatus?: string;
+  status: 'active' | 'suspended' | 'dormant' | 'ACTIVE' | 'INACTIVE' | 'SUSPENDED' | string;
   avatarUrl?: string;
   notes?: string;
   enrolledProgrammes?: string[];
+  enrolledSchemes?: string[];
+  activityHistory?: CustomerActivityEntry[];
 }
 
 export interface FixedTargetPlan {

@@ -14,9 +14,12 @@ import {
   AlertTriangle,
   Eye,
   X,
+  ExternalLink,
 } from 'lucide-react';
-import { User } from '../../../types/banking';
+import { User, CustomerRecord } from '../../../types/banking';
 import { safeApiFetch } from '../../../utils/apiClient';
+import { CentralCustomerDirectory } from '../../../components/internal/CentralCustomerDirectory';
+import { CustomerProfileModal } from '../../../components/internal/CustomerProfileModal';
 
 interface AuditorDashboardProps {
   currentUser: User | null;
@@ -36,7 +39,8 @@ export const AuditorDashboard: React.FC<AuditorDashboardProps> = ({
   const [collections, setCollections] = useState<any[]>([]);
   const [loans, setLoans] = useState<any[]>([]);
   const [reconciliations, setReconciliations] = useState<any[]>([]);
-  const [customers, setCustomers] = useState<any[]>([]);
+  const [customers, setCustomers] = useState<CustomerRecord[]>([]);
+  const [profileCustomer, setProfileCustomer] = useState<CustomerRecord | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedRecord, setSelectedRecord] = useState<any | null>(null);

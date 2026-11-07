@@ -56,6 +56,9 @@ import { formatNaira, formatLagosDate, nairaToKobo, koboToNaira } from '../../ut
 import { BrandLogo } from '../../components/common/BrandLogo';
 import { ThemeSelector } from '../../components/common/ThemeSelector';
 import { normalizeError } from '../../utils/errorNormalizer';
+import { isReadOnlyAuditor } from '../../utils/roleRouting';
+import { CentralCustomerDirectory } from '../../components/internal/CentralCustomerDirectory';
+import { CustomerProfileModal } from '../../components/internal/CustomerProfileModal';
 
 interface StaffPortalProps {
   config: BankConfig;
@@ -1150,7 +1153,7 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({ config, onNavigate, cu
                 </div>
                 <div className="flex flex-wrap items-center gap-2.5">
                   <button
-                    onClick={() => setModalType('register_customer')}
+                    onClick={() => setActiveTab('customers')}
                     className="px-5 py-2.5 bg-[#0B2A5B] hover:bg-[#1E5BD8] text-white rounded-full text-xs font-display font-bold flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
                   >
                     <Plus size={15} />
@@ -1404,7 +1407,24 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({ config, onNavigate, cu
                             {p.reference}
                           </td>
                           <td className="px-4 py-3 font-semibold text-slate-900 dark:text-white">
-                            {p.customerName}
+                            {(() => {
+                              const matchedCust = customers.find(
+                                (c) =>
+                                  c.id === p.customerId ||
+                                  c.fullName.toLowerCase() === (p.customerName || '').toLowerCase()
+                              );
+                              return matchedCust ? (
+                                <button
+                                  type="button"
+                                  onClick={() => setSelectedCustomer(matchedCust)}
+                                  className="font-bold text-[#1E5BD8] dark:text-blue-400 hover:underline text-left cursor-pointer"
+                                >
+                                  {p.customerName}
+                                </button>
+                              ) : (
+                                p.customerName
+                              );
+                            })()}
                           </td>
                           <td className="px-4 py-3">
                             <span
@@ -1470,149 +1490,17 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({ config, onNavigate, cu
           )}
 
           {/* ========================================================= */}
-          {/* 2. CUSTOMERS MANAGEMENT */}
+          {/* 2. CENTRAL CUSTOMER DIRECTORY */}
           {/* ========================================================= */}
           {activeTab === 'customers' && (
-            <div className="space-y-6">
-              <div className="bg-white dark:bg-[#0B1536] p-6 rounded-md border border-slate-200 dark:border-[#1E2E64] shadow-xs flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
-                <div>
-                  <div className="font-mono text-[10px] font-bold uppercase tracking-[0.2em] text-[#1E5BD8] dark:text-blue-400">
-                    MODULE 02 // CENTRAL CUSTOMER REGISTRY
-                  </div>
-                  <h1 className="font-display text-2xl sm:text-3xl font-extrabold text-[#0B2A5B] dark:text-white tracking-tight mt-1">
-                    Customer Records Directory
-                  </h1>
-                  <p className="text-xs sm:text-sm text-slate-500 dark:text-slate-400 mt-0.5">
-                    Internal customer profiles, enrolled programmes, and transaction activity
-                  </p>
-                </div>
-                <button
-                  onClick={() => setModalType('register_customer')}
-                  className="px-4 py-2.5 bg-[#0B2A5B] hover:bg-[#1E5BD8] text-white rounded-xs text-xs font-display font-bold uppercase tracking-wider flex items-center gap-1.5 shadow-xs transition-colors cursor-pointer"
-                >
-                  <Plus size={16} />
-                  <span>Register New Customer</span>
-                </button>
-              </div>
-
-              {/* Filters & Search */}
-              <div className="flex flex-wrap items-center gap-3 bg-white dark:bg-[#0B1536] p-4 rounded-md border border-slate-200 dark:border-[#1E2E64] shadow-xs">
-                <div className="flex-1 min-w-[240px] relative">
-                  <Search size={16} className="absolute left-3 top-2.5 text-slate-400" />
-                  <input
-                    type="text"
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Search by customer name, phone number, or ID..."
-                    className="w-full pl-9 pr-3 py-2 text-xs rounded-xs border border-slate-300 dark:border-slate-600 bg-[#F4F7FB] dark:bg-slate-900 focus:outline-none focus:border-[#2563EB]"
-                  />
-                </div>
-
-                <div className="flex items-center gap-2">
-                  <span className="text-xs text-slate-500 font-semibold">Status:</span>
-                  <select
-                    value={statusFilter}
-                    onChange={(e) => setStatusFilter(e.target.value)}
-                    className="text-xs rounded-xs border border-slate-300 dark:border-slate-600 bg-white dark:bg-slate-900 px-3 py-2 font-medium"
-                  >
-                    <option value="ALL">All Statuses</option>
-                    <option value="ACTIVE">Active Only</option>
-                    <option value="INACTIVE">Inactive</option>
-                  </select>
-                </div>
-              </div>
-
-              {/* Customers Table */}
-              <div className="bg-white dark:bg-[#0B1536] rounded-md border border-slate-200 dark:border-[#1E2E64] shadow-xs overflow-hidden">
-                <div className="overflow-x-auto">
-                  <table className="w-full text-left text-xs">
-                    <thead className="bg-[#0B2A5B] text-white font-display font-bold uppercase tracking-wider text-[10px]">
-                      <tr>
-                        <th className="px-4 py-3">Customer ID</th>
-                        <th className="px-4 py-3">Full Name</th>
-                        <th className="px-4 py-3">Phone & Email</th>
-                        <th className="px-4 py-3">Residential Address</th>
-                        <th className="px-4 py-3">Enrolled Programmes</th>
-                        <th className="px-4 py-3">Registered Date</th>
-                        <th className="px-4 py-3">Status</th>
-                        <th className="px-4 py-3 text-right">Actions</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-100 dark:divide-slate-800 font-medium">
-                      {filteredCustomers.length === 0 ? (
-                        <tr>
-                          <td colSpan={8} className="px-4 py-8 text-center text-slate-400">
-                            No customer records found. Click &ldquo;Register New Customer&rdquo; to enrol a customer.
-                          </td>
-                        </tr>
-                      ) : (
-                        filteredCustomers.map((cust) => (
-                          <tr key={cust.id} className="hover:bg-slate-50 dark:hover:bg-slate-800/60 transition-colors">
-                            <td className="px-4 py-3 font-mono font-bold text-[#1E5BD8] dark:text-blue-400">
-                              <div>{cust.customerCode || cust.id}</div>
-                              <div className="text-[10px] text-slate-400 font-normal">{cust.id}</div>
-                            </td>
-                            <td className="px-4 py-3">
-                              <div className="font-display font-bold text-[#0B2A5B] dark:text-white">
-                                {cust.fullName}
-                              </div>
-                              {cust.nextOfKinName && (
-                                <div className="text-[11px] text-slate-400">
-                                  NOK: {cust.nextOfKinName}
-                                </div>
-                              )}
-                            </td>
-                            <td className="px-4 py-3">
-                              <div className="font-semibold text-slate-800 dark:text-slate-200 tabular-nums">
-                                {cust.phone}
-                              </div>
-                              <div className="text-[11px] text-slate-400">
-                                {cust.email || 'No email registered'}
-                              </div>
-                            </td>
-                            <td className="px-4 py-3 text-slate-600 dark:text-slate-300 max-w-xs truncate">
-                              {cust.address}
-                            </td>
-                            <td className="px-4 py-3">
-                              <div className="flex flex-wrap gap-1">
-                                {cust.enrolledProgrammes && cust.enrolledProgrammes.length > 0 ? (
-                                  cust.enrolledProgrammes.map((p) => (
-                                    <span
-                                      key={p}
-                                      className="px-1.5 py-0.5 rounded-xs text-[10px] font-bold bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300"
-                                    >
-                                      {p.replace(/_/g, ' ')}
-                                    </span>
-                                  ))
-                                ) : (
-                                  <span className="text-slate-400 text-[11px]">None enrolled</span>
-                                )}
-                              </div>
-                            </td>
-                            <td className="px-4 py-3 text-slate-500 dark:text-slate-400 tabular-nums">
-                              {cust.registrationDate ? new Date(cust.registrationDate).toLocaleDateString() : 'Today'}
-                            </td>
-                            <td className="px-4 py-3">
-                              <span className="px-2 py-0.5 rounded-xs text-[10px] font-bold bg-emerald-100 text-emerald-800 dark:bg-emerald-900/60 dark:text-emerald-300">
-                                {(cust.status || 'active').toUpperCase()}
-                              </span>
-                            </td>
-                            <td className="px-4 py-3 text-right">
-                              <button
-                                onClick={() => setSelectedCustomer(cust)}
-                                className="px-3 py-1.5 text-xs font-display font-bold bg-[#0B2A5B] hover:bg-[#1E5BD8] text-white rounded-xs transition-colors cursor-pointer"
-                              >
-                                Profile & Enrol
-                              </button>
-                            </td>
-                          </tr>
-                        ))
-                      )}
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-            </div>
+            <CentralCustomerDirectory
+              title="Central Customer Directory — Staff Operations"
+              subtitle="Permanent, shared Firestore customer registry with clickable customer profiles, separate Next of Kin & Guarantor sections, original registering staff attribution, and complete activity history."
+              canCreateCustomer={!isReadOnlyAuditor(currentUser)}
+              canEditCustomer={!isReadOnlyAuditor(currentUser)}
+              canRecordActivity={!isReadOnlyAuditor(currentUser)}
+              onCustomersChanged={(updated) => setCustomers(updated)}
+            />
           )}
 
           {/* ========================================================= */}
@@ -1705,7 +1593,24 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({ config, onNavigate, cu
                             {p.reference}
                           </td>
                           <td className="px-4 py-3 font-bold text-slate-900 dark:text-white">
-                            {p.customerName}
+                            {(() => {
+                              const matchedCust = customers.find(
+                                (c) =>
+                                  c.id === p.customerId ||
+                                  c.fullName.toLowerCase() === (p.customerName || '').toLowerCase()
+                              );
+                              return matchedCust ? (
+                                <button
+                                  type="button"
+                                  onClick={() => setSelectedCustomer(matchedCust)}
+                                  className="font-bold text-[#1E5BD8] dark:text-blue-400 hover:underline text-left cursor-pointer"
+                                >
+                                  {p.customerName}
+                                </button>
+                              ) : (
+                                p.customerName
+                              );
+                            })()}
                           </td>
                           <td className="px-4 py-3">
                             <span className="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider uppercase bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-300">
@@ -3540,63 +3445,18 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({ config, onNavigate, cu
         </div>
       )}
 
-      {/* 11. Customer Profile Drawer / Modal */}
+      {/* 11. Dedicated Customer Profile Modal */}
       {selectedCustomer && (
-        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4">
-          <div className="bg-white dark:bg-slate-800 rounded-lg max-w-lg w-full p-6 space-y-4 shadow-xl border border-slate-200 dark:border-slate-700">
-            <div className="flex items-center justify-between border-b pb-3 border-slate-200 dark:border-slate-700">
-              <div>
-                <h3 className="font-extrabold text-base text-slate-900 dark:text-white">
-                  {selectedCustomer.fullName}
-                </h3>
-                <div className="text-xs font-mono text-slate-400">ID: {selectedCustomer.id}</div>
-              </div>
-              <button onClick={() => setSelectedCustomer(null)} className="text-slate-400 hover:text-slate-600">
-                <X size={20} />
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs">
-              <div className="grid grid-cols-2 gap-2 bg-slate-50 dark:bg-slate-900 p-3 rounded">
-                <div>Phone: <strong>{selectedCustomer.phone}</strong></div>
-                <div>Email: <strong>{selectedCustomer.email || 'N/A'}</strong></div>
-                <div>Registered: <strong>{new Date(selectedCustomer.registrationDate).toLocaleDateString()}</strong></div>
-                <div>Status: <strong className="text-emerald-600">{selectedCustomer.status}</strong></div>
-              </div>
-
-              <div>
-                <div className="font-bold text-slate-700 dark:text-slate-300 mb-1">Residential Address:</div>
-                <div className="text-slate-600 dark:text-slate-300 bg-slate-50 dark:bg-slate-900 p-2 rounded">
-                  {selectedCustomer.address}
-                </div>
-              </div>
-
-              <div>
-                <div className="font-bold text-slate-700 dark:text-slate-300 mb-1">Enrolled Programmes:</div>
-                <div className="flex flex-wrap gap-1">
-                  {selectedCustomer.enrolledProgrammes && selectedCustomer.enrolledProgrammes.length > 0 ? (
-                    selectedCustomer.enrolledProgrammes.map((p) => (
-                      <span key={p} className="px-2 py-0.5 rounded text-[10px] font-bold bg-blue-100 text-blue-800 dark:bg-blue-900/60 dark:text-blue-300">
-                        {p.replace(/_/g, ' ')}
-                      </span>
-                    ))
-                  ) : (
-                    <span className="text-slate-400">None currently enrolled</span>
-                  )}
-                </div>
-              </div>
-
-              <div className="pt-2 border-t flex justify-end">
-                <button
-                  onClick={() => setSelectedCustomer(null)}
-                  className="px-4 py-2 bg-slate-200 hover:bg-slate-300 dark:bg-slate-700 text-slate-800 dark:text-white rounded font-bold"
-                >
-                  Close Profile
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
+        <CustomerProfileModal
+          customer={selectedCustomer}
+          onClose={() => setSelectedCustomer(null)}
+          canEdit={!isReadOnlyAuditor(currentUser)}
+          canRecordActivity={!isReadOnlyAuditor(currentUser)}
+          onCustomerUpdated={(updated) => {
+            setSelectedCustomer(updated);
+            loadData();
+          }}
+        />
       )}
 
       {/* 12. Add Staff User Modal */}

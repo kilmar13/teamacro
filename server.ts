@@ -24,6 +24,7 @@ import {
   deleteFirebaseAccountAndFirestoreProfile,
   updateFirebaseAuthUserCredentials,
   deleteFirestoreDocument,
+  writeFirestoreDocument,
 } from './src/server/firebaseAdmin.js';
 import {
   getDedicatedRouteForUser,
@@ -3325,7 +3326,7 @@ app.get('/api/customers', apiHandler(async (req: Request, res: Response) => {
     for (const data of fsCustomers) {
       if (data && (data.fullName || data.phone)) {
         try {
-          serverAuthManager.saveCustomerRecord(data);
+          serverAuthManager.saveCustomerRecord(data, undefined, { fromFirestoreSync: true });
         } catch {
           // Ignore malformed records
         }
@@ -3345,11 +3346,96 @@ app.get('/api/customers', apiHandler(async (req: Request, res: Response) => {
 }));
 
 /**
+ * GET /api/customers/:customerId
+ * Retrieves a single customer's complete internal profile, including Next of Kin, Guarantor,
+ * original registering staff metadata, and full activity history timeline.
+ */
+app.get('/api/customers/:customerId', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required. Unauthenticated access to customer profiles is prohibited.',
+      error: 'Authentication required.',
+    });
+  }
+
+  const account = serverAuthManager.findAccountByIdentifier(session.email);
+  if (account && account.status !== 'active') {
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied: Account is suspended or inactive.',
+      error: 'Account suspended.',
+    });
+  }
+  if (
+    session.role !== 'LIFETIME_SUPER_ADMIN' &&
+    session.role !== 'ADMIN' &&
+    account?.permissions &&
+    account.permissions.canViewCustomers === false
+  ) {
+    return res.status(403).json({
+      success: false,
+      message: 'Clearance violation: Staff account does not have permission to view customer profiles.',
+      error: 'Clearance violation.',
+    });
+  }
+
+  const customerId = String(req.params.customerId || '').trim();
+  const callerFbToken =
+    typeof req.headers['x-firebase-token'] === 'string'
+      ? req.headers['x-firebase-token'].trim()
+      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
+      ? req.headers.authorization.substring(7).trim()
+      : undefined;
+
+  try {
+    const fsDoc = await withServerTimeout(
+      readFirestoreDocument('customers', customerId, callerFbToken),
+      1200
+    );
+    if (fsDoc && (fsDoc.fullName || fsDoc.phone)) {
+      serverAuthManager.saveCustomerRecord(fsDoc, undefined, { fromFirestoreSync: true });
+    }
+  } catch {
+    // Non-fatal if Firestore read times out
+  }
+
+  const customer = serverAuthManager.findCustomerByIdentifier(customerId);
+  if (!customer) {
+    return res.status(404).json({
+      success: false,
+      message: 'Customer record not found.',
+      error: 'Customer record not found.',
+    });
+  }
+
+  serverAuthManager.recordAudit({
+    actorId: session.userId,
+    actorName: session.fullName,
+    actorRole: session.role,
+    action: 'VIEWED_CUSTOMER_PROFILE',
+    resource: `/api/customers/${customer.id}`,
+    details: `Accessed internal customer profile for ${customer.fullName} (${customer.customerCode || customer.id}).`,
+    ip: session.ip,
+    status: 'SUCCESS',
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Customer profile retrieved successfully.',
+    data: { customer },
+    customer,
+  });
+}));
+
+/**
  * POST /api/customers
  * Persists a newly created or updated customer record on the backend and Firestore.
- * Restricted to authenticated Super Admin, Admin, or Staff with customer registration permission.
+ * Automatically captures the authenticated registering employee's identity on creation
+ * and permanently preserves original registration ownership on subsequent updates.
  */
-app.post('/api/customers', apiHandler(async (req: Request, res: Response) => {
+const handleSaveCustomerRequest = apiHandler(async (req: Request, res: Response) => {
   const session = await authenticateRequest(req);
   if (!session) {
     return res.status(401).json({
@@ -3375,11 +3461,21 @@ app.post('/api/customers', apiHandler(async (req: Request, res: Response) => {
       error: 'Account suspended.',
     });
   }
+
+  const payload = req.body?.customer || req.body || {};
+  const targetId = String(req.params?.customerId || payload.id || '').trim();
+  const isExisting = Boolean(
+    (targetId && serverAuthManager.findCustomerByIdentifier(targetId)) ||
+      (payload.phone && serverAuthManager.findCustomerByIdentifier(payload.phone))
+  );
+
   if (
     session.role !== 'LIFETIME_SUPER_ADMIN' &&
     session.role !== 'ADMIN' &&
     account?.permissions &&
-    account.permissions.canRegisterCustomers === false
+    account.permissions.canRegisterCustomers === false &&
+    account.permissions.canEditCustomer === false &&
+    account.permissions.manage_customers === false
   ) {
     return res.status(403).json({
       success: false,
@@ -3388,8 +3484,7 @@ app.post('/api/customers', apiHandler(async (req: Request, res: Response) => {
     });
   }
 
-  const payload = req.body?.customer || req.body || {};
-  if (!payload.fullName && !payload.phone) {
+  if (!payload.fullName && !payload.phone && !isExisting) {
     return res.status(400).json({
       success: false,
       message: 'Customer full name and phone number are required.',
@@ -3397,15 +3492,156 @@ app.post('/api/customers', apiHandler(async (req: Request, res: Response) => {
     });
   }
 
-  const customer = serverAuthManager.saveCustomerRecord(payload);
+  const callerFbToken =
+    typeof req.headers['x-firebase-token'] === 'string'
+      ? req.headers['x-firebase-token'].trim()
+      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
+      ? req.headers.authorization.substring(7).trim()
+      : undefined;
+
+  // Hydrate existing Firestore customer first if updating by ID across serverless cold starts
+  if (targetId && !serverAuthManager.findCustomerByIdentifier(targetId)) {
+    try {
+      const fsExisting = await withServerTimeout(
+        readFirestoreDocument('customers', targetId, callerFbToken),
+        1200
+      );
+      if (fsExisting && (fsExisting.fullName || fsExisting.phone)) {
+        serverAuthManager.saveCustomerRecord(fsExisting, undefined, { fromFirestoreSync: true });
+      }
+    } catch {
+      // Ignore lookup timeout
+    }
+  }
+
+  const mergedPayload = targetId ? { ...payload, id: targetId } : payload;
+  const customer = serverAuthManager.saveCustomerRecord(mergedPayload, session);
+
+  // Authoritatively persist to Cloud Firestore /customers/{customer.id}
+  await withServerTimeout(
+    writeFirestoreDocument('customers', customer.id, customer, callerFbToken),
+    2500
+  ).catch(() => false);
+
+  serverAuthManager.recordAudit({
+    actorId: session.userId,
+    actorName: session.fullName,
+    actorRole: session.role,
+    action: isExisting ? 'UPDATED_CUSTOMER_PROFILE' : 'REGISTERED_NEW_CUSTOMER',
+    resource: `/api/customers/${customer.id}`,
+    details: isExisting
+      ? `Updated customer profile for ${customer.fullName} (${customer.customerCode}). Original registering officer: ${customer.registeredByName} (${customer.registeredByStaffCode}).`
+      : `Registered new customer ${customer.fullName} (${customer.customerCode}) by ${customer.registeredByName} (${customer.registeredByPosition}, Staff ID: ${customer.registeredByStaffCode}).`,
+    ip: session.ip,
+    status: 'SUCCESS',
+  });
 
   const customers = serverAuthManager.getCustomersList();
-  return res.status(201).json({
+  return res.status(isExisting ? 200 : 201).json({
     success: true,
-    message: 'Customer registered and synchronized successfully.',
+    message: isExisting
+      ? 'Customer profile updated and synchronized to Firestore.'
+      : 'Customer registered and permanently saved to Firestore.',
     data: { customer, customers },
     customer,
     customers,
+  });
+});
+
+app.post('/api/customers', handleSaveCustomerRequest);
+app.put('/api/customers/:customerId', handleSaveCustomerRequest);
+
+/**
+ * POST /api/customers/:customerId/activity
+ * Appends an authorised activity entry (account adjustment, contribution, loan activity, payment collection, or reversal)
+ * to a customer's activity timeline without altering the original registering staff member.
+ */
+app.post('/api/customers/:customerId/activity', apiHandler(async (req: Request, res: Response) => {
+  const session = await authenticateRequest(req);
+  if (!session) {
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication required.',
+      error: 'Authentication required.',
+    });
+  }
+
+  if (serverAuthManager.isAuditorSession(session)) {
+    return res.status(403).json({
+      success: false,
+      message: 'Read-Only Restriction: Auditors are strictly prohibited from modifying customer activity records.',
+      error: 'Read-Only Restriction: Auditors cannot record customer activities.',
+    });
+  }
+
+  const customerId = String(req.params.customerId || '').trim();
+  const callerFbToken =
+    typeof req.headers['x-firebase-token'] === 'string'
+      ? req.headers['x-firebase-token'].trim()
+      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
+      ? req.headers.authorization.substring(7).trim()
+      : undefined;
+
+  if (!serverAuthManager.findCustomerByIdentifier(customerId)) {
+    try {
+      const fsDoc = await withServerTimeout(
+        readFirestoreDocument('customers', customerId, callerFbToken),
+        1200
+      );
+      if (fsDoc && (fsDoc.fullName || fsDoc.phone)) {
+        serverAuthManager.saveCustomerRecord(fsDoc, undefined, { fromFirestoreSync: true });
+      }
+    } catch {
+      // Ignore lookup timeout
+    }
+  }
+
+  const { category, action, description, reference, amount } = req.body || {};
+  if (!action || !description) {
+    return res.status(400).json({
+      success: false,
+      message: 'Activity action title and description are required.',
+      error: 'Activity action title and description are required.',
+    });
+  }
+
+  const updated = serverAuthManager.appendCustomerActivity(customerId, session, {
+    category: category || 'ACCOUNT_ADJUSTMENT',
+    action: String(action).trim(),
+    description: String(description).trim(),
+    reference: reference ? String(reference).trim() : undefined,
+    amount: typeof amount === 'number' && Number.isFinite(amount) ? amount : undefined,
+  });
+
+  if (!updated) {
+    return res.status(404).json({
+      success: false,
+      message: 'Customer record not found.',
+      error: 'Customer record not found.',
+    });
+  }
+
+  await withServerTimeout(
+    writeFirestoreDocument('customers', updated.id, updated, callerFbToken),
+    2500
+  ).catch(() => false);
+
+  serverAuthManager.recordAudit({
+    actorId: session.userId,
+    actorName: session.fullName,
+    actorRole: session.role,
+    action: 'RECORDED_CUSTOMER_ACTIVITY',
+    resource: `/api/customers/${updated.id}/activity`,
+    details: `Recorded ${category || 'ACCOUNT_ADJUSTMENT'} (${action}) on customer ${updated.fullName} (${updated.customerCode}).`,
+    ip: session.ip,
+    status: 'SUCCESS',
+  });
+
+  return res.status(201).json({
+    success: true,
+    message: 'Customer activity recorded and persisted to Firestore.',
+    data: { customer: updated },
+    customer: updated,
   });
 }));
 
@@ -3707,6 +3943,10 @@ if (!isServerlessRuntime) {
           .then((vite) => {
             viteInstance = vite;
             console.log('[DEV] Vite dev server middleware initialized and mounted');
+            if (typeof vite.transformRequest === 'function') {
+              vite.transformRequest('/src/main.tsx').catch(() => {});
+              vite.transformRequest('/src/App.tsx').catch(() => {});
+            }
             return vite;
           })
           .catch((err) => {

@@ -18,8 +18,9 @@ import {
   ShieldCheck,
   Edit3,
   Trash2,
+  ExternalLink,
 } from 'lucide-react';
-import { User } from '../../../types/banking';
+import { User, CustomerRecord } from '../../../types/banking';
 import { safeApiFetch } from '../../../utils/apiClient';
 import { authService } from '../../../services/authService';
 import {
@@ -30,6 +31,8 @@ import {
   getDefaultPositionPermissions,
   StaffPosition,
 } from '../../../utils/roleRouting';
+import { CentralCustomerDirectory } from '../../../components/internal/CentralCustomerDirectory';
+import { CustomerProfileModal } from '../../../components/internal/CustomerProfileModal';
 
 interface OperationsManagerDashboardProps {
   currentUser: User | null;
@@ -46,7 +49,8 @@ export const OperationsManagerDashboard: React.FC<OperationsManagerDashboardProp
     'overview' | 'programmes' | 'staff' | 'registrations' | 'loans'
   >('overview');
   const [staffAccounts, setStaffAccounts] = useState<any[]>([]);
-  const [customers, setCustomers] = useState<any[]>([]);
+  const [customers, setCustomers] = useState<CustomerRecord[]>([]);
+  const [profileCustomer, setProfileCustomer] = useState<CustomerRecord | null>(null);
   const [collections, setCollections] = useState<any[]>([]);
   const [loans, setLoans] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -786,46 +790,15 @@ export const OperationsManagerDashboard: React.FC<OperationsManagerDashboardProp
 
         {/* REGISTRATIONS TAB */}
         {activeTab === 'registrations' && (
-          <div className="bg-[#0D1E4C] border border-white/10 rounded-xl p-5 space-y-4">
-            <h2 className="text-base font-bold text-white">
-              Customer Registration Activity Monitor ({customers.length})
-            </h2>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left border-collapse">
-                <thead>
-                  <tr className="border-b border-white/10 text-[11px] uppercase text-slate-400">
-                    <th className="py-2.5 px-3">Customer Code</th>
-                    <th className="py-2.5 px-3">Full Name</th>
-                    <th className="py-2.5 px-3">Phone</th>
-                    <th className="py-2.5 px-3">Account Number</th>
-                    <th className="py-2.5 px-3">KYC / Next of Kin</th>
-                    <th className="py-2.5 px-3">Registration Date</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5 text-xs">
-                  {customers.map((c) => (
-                    <tr key={c.id} className="hover:bg-white/5">
-                      <td className="py-3 px-3 font-mono text-sky-300">{c.customerCode}</td>
-                      <td className="py-3 px-3 font-semibold text-white">{c.fullName}</td>
-                      <td className="py-3 px-3 text-slate-300">{c.phone}</td>
-                      <td className="py-3 px-3 font-mono text-white">{c.accountNumber}</td>
-                      <td className="py-3 px-3">
-                        {c.ninOrBvn && c.nextOfKinName ? (
-                          <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 text-[10px] font-bold">
-                            COMPLETE
-                          </span>
-                        ) : (
-                          <span className="px-2 py-0.5 rounded bg-amber-500/20 text-amber-300 text-[10px] font-bold">
-                            INCOMPLETE KYC
-                          </span>
-                        )}
-                      </td>
-                      <td className="py-3 px-3 text-slate-300">{c.registrationDate}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+          <div className="text-slate-900">
+            <CentralCustomerDirectory
+              title="Central Customer Directory & Staff Registration Monitor (Operations Manager)"
+              subtitle="Click any customer name to inspect their full profile, separate Next of Kin & Guarantor sections, original registering staff member, and operational activity timeline."
+              canCreateCustomer={true}
+              canEditCustomer={true}
+              canRecordActivity={true}
+              onCustomersChanged={(list) => setCustomers(list)}
+            />
           </div>
         )}
 
@@ -840,7 +813,7 @@ export const OperationsManagerDashboard: React.FC<OperationsManagerDashboardProp
                 <thead>
                   <tr className="border-b border-white/10 text-[11px] uppercase text-slate-400">
                     <th className="py-2.5 px-3">Loan Code</th>
-                    <th className="py-2.5 px-3">Borrower</th>
+                    <th className="py-2.5 px-3">Borrower (Click for Profile)</th>
                     <th className="py-2.5 px-3">Programme</th>
                     <th className="py-2.5 px-3">Principal</th>
                     <th className="py-2.5 px-3">Outstanding</th>
@@ -848,24 +821,46 @@ export const OperationsManagerDashboard: React.FC<OperationsManagerDashboardProp
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-white/5 text-xs">
-                  {loans.map((l) => (
-                    <tr key={l.id} className="hover:bg-white/5">
-                      <td className="py-3 px-3 font-mono text-sky-300">{l.loanCode}</td>
-                      <td className="py-3 px-3 font-semibold text-white">{l.customerName}</td>
-                      <td className="py-3 px-3 text-slate-300">{l.programme}</td>
-                      <td className="py-3 px-3 font-mono text-white">
-                        ₦{Number(l.principalAmount || 0).toLocaleString()}
-                      </td>
-                      <td className="py-3 px-3 font-mono text-amber-300">
-                        ₦{Number(l.outstandingBalance || 0).toLocaleString()}
-                      </td>
-                      <td className="py-3 px-3">
-                        <span className="px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 text-[10px] font-bold">
-                          {l.stage}
-                        </span>
-                      </td>
-                    </tr>
-                  ))}
+                  {loans.map((l) => {
+                    const bName = l.customerName || l.borrowerName;
+                    const matchedCust = customers.find(
+                      (c) =>
+                        c.id === l.customerId ||
+                        c.customerCode === l.customerId ||
+                        c.fullName?.toLowerCase() === bName?.toLowerCase()
+                    );
+                    return (
+                      <tr key={l.id} className="hover:bg-white/5">
+                        <td className="py-3 px-3 font-mono text-sky-300">{l.loanCode || l.id}</td>
+                        <td className="py-3 px-3 font-semibold text-white">
+                          {matchedCust ? (
+                            <button
+                              type="button"
+                              onClick={() => setProfileCustomer(matchedCust)}
+                              className="font-bold text-sky-300 hover:text-white hover:underline flex items-center gap-1 text-left"
+                            >
+                              <span>{bName}</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </button>
+                          ) : (
+                            bName
+                          )}
+                        </td>
+                        <td className="py-3 px-3 text-slate-300">{l.programme}</td>
+                        <td className="py-3 px-3 font-mono text-white">
+                          ₦{Number(l.principalAmount || l.amount || 0).toLocaleString()}
+                        </td>
+                        <td className="py-3 px-3 font-mono text-amber-300">
+                          ₦{Number(l.outstandingBalance || 0).toLocaleString()}
+                        </td>
+                        <td className="py-3 px-3">
+                          <span className="px-2 py-0.5 rounded bg-sky-500/20 text-sky-300 text-[10px] font-bold">
+                            {l.stage || l.status}
+                          </span>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -1275,6 +1270,19 @@ export const OperationsManagerDashboard: React.FC<OperationsManagerDashboardProp
             </div>
           </div>
         </div>
+      )}
+
+      {profileCustomer && (
+        <CustomerProfileModal
+          customer={profileCustomer}
+          onClose={() => setProfileCustomer(null)}
+          canEdit={true}
+          canRecordActivity={true}
+          onCustomerUpdated={(updated) => {
+            setProfileCustomer(updated);
+            setCustomers((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+          }}
+        />
       )}
     </div>
   );

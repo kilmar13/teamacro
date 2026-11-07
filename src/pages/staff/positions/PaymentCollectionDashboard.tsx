@@ -1,11 +1,13 @@
 import React, { useState, useEffect, useMemo } from 'react';
 import {
   Wallet, Search, Plus, CheckCircle2, RefreshCw, Download, ShieldAlert,
-  LogOut, Receipt, FileText, Sparkles, ArrowLeft
+  LogOut, Receipt, FileText, Sparkles, ArrowLeft, Users, ExternalLink
 } from 'lucide-react';
 import { User, CustomerRecord } from '../../../types/banking';
 import { safeApiFetch } from '../../../utils/apiClient';
 import { ASSIGNABLE_PROGRAMMES } from '../../../utils/roleRouting';
+import { CentralCustomerDirectory } from '../../../components/internal/CentralCustomerDirectory';
+import { CustomerProfileModal } from '../../../components/internal/CustomerProfileModal';
 
 interface PaymentCollectionDashboardProps {
   currentUser: User | null;
@@ -18,8 +20,9 @@ export const PaymentCollectionDashboard: React.FC<PaymentCollectionDashboardProp
   onLogout,
   onNavigate,
 }) => {
-  const [activeTab, setActiveTab] = useState<'record' | 'history' | 'receipts' | 'performance'>('record');
+  const [activeTab, setActiveTab] = useState<'record' | 'directory' | 'history' | 'receipts' | 'performance'>('record');
   const [customers, setCustomers] = useState<CustomerRecord[]>([]);
+  const [profileCustomer, setProfileCustomer] = useState<CustomerRecord | null>(null);
   const [collections, setCollections] = useState<any[]>([]);
   const [loans, setLoans] = useState<any[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -261,6 +264,7 @@ export const PaymentCollectionDashboard: React.FC<PaymentCollectionDashboardProp
         <div className="max-w-7xl mx-auto px-6 flex gap-1 overflow-x-auto border-t border-slate-800/60">
           {[
             { id: 'record', label: 'Record Savings / Repayment', icon: Plus },
+            { id: 'directory', label: 'Central Customer Directory', icon: Users },
             { id: 'history', label: 'Collection History & Search', icon: FileText },
             { id: 'receipts', label: 'Transaction Receipts', icon: Receipt },
             { id: 'performance', label: 'Collection Performance', icon: Sparkles },
@@ -338,6 +342,19 @@ export const PaymentCollectionDashboard: React.FC<PaymentCollectionDashboardProp
             <div className="text-[11px] text-slate-400 mt-1">Duplicate-checked references</div>
           </div>
         </div>
+
+        {activeTab === 'directory' && (
+          <div className="text-slate-900">
+            <CentralCustomerDirectory
+              title="Central Customer Directory (Payment Collection Access)"
+              subtitle="Click any customer name to view their complete profile, Next of Kin, Guarantor, original registering officer, and collection history."
+              canCreateCustomer={true}
+              canEditCustomer={true}
+              canRecordActivity={true}
+              onCustomersChanged={(list) => setCustomers(list)}
+            />
+          </div>
+        )}
 
         {activeTab === 'record' && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -510,10 +527,17 @@ export const PaymentCollectionDashboard: React.FC<PaymentCollectionDashboardProp
                   Selected Customer Account
                 </h3>
                 {selectedCustomer ? (
-                  <div className="space-y-2 text-xs">
-                    <div className="flex justify-between">
+                  <div className="space-y-2.5 text-xs">
+                    <div className="flex justify-between items-center">
                       <span className="text-slate-400">Customer Name:</span>
-                      <span className="font-semibold text-white">{selectedCustomer.fullName}</span>
+                      <button
+                        type="button"
+                        onClick={() => setProfileCustomer(selectedCustomer)}
+                        className="font-bold text-emerald-400 hover:underline flex items-center gap-1"
+                      >
+                        <span>{selectedCustomer.fullName}</span>
+                        <ExternalLink className="w-3 h-3" />
+                      </button>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-slate-400">Customer Code:</span>
@@ -524,9 +548,20 @@ export const PaymentCollectionDashboard: React.FC<PaymentCollectionDashboardProp
                       <span className="font-mono text-white">{selectedCustomer.phone}</span>
                     </div>
                     <div className="flex justify-between">
+                      <span className="text-slate-400">Registered By:</span>
+                      <span className="text-slate-200">{selectedCustomer.registeredByName || 'Not provided'}</span>
+                    </div>
+                    <div className="flex justify-between">
                       <span className="text-slate-400">Account Status:</span>
                       <span className="text-emerald-400 uppercase">{selectedCustomer.status}</span>
                     </div>
+                    <button
+                      type="button"
+                      onClick={() => setProfileCustomer(selectedCustomer)}
+                      className="w-full mt-2 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-emerald-300 text-xs font-semibold"
+                    >
+                      Open Full Customer Profile
+                    </button>
                   </div>
                 ) : (
                   <p className="text-xs text-slate-500">
@@ -611,7 +646,7 @@ export const PaymentCollectionDashboard: React.FC<PaymentCollectionDashboardProp
                 <thead>
                   <tr className="border-b border-slate-800 text-[11px] uppercase text-slate-400 bg-slate-950/60">
                     <th className="py-3 px-4">Receipt & Ref</th>
-                    <th className="py-3 px-4">Customer</th>
+                    <th className="py-3 px-4">Customer (Click for Profile)</th>
                     <th className="py-3 px-4">Programme & Type</th>
                     <th className="py-3 px-4">Amount</th>
                     <th className="py-3 px-4">Date</th>
@@ -620,44 +655,63 @@ export const PaymentCollectionDashboard: React.FC<PaymentCollectionDashboardProp
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60 text-xs">
-                  {filteredCollections.map((c) => (
-                    <tr key={c.id} className="hover:bg-slate-800/30">
-                      <td className="py-3 px-4 font-mono">
-                        <div className="text-white font-semibold">{c.receiptNumber || c.id}</div>
-                        <div className="text-[11px] text-slate-400">{c.paymentReference}</div>
-                      </td>
-                      <td className="py-3 px-4">
-                        <div className="font-medium text-white">{c.customerName}</div>
-                        <div className="text-[11px] text-slate-400 font-mono">{c.accountNumber}</div>
-                      </td>
-                      <td className="py-3 px-4">
-                        <div className="text-slate-200">{c.programme}</div>
-                        <div className="text-[11px] text-emerald-400">
-                          {c.type === 'LOAN_REPAYMENT' ? 'Loan Repayment' : 'Savings Contribution'}
-                        </div>
-                      </td>
-                      <td className="py-3 px-4 font-mono font-bold text-emerald-400">
-                        ₦{Number(c.amount || 0).toLocaleString()}
-                      </td>
-                      <td className="py-3 px-4 text-slate-400">
-                        {c.paymentDate || new Date(c.createdAt).toLocaleDateString()}
-                      </td>
-                      <td className="py-3 px-4">
-                        <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[11px] font-mono">
-                          {c.status || 'CONFIRMED'}
-                        </span>
-                      </td>
-                      <td className="py-3 px-4 text-right">
-                        <button
-                          onClick={() => downloadReceiptTxt(c)}
-                          className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] inline-flex items-center gap-1"
-                        >
-                          <Download className="w-3 h-3" />
-                          Receipt
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                  {filteredCollections.map((c) => {
+                    const matchedCust = customers.find(
+                      (cust) =>
+                        cust.id === c.customerId ||
+                        cust.customerCode === c.accountNumber ||
+                        cust.fullName?.toLowerCase() === c.customerName?.toLowerCase()
+                    );
+                    return (
+                      <tr key={c.id} className="hover:bg-slate-800/30">
+                        <td className="py-3 px-4 font-mono">
+                          <div className="text-white font-semibold">{c.receiptNumber || c.id}</div>
+                          <div className="text-[11px] text-slate-400">{c.paymentReference}</div>
+                        </td>
+                        <td className="py-3 px-4">
+                          {matchedCust ? (
+                            <button
+                              type="button"
+                              onClick={() => setProfileCustomer(matchedCust)}
+                              className="font-bold text-emerald-400 hover:underline flex items-center gap-1 text-left"
+                            >
+                              <span>{c.customerName}</span>
+                              <ExternalLink className="w-3 h-3" />
+                            </button>
+                          ) : (
+                            <div className="font-medium text-white">{c.customerName}</div>
+                          )}
+                          <div className="text-[11px] text-slate-400 font-mono">{c.accountNumber}</div>
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="text-slate-200">{c.programme}</div>
+                          <div className="text-[11px] text-emerald-400">
+                            {c.type === 'LOAN_REPAYMENT' ? 'Loan Repayment' : 'Savings Contribution'}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4 font-mono font-bold text-emerald-400">
+                          ₦{Number(c.amount || 0).toLocaleString()}
+                        </td>
+                        <td className="py-3 px-4 text-slate-400">
+                          {c.paymentDate || new Date(c.createdAt).toLocaleDateString()}
+                        </td>
+                        <td className="py-3 px-4">
+                          <span className="px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[11px] font-mono">
+                            {c.status || 'CONFIRMED'}
+                          </span>
+                        </td>
+                        <td className="py-3 px-4 text-right">
+                          <button
+                            onClick={() => downloadReceiptTxt(c)}
+                            className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-[11px] inline-flex items-center gap-1"
+                          >
+                            <Download className="w-3 h-3" />
+                            Receipt
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                   {filteredCollections.length === 0 && (
                     <tr>
                       <td colSpan={7} className="py-8 text-center text-slate-500 text-xs">
@@ -694,6 +748,19 @@ export const PaymentCollectionDashboard: React.FC<PaymentCollectionDashboardProp
           </div>
         )}
       </main>
+
+      {profileCustomer && (
+        <CustomerProfileModal
+          customer={profileCustomer}
+          onClose={() => setProfileCustomer(null)}
+          canEdit={true}
+          canRecordActivity={true}
+          onCustomerUpdated={(updated) => {
+            setProfileCustomer(updated);
+            setCustomers((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+          }}
+        />
+      )}
     </div>
   );
 };

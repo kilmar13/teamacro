@@ -49,7 +49,10 @@ import {
   POSITION_METADATA,
   getDefaultPositionPermissions,
   getDedicatedRouteForUser,
+  isReadOnlyAuditor,
 } from '../../utils/roleRouting';
+import { CentralCustomerDirectory } from '../../components/internal/CentralCustomerDirectory';
+import { CustomerProfileModal } from '../../components/internal/CustomerProfileModal';
 
 interface AdminPortalProps {
   config: BankConfig;
@@ -82,6 +85,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
 
   // Modals & Actions
   const [selectedRequest, setSelectedRequest] = useState<MoneyTransferRequest | null>(null);
+  const [selectedCustomerProfile, setSelectedCustomerProfile] = useState<CustomerRecord | null>(null);
   const [actionModal, setActionModal] = useState<'approve' | 'reject' | 'execute' | 'inspect' | null>(null);
   const [rejectReason, setRejectReason] = useState('');
   const [approvalNotes, setApprovalNotes] = useState('');
@@ -987,9 +991,26 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                               <span className="text-[10px] text-slate-500">{req.programmeLabel}</span>
                             </td>
                             <td className="p-3.5">
-                              <span className="font-bold text-[#0B2A5B] dark:text-white block">
-                                {req.customerName}
-                              </span>
+                              {(() => {
+                                const matchedCust = customers.find(
+                                  (c) =>
+                                    c.id === req.customerId ||
+                                    c.fullName.toLowerCase() === req.customerName.toLowerCase()
+                                );
+                                return matchedCust ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => setSelectedCustomerProfile(matchedCust)}
+                                    className="font-bold text-[#2563EB] hover:underline text-left block cursor-pointer"
+                                  >
+                                    {req.customerName}
+                                  </button>
+                                ) : (
+                                  <span className="font-bold text-[#0B2A5B] dark:text-white block">
+                                    {req.customerName}
+                                  </span>
+                                );
+                              })()}
                               <span className="text-[10px] text-slate-500">{req.customerPhone || 'Counter'}</span>
                             </td>
                             <td className="p-3.5 text-right font-display font-extrabold text-[#0B2A5B] dark:text-white tabular-nums">
@@ -1318,98 +1339,32 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
         )}
 
         {/* =====================================================================
-            TAB 4: CUSTOMER RECORDS
+            TAB 4: CENTRAL CUSTOMER DIRECTORY
            ===================================================================== */}
         {activeTab === 'customers' && (
-          <div className="space-y-6">
-            <div className="bg-white dark:bg-[#0B162C] p-6 border border-slate-200 dark:border-slate-800 shadow-xs flex flex-wrap items-center justify-between gap-4">
-              <div>
-                <div className="text-[10px] font-bold uppercase tracking-[0.2em] text-[#2563EB] mb-1">
-                  MODULE 04 // CENTRAL CUSTOMER REGISTRY
-                </div>
-                <h2 className="font-display text-xl font-extrabold text-[#0B2A5B] dark:text-white">
-                  Registered Customer Profiles
-                </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  KYC verification, enrolled programmes, and transaction activity.
-                </p>
-              </div>
-              <div className="flex items-center gap-3">
-                <span className="text-xs font-bold text-[#2563EB] bg-[#2563EB]/10 px-3 py-1.5 uppercase tracking-wider tabular-nums">
-                  {customers.length} Enrolled
-                </span>
-                <button
-                  onClick={() => setShowAddCustomerModal(true)}
-                  className="px-4 py-2.5 text-xs font-bold uppercase tracking-wider bg-[#1E5BD8] hover:bg-[#0B2A5B] text-white flex items-center gap-2 shadow-sm cursor-pointer transition-colors"
-                >
-                  <UserPlus size={15} />
-                  <span>Register New Customer</span>
-                </button>
-              </div>
-            </div>
-
-            <div className="bg-white dark:bg-[#0B162C] border border-slate-200 dark:border-slate-800 shadow-xs overflow-hidden">
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="bg-[#0B2A5B] text-white font-bold uppercase tracking-wider text-[11px]">
-                      <th className="p-3.5">Customer Code</th>
-                      <th className="p-3.5">Full Name</th>
-                      <th className="p-3.5">Phone & Email</th>
-                      <th className="p-3.5">Address / State</th>
-                      <th className="p-3.5">Programmes</th>
-                      <th className="p-3.5">Registered</th>
-                      <th className="p-3.5">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-700 dark:text-slate-300">
-                    {customers.length === 0 ? (
-                      <tr>
-                        <td colSpan={7} className="p-8 text-center text-slate-400">
-                          No customer profiles registered yet. Click &ldquo;Register New Customer&rdquo; to enrol a customer.
-                        </td>
-                      </tr>
-                    ) : (
-                      customers.map((c) => (
-                        <tr key={c.id} className="hover:bg-[#F4F7FB] dark:hover:bg-slate-900/40 transition-colors">
-                          <td className="p-3.5 font-mono font-bold text-[#2563EB]">
-                            <div>{c.customerCode || c.id}</div>
-                            <div className="text-[10px] text-slate-400 font-normal">{c.id}</div>
-                          </td>
-                          <td className="p-3.5 font-bold text-[#0B2A5B] dark:text-white">{c.fullName}</td>
-                          <td className="p-3.5">
-                            <span className="block font-medium">{c.phone}</span>
-                            <span className="text-[10px] text-slate-400">{c.email || 'No email'}</span>
-                          </td>
-                          <td className="p-3.5 text-[11px] text-slate-500">
-                            <span className="block truncate max-w-xs">{c.address || 'Lagos'}</span>
-                            <span className="text-[10px] text-slate-400">{c.state || 'Lagos'}, {c.lga || 'Metropolitan'}</span>
-                          </td>
-                          <td className="p-3.5">
-                            <span className="text-[10px] font-bold uppercase tracking-wider bg-[#F4F7FB] dark:bg-slate-800 px-2 py-0.5 text-[#0B2A5B] dark:text-slate-200 border border-slate-200 dark:border-slate-700">
-                              {c.enrolledProgrammes && c.enrolledProgrammes.length > 0
-                                ? c.enrolledProgrammes.join(', ')
-                                : 'General Member'}
-                            </span>
-                          </td>
-                          <td className="p-3.5 text-[11px] text-slate-500">
-                            {c.registrationDate ? new Date(c.registrationDate).toLocaleDateString() : 'Today'}
-                          </td>
-                          <td className="p-3.5">
-                            <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800 bg-emerald-100 px-2 py-0.5">
-                              {(c.status || 'active').toUpperCase()}
-                            </span>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </div>
+          <CentralCustomerDirectory
+            title="Central Customer Directory — Administrative Oversight"
+            subtitle="Permanent, shared Firestore customer registry with clickable customer profiles, separate Next of Kin & Guarantor sections, original registering staff attribution, and complete activity history."
+            canCreateCustomer={!isReadOnlyAuditor(currentUser)}
+            canEditCustomer={!isReadOnlyAuditor(currentUser)}
+            canRecordActivity={!isReadOnlyAuditor(currentUser)}
+            onCustomersChanged={(updated) => setCustomers(updated)}
+          />
         )}
       </div>
+
+      {selectedCustomerProfile && (
+        <CustomerProfileModal
+          customer={selectedCustomerProfile}
+          onClose={() => setSelectedCustomerProfile(null)}
+          canEdit={!isReadOnlyAuditor(currentUser)}
+          canRecordActivity={!isReadOnlyAuditor(currentUser)}
+          onCustomerUpdated={(updated) => {
+            setSelectedCustomerProfile(updated);
+            loadData();
+          }}
+        />
+      )}
 
       {/* =========================================================================
           MODALS
