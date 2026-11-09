@@ -218,10 +218,14 @@ export const CentralCustomerDirectory: React.FC<CentralCustomerDirectoryProps> =
         body: JSON.stringify({ customer: payload }),
       });
 
-      const created: CustomerRecord =
-        res.customer ||
-        res.data?.customer ||
-        LedgerEngine.saveCustomer(payload, currentUser);
+      const created: CustomerRecord | undefined = res.customer || res.data?.customer;
+      if (!res.success || res.savedToFirestore === false || !created) {
+        throw new Error(
+          res.message ||
+            res.error ||
+            'Failed to save customer record to Firestore database. Please check the details and try again.'
+        );
+      }
 
       LedgerEngine.saveCustomer(created, currentUser);
       await refreshDirectory();
@@ -254,7 +258,7 @@ export const CentralCustomerDirectory: React.FC<CentralCustomerDirectoryProps> =
       });
       setBanner({
         type: 'success',
-        message: `Customer ${created.fullName} (${created.customerCode}) registered permanently in Firestore under ${created.registeredByName || currentUser?.fullName || 'your account'}.`,
+        message: `Customer successfully registered — ${created.fullName} (${created.customerCode}) saved permanently in Firestore under ${created.registeredByName || currentUser?.fullName || 'your account'}.`,
       });
     } catch (err: any) {
       setBanner({

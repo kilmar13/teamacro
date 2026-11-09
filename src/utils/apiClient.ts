@@ -140,18 +140,36 @@ export async function safeApiFetch<T = any>(
 
   let fbIdToken: string | null = null;
   if (typeof window !== 'undefined' && auth?.currentUser) {
-    const currentUid = auth.currentUser.uid;
-    const now = Date.now();
-    if (cachedFbToken && cachedFbToken.uid === currentUid && now < cachedFbToken.expiresAt) {
-      fbIdToken = cachedFbToken.token;
-    } else {
-      try {
-        fbIdToken = await auth.currentUser.getIdToken(false);
-        if (fbIdToken) {
-          cachedFbToken = { uid: currentUid, token: fbIdToken, expiresAt: now + 60_000 };
+    let matchesCurrentSession = true;
+    try {
+      const storedRaw = window.localStorage.getItem('teamacro_auth_current_user');
+      if (storedRaw && auth.currentUser.email) {
+        const storedUser = JSON.parse(storedRaw);
+        if (
+          storedUser?.email &&
+          String(storedUser.email).toLowerCase() !== String(auth.currentUser.email).toLowerCase()
+        ) {
+          matchesCurrentSession = false;
         }
-      } catch {
-        // Firebase auth offline or not initialized in this environment
+      }
+    } catch {
+      // Ignore storage parse error
+    }
+
+    if (matchesCurrentSession) {
+      const currentUid = auth.currentUser.uid;
+      const now = Date.now();
+      if (cachedFbToken && cachedFbToken.uid === currentUid && now < cachedFbToken.expiresAt) {
+        fbIdToken = cachedFbToken.token;
+      } else {
+        try {
+          fbIdToken = await auth.currentUser.getIdToken(false);
+          if (fbIdToken) {
+            cachedFbToken = { uid: currentUid, token: fbIdToken, expiresAt: now + 60_000 };
+          }
+        } catch {
+          // Firebase auth offline or not initialized in this environment
+        }
       }
     }
   }
@@ -164,10 +182,10 @@ export async function safeApiFetch<T = any>(
   }
 
   if (!headers['Authorization']) {
-    if (fbIdToken) {
-      headers['Authorization'] = `Bearer ${fbIdToken}`;
-    } else if (token) {
+    if (token) {
       headers['Authorization'] = `Bearer ${token}`;
+    } else if (fbIdToken) {
+      headers['Authorization'] = `Bearer ${fbIdToken}`;
     }
   }
 

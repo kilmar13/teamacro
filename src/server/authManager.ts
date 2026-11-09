@@ -1394,15 +1394,22 @@ class ServerAuthManager {
     if (parts.length < 4) return null;
     const sig = parts[parts.length - 1];
     const b64 = parts.slice(2, parts.length - 1).join('_');
-    const expectedSig = crypto
-      .createHmac('sha256', this.getSessionHmacSecret())
-      .update(`mfa:${b64}`)
-      .digest('hex');
 
     try {
       const sigBuf = Buffer.from(sig, 'hex');
-      const expBuf = Buffer.from(expectedSig, 'hex');
-      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      let signatureMatched = false;
+      for (const secret of this.getSessionHmacSecretCandidates()) {
+        const expectedSig = crypto
+          .createHmac('sha256', secret)
+          .update(`mfa:${b64}`)
+          .digest('hex');
+        const expBuf = Buffer.from(expectedSig, 'hex');
+        if (sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf)) {
+          signatureMatched = true;
+          break;
+        }
+      }
+      if (!signatureMatched) {
         return null;
       }
       const padded = b64.replace(/-/g, '+').replace(/_/g, '/');
@@ -1644,10 +1651,20 @@ class ServerAuthManager {
     return (
       process.env.SESSION_SECRET ||
       process.env.ROOT_SETUP_SECRET ||
-      process.env.FIREBASE_SERVICE_ACCOUNT_KEY ||
-      process.env.FIREBASE_PRIVATE_KEY ||
       'teamacro-a1849-authoritative-hmac-session-key-v1'
     );
+  }
+
+  private getSessionHmacSecretCandidates(): string[] {
+    const candidates = [
+      this.getSessionHmacSecret(),
+      'teamacro-a1849-authoritative-hmac-session-key-v1',
+      process.env.SESSION_SECRET,
+      process.env.ROOT_SETUP_SECRET,
+      process.env.FIREBASE_SERVICE_ACCOUNT_KEY,
+      process.env.FIREBASE_PRIVATE_KEY,
+    ].filter((s): s is string => typeof s === 'string' && s.length > 0);
+    return Array.from(new Set(candidates));
   }
 
   private createSignedSessionToken(payload: {
@@ -1686,15 +1703,22 @@ class ServerAuthManager {
     if (parts.length < 4) return null;
     const sig = parts[parts.length - 1];
     const b64 = parts.slice(2, parts.length - 1).join('_');
-    const expectedSig = crypto
-      .createHmac('sha256', this.getSessionHmacSecret())
-      .update(b64)
-      .digest('hex');
 
     try {
       const sigBuf = Buffer.from(sig, 'hex');
-      const expBuf = Buffer.from(expectedSig, 'hex');
-      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      let signatureMatched = false;
+      for (const secret of this.getSessionHmacSecretCandidates()) {
+        const expectedSig = crypto
+          .createHmac('sha256', secret)
+          .update(b64)
+          .digest('hex');
+        const expBuf = Buffer.from(expectedSig, 'hex');
+        if (sigBuf.length === expBuf.length && crypto.timingSafeEqual(sigBuf, expBuf)) {
+          signatureMatched = true;
+          break;
+        }
+      }
+      if (!signatureMatched) {
         return null;
       }
       const padded = b64.replace(/-/g, '+').replace(/_/g, '/');
@@ -1992,6 +2016,10 @@ class ServerAuthManager {
       if (session.role === 'LIFETIME_SUPER_ADMIN') {
         return null;
       }
+      const resolvedPos =
+        normalizeCanonicalPosition(session.position || session.roleTitle, session.role) ||
+        session.position ||
+        session.roleTitle;
       account = {
         id: session.userId,
         uid: session.userId,
@@ -2000,15 +2028,17 @@ class ServerAuthManager {
         fullName: session.fullName,
         phone: '+234 800 000 0000',
         role: session.role,
-        roleTitle: session.roleTitle,
-        duty: session.roleTitle,
+        roleTitle: resolvedPos,
+        duty: resolvedPos,
+        position: resolvedPos,
+        dashboardRoute: session.dashboardRoute || getDedicatedRouteForUser(session),
         isLifetimeSuperAdmin: false,
         status: 'active',
         active: true,
         passwordSalt: '',
         passwordHash: '',
         mfaRequired: false,
-        permissions: this.getDefaultPermissionsForDuty(session.roleTitle),
+        permissions: this.getDefaultPermissionsForDuty(resolvedPos),
         createdAt: new Date().toISOString(),
         securityVersion: session.securityVersion || 1,
       };
@@ -5373,10 +5403,104 @@ class ServerAuthManager {
     return updatedCustomer;
   }
 
+  public normalizeCustomerPhone(rawPhone?: string | null): string {
+    const digits = String(rawPhone || '').replace(/\D+/g, '');
+    if (!digits) return '';
+    // Normalize Nigerian numbers: +2348031234567 -> 8031234567, 08031234567 -> 8031234567
+    if (digits.startsWith('234') && digits.length === 13) {
+      return digits.slice(3);
+    }
+    if (digits.startsWith('0') && digits.length === 11) {
+      return digits.slice(1);
+    }
+    return digits;
+  }
+
+  public findDuplicateCustomer(
+    customerData: any,
+    excludeId?: string
+  ): {
+    isDuplicate: boolean;
+    field?: string;
+    matchedValue?: string;
+    existingCustomer?: any;
+  } {
+    if (!customerData) return { isDuplicate: false };
+    const cleanExcludeId = String(excludeId || '').trim();
+    const incomingId = String(customerData.id || '').trim();
+    const incomingCode = String(customerData.customerCode || '').trim().toLowerCase();
+    const incomingPhoneNorm = this.normalizeCustomerPhone(customerData.phone);
+    const incomingNinOrBvn = String(
+      customerData.ninOrBvn || customerData.kycIdNumber || customerData.bvn || customerData.nin || ''
+    )
+      .replace(/\s+/g, '')
+      .toLowerCase();
+
+    for (const c of this.customers.values()) {
+      if (!c) continue;
+      if (cleanExcludeId && c.id === cleanExcludeId) continue;
+
+      if (incomingId && c.id === incomingId) {
+        return {
+          isDuplicate: true,
+          field: 'Customer ID',
+          matchedValue: c.customerCode || c.id,
+          existingCustomer: c,
+        };
+      }
+
+      if (incomingCode && c.customerCode && String(c.customerCode).trim().toLowerCase() === incomingCode) {
+        return {
+          isDuplicate: true,
+          field: 'Customer ID',
+          matchedValue: c.customerCode,
+          existingCustomer: c,
+        };
+      }
+
+      if (incomingPhoneNorm && incomingPhoneNorm.length >= 7) {
+        const existingPhoneNorm = this.normalizeCustomerPhone(c.phone);
+        if (existingPhoneNorm && existingPhoneNorm === incomingPhoneNorm) {
+          return {
+            isDuplicate: true,
+            field: 'phone number',
+            matchedValue: c.phone,
+            existingCustomer: c,
+          };
+        }
+      }
+
+      if (incomingNinOrBvn && incomingNinOrBvn.length >= 6) {
+        const existingNinOrBvn = String(c.ninOrBvn || '').replace(/\s+/g, '').toLowerCase();
+        if (existingNinOrBvn && existingNinOrBvn === incomingNinOrBvn) {
+          return {
+            isDuplicate: true,
+            field: 'NIN / BVN identification number',
+            matchedValue: c.ninOrBvn,
+            existingCustomer: c,
+          };
+        }
+      }
+    }
+
+    return { isDuplicate: false };
+  }
+
+  public removeCustomerFromMemory(customerId: string): void {
+    if (customerId && this.customers.has(customerId)) {
+      this.customers.delete(customerId);
+      this.persistCustomers();
+    }
+  }
+
   public saveCustomerRecord(
     customerData: any,
     actorSession?: UserSession,
-    options?: { fromFirestoreSync?: boolean }
+    options?: {
+      fromFirestoreSync?: boolean;
+      skipAutoFirestoreWrite?: boolean;
+      forceCreateNew?: boolean;
+    }
   ): any {
     if (!customerData || (!customerData.fullName && !customerData.phone)) {
       throw new Error('Customer full name and phone number are required.');
@@ -5385,38 +5509,61 @@ class ServerAuthManager {
     const cleanedPhone = String(customerData.phone || '').replace(/\s+/g, '');
     const cleanEmail = String(customerData.email || '').trim().toLowerCase();
 
-    // Check if customer already exists by ID, customerCode, phone, or email
+    // Check if customer already exists when updating or syncing from Firestore
     let existing: any = null;
-    if (customerData.id && this.customers.has(customerData.id)) {
-      existing = this.customers.get(customerData.id);
-    } else {
-      for (const c of this.customers.values()) {
-        if (
-          customerData.customerCode &&
-          c.customerCode &&
-          String(c.customerCode).toLowerCase() === String(customerData.customerCode).toLowerCase()
-        ) {
-          existing = c;
-          break;
-        }
-        if (cleanedPhone && String(c.phone || '').replace(/\s+/g, '') === cleanedPhone) {
-          existing = c;
-          break;
-        }
-        if (cleanEmail && String(c.email || '').trim().toLowerCase() === cleanEmail) {
-          existing = c;
-          break;
+    if (!options?.forceCreateNew) {
+      if (customerData.id && this.customers.has(customerData.id)) {
+        existing = this.customers.get(customerData.id);
+      } else {
+        const incomingPhoneNorm = this.normalizeCustomerPhone(customerData.phone);
+        for (const c of this.customers.values()) {
+          if (
+            customerData.customerCode &&
+            c.customerCode &&
+            String(c.customerCode).toLowerCase() === String(customerData.customerCode).toLowerCase()
+          ) {
+            existing = c;
+            break;
+          }
+          if (
+            (cleanedPhone && String(c.phone || '').replace(/\s+/g, '') === cleanedPhone) ||
+            (incomingPhoneNorm &&
+              incomingPhoneNorm.length >= 7 &&
+              this.normalizeCustomerPhone(c.phone) === incomingPhoneNorm)
+          ) {
+            existing = c;
+            break;
+          }
+          if (cleanEmail && String(c.email || '').trim().toLowerCase() === cleanEmail) {
+            existing = c;
+            break;
+          }
         }
       }
     }
 
     const count = this.customers.size + 1;
-    const id =
+    let id =
       existing?.id ||
       customerData.id ||
       `cust_${String(count).padStart(3, '0')}_${Date.now().toString(36).slice(-4)}`;
-    const customerCode =
-      existing?.customerCode || customerData.customerCode || `TMC-CST-${1000 + count}`;
+    while (!existing && this.customers.has(id)) {
+      id = `cust_${String(count).padStart(3, '0')}_${crypto.randomBytes(2).toString('hex')}`;
+    }
+
+    let customerCode = existing?.customerCode || customerData.customerCode || '';
+    if (!customerCode) {
+      let maxSeq = 1000 + this.customers.size;
+      for (const c of this.customers.values()) {
+        const m = String(c?.customerCode || '').match(/TMC-CST-(\d+)/i);
+        if (m) {
+          const n = parseInt(m[1], 10);
+          if (!isNaN(n) && n >= maxSeq) maxSeq = n;
+        }
+      }
+      customerCode = `TMC-CST-${maxSeq + 1}`;
+    }
+
     const accountNumber =
       existing?.accountNumber ||
       customerData.accountNumber ||
@@ -5687,7 +5834,7 @@ class ServerAuthManager {
     this.customers.set(id, record);
     this.persistCustomers();
 
-    if (!isFromFirestore) {
+    if (!isFromFirestore && !options?.skipAutoFirestoreWrite) {
       writeFirestoreDocument('customers', id, record).catch(() => {});
     }
 

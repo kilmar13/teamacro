@@ -162,6 +162,18 @@ class AuthService {
       dashboardRoute: res.user.dashboardRoute || redirectRoute,
     };
 
+    if (
+      auth?.currentUser?.email &&
+      enrichedUser.email &&
+      auth.currentUser.email.toLowerCase() !== enrichedUser.email.toLowerCase()
+    ) {
+      try {
+        await firebaseSignOut(auth);
+      } catch {
+        // Ignore signOut failure
+      }
+    }
+
     this.setStoredToken(res.sessionToken);
     this.cachedUser = enrichedUser;
     ledgerEngine.setCurrentUser(enrichedUser);

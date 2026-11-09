@@ -226,14 +226,30 @@ export const CustomerRegistrationDashboard: React.FC<CustomerRegistrationDashboa
 
   const handleSubmitCustomer = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (!form.fullName.trim() || !form.phone.trim()) {
+      setFeedback({
+        type: 'error',
+        message: 'Customer full legal name and primary phone number are required.',
+      });
+      return;
+    }
+
     setIsSubmitting(true);
     setFeedback(null);
+    const isEditing = Boolean(form.id && form.id.trim());
+    const endpoint = isEditing
+      ? `/api/customers/${encodeURIComponent(form.id.trim())}`
+      : '/api/customers';
+    const method = isEditing ? 'PUT' : 'POST';
+
     try {
-      const res = await safeApiFetch('/api/customers', {
-        method: 'POST',
+      const res = await safeApiFetch(endpoint, {
+        method,
         body: JSON.stringify({
+          isUpdate: isEditing,
           customer: {
             ...form,
+            id: isEditing ? form.id.trim() : undefined,
             nextOfKinRelation: form.nextOfKinRelationship,
             guarantorVerificationStatus: form.guarantorName.trim()
               ? form.guarantorVerificationStatus
@@ -242,23 +258,35 @@ export const CustomerRegistrationDashboard: React.FC<CustomerRegistrationDashboa
           },
         }),
       });
-      if (!res.success) {
+
+      const savedCustomer = res.customer || res.data?.customer;
+      const confirmedFirestore = res.savedToFirestore !== false && Boolean(savedCustomer);
+
+      if (!res.success || !confirmedFirestore) {
         setFeedback({
           type: 'error',
-          message: res.message || res.error || 'Failed to save customer registration.',
+          message:
+            res.message ||
+            res.error ||
+            'Failed to save customer record to Firestore database. Please verify details and try again.',
         });
-      } else {
-        const savedCustomer = res.customer || res.data?.customer;
-        setFeedback({
-          type: 'success',
-          message: form.id
-            ? `Customer profile for ${form.fullName} updated in Firestore. Original registering officer (${savedCustomer?.registeredByName || 'preserved'}) kept intact.`
-            : `Customer profile for ${form.fullName} (${savedCustomer?.customerCode || 'New'}) saved permanently in Firestore under ${savedCustomer?.registeredByName || currentUser?.fullName || 'your account'}.`,
-        });
-        resetForm();
-        await loadCustomers();
-        setActiveTab('directory');
+        return;
       }
+
+      setFeedback({
+        type: 'success',
+        message: isEditing
+          ? `Customer profile for ${savedCustomer.fullName} (${savedCustomer.customerCode}) updated in Firestore. Original registering officer (${savedCustomer.registeredByName || 'preserved'}) kept intact.`
+          : `Customer successfully registered — ${savedCustomer.fullName} (Customer ID: ${savedCustomer.customerCode}) saved permanently in Firestore under ${savedCustomer.registeredByName || currentUser?.fullName || 'your account'}.`,
+      });
+      resetForm();
+      await loadCustomers();
+      setActiveTab('directory');
+    } catch (err: any) {
+      setFeedback({
+        type: 'error',
+        message: err?.message || 'Unable to save customer registration due to a network or server error.',
+      });
     } finally {
       setIsSubmitting(false);
     }
@@ -574,6 +602,16 @@ export const CustomerRegistrationDashboard: React.FC<CustomerRegistrationDashboa
               </span>
             </div>
 
+            {feedback && feedback.type === 'error' && (
+              <div className="mb-5 p-3.5 rounded-xl bg-rose-500/15 border border-rose-400/40 text-rose-200 text-xs flex items-start gap-2.5">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <div>
+                  <div className="font-bold text-rose-300 mb-0.5">Registration Cannot Proceed</div>
+                  <div>{feedback.message}</div>
+                </div>
+              </div>
+            )}
+
             <form onSubmit={handleSubmitCustomer} className="space-y-6 text-xs">
               {/* Section 1: Customer Identification */}
               <div className="space-y-4">
@@ -641,13 +679,12 @@ export const CustomerRegistrationDashboard: React.FC<CustomerRegistrationDashboa
                     </select>
                   </div>
                   <div>
-                    <label className="block text-slate-300 mb-1">NIN or BVN Number *</label>
+                    <label className="block text-slate-300 mb-1">NIN or BVN Number</label>
                     <input
                       type="text"
-                      required
                       value={form.ninOrBvn}
                       onChange={(e) => setForm({ ...form, ninOrBvn: e.target.value })}
-                      placeholder="11-digit NIN or BVN"
+                      placeholder="11-digit NIN or BVN (if available)"
                       className="w-full px-3 py-2.5 rounded-lg bg-[#07112B] border border-white/15 text-white font-mono"
                     />
                   </div>
@@ -666,10 +703,9 @@ export const CustomerRegistrationDashboard: React.FC<CustomerRegistrationDashboa
                     />
                   </div>
                   <div>
-                    <label className="block text-slate-300 mb-1">Occupation / Trade *</label>
+                    <label className="block text-slate-300 mb-1">Occupation / Trade</label>
                     <input
                       type="text"
-                      required
                       value={form.occupation}
                       onChange={(e) => setForm({ ...form, occupation: e.target.value })}
                       placeholder="e.g. Merchant, Civil Servant, Artisan"

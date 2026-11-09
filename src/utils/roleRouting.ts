@@ -402,9 +402,9 @@ export function getDefaultPositionPermissions(
       return {
         canViewDashboard: true,
         canViewCustomers: true,
-        canRegisterCustomers: true,
-        canRegisterCustomer: true,
-        canEditCustomer: true,
+        canRegisterCustomers: false,
+        canRegisterCustomer: false,
+        canEditCustomer: false,
         canRecordCollections: false,
         canCollectPayments: false,
         canManageSavings: false,

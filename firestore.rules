@@ -103,10 +103,12 @@ service cloud.firestore {
     }
 
     function isValidCustomer(data) {
-      return data.keys().hasAll(['id', 'fullName', 'phone']) &&
+      return data.keys().hasAll(['id', 'fullName', 'phone', 'registeredByStaffId', 'registeredByName']) &&
         data.id is string && data.id.size() <= 128 &&
         data.fullName is string && data.fullName.size() <= 120 &&
-        data.phone is string && data.phone.size() <= 40;
+        data.phone is string && data.phone.size() <= 40 &&
+        data.registeredByStaffId is string && data.registeredByStaffId.size() > 0 && data.registeredByStaffId.size() <= 128 &&
+        data.registeredByName is string && data.registeredByName.size() > 0 && data.registeredByName.size() <= 160;
     }
 
     function isValidAccount(data) {

@@ -30,6 +30,7 @@ import {
 import {
   getDedicatedRouteForUser,
   normalizeCanonicalPosition,
+  sanitizePermissionsForPosition,
 } from './src/utils/roleRouting.js';
 
 // ============================================================================
@@ -2231,14 +2232,22 @@ async function ensureAccountHydratedFromFirestore(
         : adminDoc || merged.role === 'ADMIN'
         ? 'ADMIN'
         : 'STAFF';
+      const resolvedPos = String(
+        merged.position ||
+          merged.duty ||
+          merged.roleTitle ||
+          (role === 'ADMIN' ? 'Account Manager' : 'Customer Registration Officer')
+      );
       serverAuthManager.syncProvisionedAccount({
         id: uid,
         email: String(merged.email),
         fullName: String(merged.fullName || merged.email),
         phone: String(merged.phone || '+234 800 000 0000'),
         role,
-        roleTitle: String(merged.roleTitle || merged.duty || (role === 'ADMIN' ? 'Executive Administrator' : 'Operations Officer')),
-        duty: String(merged.duty || merged.roleTitle || (role === 'ADMIN' ? 'Executive Administrator' : 'Operations Officer')),
+        roleTitle: resolvedPos,
+        duty: resolvedPos,
+        position: resolvedPos,
+        dashboardRoute: merged.dashboardRoute ? String(merged.dashboardRoute) : undefined,
         staffCode: merged.staffCode ? String(merged.staffCode) : undefined,
         status: merged.active === false || merged.status === 'suspended' ? 'suspended' : 'active',
         passwordHash: merged.passwordHash ? String(merged.passwordHash) : undefined,
@@ -3483,6 +3492,15 @@ const handleSaveCustomerRequest = apiHandler(async (req: Request, res: Response)
     });
   }
 
+  const callerFbToken =
+    typeof req.headers['x-firebase-token'] === 'string'
+      ? req.headers['x-firebase-token'].trim()
+      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
+      ? req.headers.authorization.substring(7).trim()
+      : undefined;
+
+  await ensureAccountHydratedFromFirestore(session.userId, callerFbToken);
+
   if (serverAuthManager.isAuditorSession(session)) {
     return res.status(403).json({
       success: false,
@@ -3491,7 +3509,9 @@ const handleSaveCustomerRequest = apiHandler(async (req: Request, res: Response)
     });
   }
 
-  const account = serverAuthManager.findAccountByIdentifier(session.email);
+  const account =
+    serverAuthManager.findAccountByIdentifier(session.userId) ||
+    serverAuthManager.findAccountByIdentifier(session.email);
   if (account && account.status !== 'active') {
     return res.status(403).json({
       success: false,
@@ -3502,47 +3522,86 @@ const handleSaveCustomerRequest = apiHandler(async (req: Request, res: Response)
 
   const payload = req.body?.customer || req.body || {};
   const targetId = String(req.params?.customerId || payload.id || '').trim();
-  const isExisting = Boolean(
-    (targetId && serverAuthManager.findCustomerByIdentifier(targetId)) ||
-      (payload.phone && serverAuthManager.findCustomerByIdentifier(payload.phone))
+  const isExplicitUpdate =
+    req.method === 'PUT' || Boolean(targetId) || Boolean(payload.isUpdate);
+
+  // Enforce backend RBAC permissions for customer creation and modification
+  const canonicalPos = normalizeCanonicalPosition(
+    account?.position || account?.duty || account?.roleTitle || session.position || session.roleTitle,
+    session.role
+  );
+  const effectivePermissions = sanitizePermissionsForPosition(
+    canonicalPos || account?.position || session.position || session.roleTitle,
+    account?.permissions
   );
 
-  if (
-    session.role !== 'LIFETIME_SUPER_ADMIN' &&
-    session.role !== 'ADMIN' &&
-    account?.permissions &&
-    account.permissions.canRegisterCustomers === false &&
-    account.permissions.canEditCustomer === false &&
-    account.permissions.manage_customers === false
-  ) {
-    return res.status(403).json({
-      success: false,
-      message: 'Clearance violation: Staff account does not have permission to register or modify customer records.',
-      error: 'Clearance violation.',
-    });
+  if (session.role !== 'LIFETIME_SUPER_ADMIN') {
+    if (!isExplicitUpdate) {
+      const canCreate =
+        effectivePermissions.canRegisterCustomers === true ||
+        effectivePermissions.canRegisterCustomer === true ||
+        account?.permissions?.manage_customers === true;
+      if (!canCreate) {
+        return res.status(403).json({
+          success: false,
+          message: `Access denied: Your assigned position (${canonicalPos || session.roleTitle || session.role}) does not have permission to create customer records.`,
+          error: 'Clearance violation: Missing customer creation permission.',
+        });
+      }
+    } else {
+      const canEdit =
+        effectivePermissions.canEditCustomer === true ||
+        effectivePermissions.canRegisterCustomers === true ||
+        effectivePermissions.canRegisterCustomer === true ||
+        account?.permissions?.manage_customers === true;
+      if (!canEdit) {
+        return res.status(403).json({
+          success: false,
+          message: `Access denied: Your assigned position (${canonicalPos || session.roleTitle || session.role}) does not have permission to modify customer records.`,
+          error: 'Clearance violation: Missing customer edit permission.',
+        });
+      }
+    }
   }
 
-  if (!payload.fullName && !payload.phone && !isExisting) {
+  if (!isExplicitUpdate && (!String(payload.fullName || '').trim() || !String(payload.phone || '').trim())) {
     return res.status(400).json({
       success: false,
-      message: 'Customer full name and phone number are required.',
-      error: 'Customer full name and phone number are required.',
+      message: 'Customer full name and primary phone number are required.',
+      error: 'Customer full name and primary phone number are required.',
     });
   }
 
-  const callerFbToken =
-    typeof req.headers['x-firebase-token'] === 'string'
-      ? req.headers['x-firebase-token'].trim()
-      : req.headers.authorization?.startsWith('Bearer ') && req.headers.authorization.split('.').length === 3
-      ? req.headers.authorization.substring(7).trim()
-      : undefined;
+  // Ensure existing customers from Firestore are hydrated before duplicate detection or updates
+  const nowMs = Date.now();
+  if (
+    nowMs - lastCustomersHydratedAt >= HYDRATION_COOLDOWN_MS ||
+    serverAuthManager.getCustomersList().length === 0
+  ) {
+    try {
+      const fsCustomers = await withServerTimeout(
+        listFirestoreCollection('customers', callerFbToken),
+        2000
+      );
+      if (Array.isArray(fsCustomers) && fsCustomers.length > 0) {
+        for (const doc of fsCustomers) {
+          if (doc && (doc.fullName || doc.phone)) {
+            serverAuthManager.saveCustomerRecord(doc, undefined, { fromFirestoreSync: true });
+          }
+        }
+        lastCustomersHydratedAt = Date.now();
+      }
+    } catch {
+      // Non-fatal if Firestore read times out
+    }
+  }
 
-  // Hydrate existing Firestore customer first if updating by ID across serverless cold starts
+  // Hydrate specific target customer if updating by ID across cold starts
   if (targetId && !serverAuthManager.findCustomerByIdentifier(targetId)) {
     try {
       const fsExisting = await withServerTimeout(
         readFirestoreDocument('customers', targetId, callerFbToken),
-        1200
+        1500
       );
       if (fsExisting && (fsExisting.fullName || fsExisting.phone)) {
         serverAuthManager.saveCustomerRecord(fsExisting, undefined, { fromFirestoreSync: true });
@@ -3552,23 +3611,78 @@ const handleSaveCustomerRequest = apiHandler(async (req: Request, res: Response)
     }
   }
 
-  const mergedPayload = targetId ? { ...payload, id: targetId } : payload;
-  const customer = serverAuthManager.saveCustomerRecord(mergedPayload, session);
-  lastCustomersHydratedAt = Date.now();
+  // Duplicate check: Never silently overwrite or merge existing customers on new registration
+  if (!isExplicitUpdate) {
+    const duplicateCheck = serverAuthManager.findDuplicateCustomer(payload);
+    if (duplicateCheck.isDuplicate && duplicateCheck.existingCustomer) {
+      const existingCust = duplicateCheck.existingCustomer;
+      return res.status(409).json({
+        success: false,
+        isDuplicate: true,
+        duplicateField: duplicateCheck.field,
+        existingCustomer: {
+          id: existingCust.id,
+          customerCode: existingCust.customerCode,
+          fullName: existingCust.fullName,
+          phone: existingCust.phone,
+        },
+        message: `Duplicate customer warning: A customer with this ${duplicateCheck.field} (${duplicateCheck.matchedValue}) is already registered under ${existingCust.fullName} (Customer ID: ${existingCust.customerCode || existingCust.id}). Existing customer records cannot be overwritten.`,
+        error: `Duplicate customer detected (${duplicateCheck.field}: ${duplicateCheck.matchedValue}).`,
+      });
+    }
+  } else if (targetId) {
+    const duplicateOnUpdate = serverAuthManager.findDuplicateCustomer(payload, targetId);
+    if (duplicateOnUpdate.isDuplicate && duplicateOnUpdate.existingCustomer) {
+      const existingCust = duplicateOnUpdate.existingCustomer;
+      return res.status(409).json({
+        success: false,
+        isDuplicate: true,
+        duplicateField: duplicateOnUpdate.field,
+        existingCustomer: {
+          id: existingCust.id,
+          customerCode: existingCust.customerCode,
+          fullName: existingCust.fullName,
+          phone: existingCust.phone,
+        },
+        message: `Duplicate customer warning: Another customer (${existingCust.fullName}, Customer ID: ${existingCust.customerCode || existingCust.id}) already uses this ${duplicateOnUpdate.field} (${duplicateOnUpdate.matchedValue}).`,
+        error: `Duplicate customer detected (${duplicateOnUpdate.field}: ${duplicateOnUpdate.matchedValue}).`,
+      });
+    }
+  }
 
-  // Authoritatively persist to Cloud Firestore /customers/{customer.id}
-  await withServerTimeout(
+  const mergedPayload = targetId ? { ...payload, id: targetId } : { ...payload, id: undefined };
+  const customer = serverAuthManager.saveCustomerRecord(mergedPayload, session, {
+    skipAutoFirestoreWrite: true,
+    forceCreateNew: !isExplicitUpdate,
+  });
+
+  // Authoritatively persist to Cloud Firestore /customers/{customer.id} and confirm write
+  const savedToFirestore = await withServerTimeout(
     writeFirestoreDocument('customers', customer.id, customer, callerFbToken),
-    2500
+    4000
   ).catch(() => false);
+
+  if (!savedToFirestore) {
+    if (!isExplicitUpdate) {
+      serverAuthManager.removeCustomerFromMemory(customer.id);
+    }
+    return res.status(500).json({
+      success: false,
+      savedToFirestore: false,
+      message: 'Failed to save customer record to the TEAMACRO Firestore database. Please verify connection and try again.',
+      error: 'Firestore write failed.',
+    });
+  }
+
+  lastCustomersHydratedAt = Date.now();
 
   serverAuthManager.recordAudit({
     actorId: session.userId,
     actorName: session.fullName,
     actorRole: session.role,
-    action: isExisting ? 'UPDATED_CUSTOMER_PROFILE' : 'REGISTERED_NEW_CUSTOMER',
+    action: isExplicitUpdate ? 'UPDATED_CUSTOMER_PROFILE' : 'REGISTERED_NEW_CUSTOMER',
     resource: `/api/customers/${customer.id}`,
-    details: isExisting
+    details: isExplicitUpdate
       ? `Updated customer profile for ${customer.fullName} (${customer.customerCode}). Original registering officer: ${customer.registeredByName} (${customer.registeredByStaffCode}).`
       : `Registered new customer ${customer.fullName} (${customer.customerCode}) by ${customer.registeredByName} (${customer.registeredByPosition}, Staff ID: ${customer.registeredByStaffCode}).`,
     ip: session.ip,
@@ -3576,12 +3690,13 @@ const handleSaveCustomerRequest = apiHandler(async (req: Request, res: Response)
   });
 
   const customers = serverAuthManager.getCustomersList();
-  return res.status(isExisting ? 200 : 201).json({
+  return res.status(isExplicitUpdate ? 200 : 201).json({
     success: true,
-    message: isExisting
+    savedToFirestore: true,
+    message: isExplicitUpdate
       ? 'Customer profile updated and synchronized to Firestore.'
-      : 'Customer registered and permanently saved to Firestore.',
-    data: { customer, customers },
+      : 'Customer successfully registered',
+    data: { customer, customers, savedToFirestore: true },
     customer,
     customers,
   });
