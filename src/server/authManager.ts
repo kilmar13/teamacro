@@ -1166,34 +1166,6 @@ class ServerAuthManager {
     let isValid = verifyPassword(cleanPassword, account.passwordSalt, account.passwordHash) ||
                   verifyPassword(password, account.passwordSalt, account.passwordHash);
 
-    // If the authoritative Lifetime Super Admin record (matched by UID + email against system_ownership)
-    // was migrated from Firestore without an initialized PBKDF2 password hash, seal and persist
-    // the master password hash on first verified sign-in.
-    if (
-      !isValid &&
-      (!account.passwordHash || !account.passwordSalt) &&
-      (account.role === 'LIFETIME_SUPER_ADMIN' || account.isLifetimeSuperAdmin) &&
-      this.ownership.isInitialized &&
-      this.isVerifiedOwner(account.uid || account.id, account.email) &&
-      cleanPassword.length >= 6
-    ) {
-      account.passwordSalt = generateSalt();
-      account.passwordHash = hashPassword(cleanPassword, account.passwordSalt);
-      this.persistAccounts();
-      this.syncAccountToFirestore(account);
-      isValid = true;
-      this.recordAudit({
-        actorId: account.id,
-        actorName: account.fullName,
-        actorRole: account.role,
-        action: 'SUPER_ADMIN_CREDENTIAL_HASH_SYNCHRONIZED',
-        resource: '/api/auth/login',
-        details: `Authoritative Lifetime Super Admin credential hash synchronized and sealed for ${account.id}.`,
-        ip,
-        status: 'SUCCESS',
-      });
-    }
-
     // If standard password verification does not match, verify if user provided their assigned access code
     if (!isValid && account.accessCodeHash && account.accessCodeSalt) {
       const accessCodeMatch =

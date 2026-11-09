@@ -223,26 +223,8 @@ export function getDefaultPermissionsForRole(role: StaffRole): PermissionSet {
   }
 }
 
-// Initial Staff Users - Sole Lifetime Super Admin (Zero Fake Staff)
-const INITIAL_STAFF: StaffUser[] = [
-  {
-    id: 'LIFETIME_ROOT_SUPER_ADMIN_001',
-    staffCode: 'TMC-DIR-001',
-    fullName: 'Davidson Eromosele',
-    email: 'eromoseledavidson68@gmail.com',
-    phone: '+234 803 123 4567',
-    role: 'LIFETIME_SUPER_ADMIN',
-    roleTitle: 'Lifetime Super Admin & Chief Executive',
-    isLifetimeSuperAdmin: true,
-    operationalResponsibility: 'Root Governance, Lifetime System Ownership & Overseer',
-    assignedModules: ['ALL_MODULES', 'DISCREET_MONITORING', 'FINANCIAL_APPROVALS', 'ADMIN_APPOINTMENT', 'ROOT_GOVERNANCE'],
-    permissions: getDefaultPermissionsForRole('LIFETIME_SUPER_ADMIN'),
-    status: 'active',
-    lastLogin: new Date().toISOString(),
-    lastActivityAt: new Date().toISOString(),
-    createdAt: '2025-01-01T08:00:00Z',
-  },
-];
+// Initial Staff Users - Zero Seeded Accounts (All accounts come from authenticated sessions / Firestore)
+const INITIAL_STAFF: StaffUser[] = [];
 
 // Production Clean Initial Collections - Zero Fake Data
 const INITIAL_CUSTOMERS: CustomerRecord[] = [];
@@ -290,17 +272,7 @@ const INITIAL_LOAN_APPLICATIONS: LoanApplicationRecord[] = [];
 const INITIAL_LOANS: LoanRecord[] = [];
 const INITIAL_PAYMENTS: ProgrammePaymentRecord[] = [];
 
-const INITIAL_AUDIT_LOGS: AuditLogEntry[] = [
-  {
-    id: 'aud_genesis',
-    timestamp: new Date().toISOString(),
-    staffId: 'LIFETIME_ROOT_SUPER_ADMIN_001',
-    staffName: 'Davidson Eromosele',
-    action: 'System Bootstrapped',
-    module: 'System Initialisation',
-    details: 'Initialised TEAMACRO SERVICES LTD operational engine with zero mock data.',
-  },
-];
+const INITIAL_AUDIT_LOGS: AuditLogEntry[] = [];
 
 const INITIAL_BOOTSTRAP_STATE: SuperAdminBootstrapState = {
   isInitialized: true,
@@ -477,11 +449,10 @@ const INITIAL_SUPPORT_TICKETS: SupportTicket[] = [];
 const INITIAL_APPLICATIONS: AccountApplication[] = [];
 
 const DATA_VERSION_KEY = 'teamacro_sys_data_version';
-const CURRENT_DATA_VERSION = 'v4_clean_authentic_teamacro_no_fake';
+const CURRENT_DATA_VERSION = 'v5_clean_authentic_no_auto_login';
 
 /**
- * Automatically purges any cached mock/fake records from localStorage across previous browser sessions,
- * guaranteeing an empty production state with only the genuine Lifetime Super Admin.
+ * Automatically purges any cached mock/fake records or auto-logged-in sessions from localStorage across previous browser sessions.
  */
 function purgeLegacyFakeDataIfPresent(): void {
   try {
@@ -490,7 +461,17 @@ function purgeLegacyFakeDataIfPresent(): void {
     const storedCustomers = localStorage.getItem(STORAGE_KEYS.CUSTOMERS);
     const storedStaff = localStorage.getItem(STORAGE_KEYS.STAFF);
     const hasMockCustomer = storedCustomers && (storedCustomers.includes('cust_001') || storedCustomers.includes('Adebayo Blessing'));
-    const hasMockStaff = storedStaff && (storedStaff.includes('Babatunde Adeleke') || storedStaff.includes('stf_admin_001') || storedStaff.includes('Dr. Victor'));
+    const hasMockStaff =
+      storedStaff &&
+      (storedStaff.includes('Babatunde Adeleke') ||
+        storedStaff.includes('stf_admin_001') ||
+        storedStaff.includes('Dr. Victor') ||
+        storedStaff.includes('LIFETIME_ROOT_SUPER_ADMIN_001'));
+
+    if (!localStorage.getItem('teamacro_auth_session_token')) {
+      localStorage.removeItem(STORAGE_KEYS.CURRENT_STAFF);
+      localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
+    }
 
     if (currentVer !== CURRENT_DATA_VERSION || hasMockCustomer || hasMockStaff) {
       localStorage.setItem(STORAGE_KEYS.CUSTOMERS, JSON.stringify([]));
@@ -511,7 +492,8 @@ function purgeLegacyFakeDataIfPresent(): void {
       localStorage.setItem(STORAGE_KEYS.SUPPORT_TICKETS, JSON.stringify([]));
       localStorage.setItem(STORAGE_KEYS.ACCOUNTS, JSON.stringify(INITIAL_ACCOUNTS));
       localStorage.setItem(STORAGE_KEYS.STAFF, JSON.stringify(INITIAL_STAFF));
-      localStorage.setItem(STORAGE_KEYS.CURRENT_STAFF, JSON.stringify(INITIAL_STAFF[0]));
+      localStorage.removeItem(STORAGE_KEYS.CURRENT_STAFF);
+      localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
       localStorage.setItem(STORAGE_KEYS.BOOTSTRAP, JSON.stringify(INITIAL_BOOTSTRAP_STATE));
       localStorage.setItem(DATA_VERSION_KEY, CURRENT_DATA_VERSION);
     }
@@ -560,7 +542,23 @@ export class LedgerEngine {
   }
 
   static getCurrentStaff(): StaffUser | null {
+    try {
+      if (typeof localStorage !== 'undefined' && !localStorage.getItem('teamacro_auth_session_token')) {
+        localStorage.removeItem(STORAGE_KEYS.CURRENT_STAFF);
+        return null;
+      }
+    } catch {
+      // Ignore storage error
+    }
     const current = loadFromStorage<StaffUser | null>(STORAGE_KEYS.CURRENT_STAFF, null);
+    if (current && current.id === 'LIFETIME_ROOT_SUPER_ADMIN_001') {
+      try {
+        localStorage.removeItem(STORAGE_KEYS.CURRENT_STAFF);
+      } catch {
+        // Ignore
+      }
+      return null;
+    }
     return current;
   }
 
@@ -2587,8 +2585,27 @@ export class LedgerEngine {
 
   // Active Session & Authentication
   static getCurrentUser(): User | null {
+    try {
+      if (typeof localStorage !== 'undefined' && !localStorage.getItem('teamacro_auth_session_token')) {
+        localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
+        localStorage.removeItem(STORAGE_KEYS.CURRENT_STAFF);
+        return null;
+      }
+    } catch {
+      // Ignore storage error
+    }
     const directUser = loadFromStorage<User | null>(STORAGE_KEYS.CURRENT_USER, null);
-    if (directUser) return directUser;
+    if (directUser) {
+      if (directUser.id === 'LIFETIME_ROOT_SUPER_ADMIN_001') {
+        try {
+          localStorage.removeItem(STORAGE_KEYS.CURRENT_USER);
+        } catch {
+          // Ignore
+        }
+        return null;
+      }
+      return directUser;
+    }
     const staff = LedgerEngine.getCurrentStaff();
     if (staff) {
       return {
@@ -3472,7 +3489,8 @@ export class LedgerEngine {
     saveToStorage(STORAGE_KEYS.SUPPORT_TICKETS, []);
     saveToStorage(STORAGE_KEYS.ACCOUNTS, INITIAL_ACCOUNTS);
     saveToStorage(STORAGE_KEYS.STAFF, INITIAL_STAFF);
-    saveToStorage(STORAGE_KEYS.CURRENT_STAFF, INITIAL_STAFF[0]);
+    saveToStorage(STORAGE_KEYS.CURRENT_STAFF, null);
+    saveToStorage(STORAGE_KEYS.CURRENT_USER, null);
     saveToStorage(STORAGE_KEYS.BOOTSTRAP, INITIAL_BOOTSTRAP_STATE);
   }
 

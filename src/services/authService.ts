@@ -230,6 +230,13 @@ class AuthService {
    * GET /api/auth/session
    */
   public async getSession(): Promise<AuthSessionResponse> {
+    const token = this.getStoredToken();
+    if (!token) {
+      this.cachedUser = null;
+      ledgerEngine.setCurrentUser(null);
+      return { authenticated: false };
+    }
+
     const res = await safeApiFetch('/api/auth/session', {
       method: 'GET',
     });
@@ -296,6 +303,13 @@ class AuthService {
     } catch {
       // Ignore network errors during logout
     } finally {
+      try {
+        if (auth?.currentUser) {
+          await firebaseSignOut(auth);
+        }
+      } catch {
+        // Ignore Firebase sign-out warning
+      }
       this.setStoredToken(null);
       this.cachedUser = null;
       ledgerEngine.setCurrentUser(null);
@@ -810,6 +824,9 @@ class AuthService {
    */
   public async ensureSuperAdminSession(force = false): Promise<string | null> {
     const existing = this.getStoredToken();
+    if (!existing) {
+      return null;
+    }
     if (!force && existing) {
       return existing;
     }
@@ -827,29 +844,6 @@ class AuthService {
       }
     } catch {
       // Ignore session check error
-    }
-
-    const fbUser = auth.currentUser;
-    if (fbUser) {
-      try {
-        const idToken = await fbUser.getIdToken();
-        const syncRes = await safeApiFetch<{ sessionToken?: string; success?: boolean }>('/api/auth/sync-super-admin', {
-          method: 'POST',
-          body: {
-            uid: fbUser.uid,
-            email: fbUser.email || '',
-            fullName: fbUser.displayName || '',
-            idToken,
-          },
-        });
-        const newToken = syncRes.sessionToken || syncRes.data?.sessionToken;
-        if (newToken) {
-          this.setStoredToken(newToken);
-          return newToken;
-        }
-      } catch (err) {
-        console.warn('[AUTH] ensureSuperAdminSession sync note:', err);
-      }
     }
 
     return this.getStoredToken();

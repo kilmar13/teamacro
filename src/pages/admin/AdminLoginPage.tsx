@@ -50,20 +50,19 @@ export const AdminLoginPage: React.FC<AdminLoginPageProps> = ({
         return;
       }
 
-      // Check role authorization: Only ADMIN (including Account Manager, Operations Manager, Auditor) and LIFETIME_SUPER_ADMIN can enter /admin
+      // Check role authorization: Strictly ADMIN (Account Manager, Operations Manager, Auditor) can enter /admin
       const allowedAdminRoles = [
         'ADMIN',
         'ACCOUNT_MANAGER',
         'OPERATIONS_MANAGER',
         'AUDITOR',
-        'SUPER_ADMIN',
-        'LIFETIME_SUPER_ADMIN',
       ];
       if (
         res.user &&
         !allowedAdminRoles.includes(String(res.user.role || '').toUpperCase())
       ) {
-        setErrorMsg('Clearance Denied: This portal requires Administrator role clearance.');
+        await authService.logout();
+        setErrorMsg('Clearance Denied: No Administrator account exists for these credentials. This portal requires Administrator role clearance.');
         return;
       }
 

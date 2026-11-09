@@ -139,7 +139,7 @@ export async function safeApiFetch<T = any>(
   }
 
   let fbIdToken: string | null = null;
-  if (typeof window !== 'undefined' && auth?.currentUser) {
+  if (token && typeof window !== 'undefined' && auth?.currentUser) {
     let matchesCurrentSession = true;
     try {
       const storedRaw = window.localStorage.getItem('teamacro_auth_current_user');
@@ -174,19 +174,15 @@ export async function safeApiFetch<T = any>(
     }
   }
 
-  if (fbIdToken) {
+  if (token && fbIdToken) {
     headers['x-firebase-token'] = fbIdToken;
   }
   if (token) {
     headers['x-session-token'] = token;
   }
 
-  if (!headers['Authorization']) {
-    if (token) {
-      headers['Authorization'] = `Bearer ${token}`;
-    } else if (fbIdToken) {
-      headers['Authorization'] = `Bearer ${fbIdToken}`;
-    }
+  if (!headers['Authorization'] && token) {
+    headers['Authorization'] = `Bearer ${token}`;
   }
 
   let res: Response;

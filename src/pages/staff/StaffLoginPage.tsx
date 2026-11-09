@@ -94,8 +94,13 @@ export const StaffLoginPage: React.FC<StaffLoginPageProps> = ({
         return;
       }
 
-      // Login Successful directly without MFA
+      // Login Successful directly without MFA — strictly enforce STAFF role
       if (res.user) {
+        if (String(res.user.role || '').toUpperCase() !== 'STAFF') {
+          await authService.logout();
+          setErrorMsg('Access Denied: No Staff account exists for these credentials. Please sign in with a valid Staff account.');
+          return;
+        }
         const targetRoute = res.redirectRoute || getDedicatedRouteForUser(res.user);
         onLoginSuccess(res.user, targetRoute);
         onNavigate(targetRoute);
@@ -308,7 +313,7 @@ export const StaffLoginPage: React.FC<StaffLoginPageProps> = ({
                         required
                         value={identifier}
                         onChange={(e) => setIdentifier(e.target.value)}
-                        placeholder="e.g. eromoseledavidson68@gmail.com"
+                        placeholder="e.g. staff@teamacro.com"
                         className="w-full text-xs px-3.5 py-2.5 pl-10 border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-800 text-slate-900 dark:text-white rounded-xl focus:border-[#2563EB] focus:ring-1 focus:ring-[#2563EB] focus:outline-hidden transition-colors"
                       />
                       <Mail size={16} className="absolute left-3.5 top-3 text-slate-400" />

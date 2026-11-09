@@ -264,53 +264,6 @@ async function authenticateRequest(req: Request): Promise<UserSession | null> {
     }
   }
 
-  // 2. Check JWT candidates (Firebase ID Token) via Firebase Admin SDK or Identity Toolkit
-  const jwtCandidates = [bearerToken, customFbToken].filter(
-    (t) => t && t.split('.').length === 3
-  );
-
-  for (const jwtToken of jwtCandidates) {
-    try {
-      const verifiedToken = await verifyFirebaseIdToken(jwtToken);
-      if (verifiedToken.verified && verifiedToken.email) {
-        const email = verifiedToken.email.toLowerCase().trim();
-        const uid = verifiedToken.uid || 'LIFETIME_SUPER_ADMIN_UID';
-        const ip = getClientIp(req);
-        const userAgent = (req.headers['user-agent'] as string) || 'unknown';
-
-        // Check if verified Lifetime Super Admin against authoritative ownership record
-        const fsOwnership = await getFirestoreSystemOwnership(jwtToken).catch(() => null);
-        if (fsOwnership?.isInitialized && fsOwnership.ownerUserId) {
-          serverAuthManager.syncOwnershipRecord(fsOwnership);
-        }
-        if (serverAuthManager.isVerifiedOwner(uid, email)) {
-          const session = serverAuthManager.syncSuperAdminSession(
-            {
-              uid: fsOwnership?.ownerUserId || uid,
-              email,
-              fullName: verifiedToken.name || fsOwnership?.ownerFullName || 'David Eromosele',
-            },
-            ip,
-            userAgent
-          );
-          return session;
-        }
-
-        // Check if registered Admin or Staff in Firestore/memory
-        if (uid) {
-          await ensureAccountHydratedFromFirestore(uid, jwtToken, true);
-        }
-        const account = serverAuthManager.findAccountByIdentifier(email);
-
-        if (account && account.status === 'active') {
-          return serverAuthManager.createSession(account, ip, userAgent, true);
-        }
-      }
-    } catch (jwtErr) {
-      console.warn('[SERVER AUTH] JWT verification warning:', jwtErr);
-    }
-  }
-
   return null;
 }
 

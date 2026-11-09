@@ -65,9 +65,6 @@ const TermsPage = lazy(() =>
 const CustomerPortal = lazy(() =>
   import('./pages/customer/CustomerPortal').then((m) => ({ default: m.CustomerPortal }))
 );
-const StaffPortal = lazy(() =>
-  import('./pages/staff/StaffPortal').then((m) => ({ default: m.StaffPortal }))
-);
 const SuperAdminPortal = lazy(() =>
   import('./pages/admin/SuperAdminPortal').then((m) => ({ default: m.SuperAdminPortal }))
 );
@@ -106,7 +103,13 @@ import { ShieldAlert, ArrowRight, Lock } from 'lucide-react';
 
 export default function App() {
   const [config, setConfig] = useState<BankConfig>(() => ledgerEngine.getConfig());
-  const [currentUser, setCurrentUser] = useState<User | null>(() => ledgerEngine.getCurrentUser());
+  const [currentUser, setCurrentUser] = useState<User | null>(() => {
+    if (!authService.getStoredToken()) {
+      ledgerEngine.setCurrentUser(null);
+      return null;
+    }
+    return ledgerEngine.getCurrentUser();
+  });
 
   // Canonical route normalizer
   const normalizeCanonicalRoute = (rawRoute: string): string => {
@@ -359,56 +362,44 @@ export default function App() {
           />
         ));
 
-      // Canonical Route 2: Staff Backend & Workspaces
+      // Canonical Route 2: Staff Backend & Workspaces (Strictly Authenticated Staff Only)
       case '/staff':
       case '/staff/login':
       case '/login':
-        if (currentUser) {
+        if (currentUser && currentUser.role === 'STAFF') {
           const dedicated = getDedicatedRouteForUser(currentUser);
-          if (dedicated && dedicated !== '/staff' && currentUser.role !== 'LIFETIME_SUPER_ADMIN') {
-            if (dedicated === '/staff/customer-registration') {
-              return (
-                <CustomerRegistrationDashboard
-                  currentUser={currentUser}
-                  onLogout={handleLogout}
-                  onNavigate={handleNavigate}
-                />
-              );
-            }
-            if (dedicated === '/staff/payment-collection') {
-              return (
-                <PaymentCollectionDashboard
-                  currentUser={currentUser}
-                  onLogout={handleLogout}
-                  onNavigate={handleNavigate}
-                />
-              );
-            }
-            if (dedicated === '/staff/loan-officer') {
-              return (
-                <LoanOfficerDashboard
-                  currentUser={currentUser}
-                  onLogout={handleLogout}
-                  onNavigate={handleNavigate}
-                />
-              );
-            }
-            if (dedicated === '/staff/accounts-officer') {
-              return (
-                <AccountsOfficerDashboard
-                  currentUser={currentUser}
-                  onLogout={handleLogout}
-                  onNavigate={handleNavigate}
-                />
-              );
-            }
+          if (dedicated === '/staff/payment-collection') {
+            return (
+              <PaymentCollectionDashboard
+                currentUser={currentUser}
+                onLogout={handleLogout}
+                onNavigate={handleNavigate}
+              />
+            );
+          }
+          if (dedicated === '/staff/loan-officer') {
+            return (
+              <LoanOfficerDashboard
+                currentUser={currentUser}
+                onLogout={handleLogout}
+                onNavigate={handleNavigate}
+              />
+            );
+          }
+          if (dedicated === '/staff/accounts-officer') {
+            return (
+              <AccountsOfficerDashboard
+                currentUser={currentUser}
+                onLogout={handleLogout}
+                onNavigate={handleNavigate}
+              />
+            );
           }
           return (
-            <StaffPortal
-              config={config}
-              onNavigate={handleNavigate}
+            <CustomerRegistrationDashboard
               currentUser={currentUser}
               onLogout={handleLogout}
+              onNavigate={handleNavigate}
             />
           );
         }
@@ -449,53 +440,49 @@ export default function App() {
 
       // Canonical Route 4: Admin Backend (Strictly Separated Authentication)
       case '/admin':
-        if (currentUser) {
-          const dedicated = getDedicatedRouteForUser(currentUser);
-          if (dedicated && dedicated !== '/admin' && currentUser.role !== 'LIFETIME_SUPER_ADMIN') {
-            if (dedicated === '/admin/accountmanager') {
-              return (
-                <AccountManagerDashboard
-                  currentUser={currentUser}
-                  onLogout={handleLogout}
-                  onNavigate={handleNavigate}
-                />
-              );
-            }
-            if (dedicated === '/admin/operationsmanager') {
-              return (
-                <OperationsManagerDashboard
-                  currentUser={currentUser}
-                  onLogout={handleLogout}
-                  onNavigate={handleNavigate}
-                />
-              );
-            }
-            if (dedicated === '/admin/auditor') {
-              return (
-                <AuditorDashboard
-                  currentUser={currentUser}
-                  onLogout={handleLogout}
-                  onNavigate={handleNavigate}
-                />
-              );
-            }
-          }
-          if (
-            currentUser.role === 'ADMIN' ||
+        if (
+          currentUser &&
+          (currentUser.role === 'ADMIN' ||
             currentUser.role === 'ACCOUNT_MANAGER' ||
             currentUser.role === 'OPERATIONS_MANAGER' ||
-            currentUser.role === 'AUDITOR' ||
-            currentUser.role === 'LIFETIME_SUPER_ADMIN'
-          ) {
+            currentUser.role === 'AUDITOR')
+        ) {
+          const dedicated = getDedicatedRouteForUser(currentUser);
+          if (dedicated === '/admin/accountmanager') {
             return (
-              <AdminPortal
-                config={config}
-                onNavigate={handleNavigate}
+              <AccountManagerDashboard
                 currentUser={currentUser}
                 onLogout={handleLogout}
+                onNavigate={handleNavigate}
               />
             );
           }
+          if (dedicated === '/admin/operationsmanager') {
+            return (
+              <OperationsManagerDashboard
+                currentUser={currentUser}
+                onLogout={handleLogout}
+                onNavigate={handleNavigate}
+              />
+            );
+          }
+          if (dedicated === '/admin/auditor') {
+            return (
+              <AuditorDashboard
+                currentUser={currentUser}
+                onLogout={handleLogout}
+                onNavigate={handleNavigate}
+              />
+            );
+          }
+          return (
+            <AdminPortal
+              config={config}
+              onNavigate={handleNavigate}
+              currentUser={currentUser}
+              onLogout={handleLogout}
+            />
+          );
         }
         return (
           <AdminLoginPage
