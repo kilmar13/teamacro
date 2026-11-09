@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   ShieldCheck,
   CheckCircle2,
@@ -133,8 +133,11 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
 
   // Master State: Approvals, Staff/Admin Management, Discreet Oversight
   const [transfers, setTransfers] = useState<MoneyTransferRequest[]>([]);
-  const [staffDirectory, setStaffDirectory] = useState<StaffUser[]>([]);
+  const [staffDirectory, setStaffDirectory] = useState<StaffUser[]>(() =>
+    ledgerEngine.getStaffAndAdminDirectory()
+  );
   const [oversightLogs, setOversightLogs] = useState<RestrictedOversightLog[]>([]);
+  const fetchRequestIdRef = useRef(0);
 
   // Live Auto-Refresh State
   const [liveMonitoring, setLiveMonitoring] = useState(true);
@@ -337,7 +340,27 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
   const [inspectedStaff, setInspectedStaff] = useState<StaffUser | null>(null);
   const [inspectedStaffLogs, setInspectedStaffLogs] = useState<AuditLogEntry[]>([]);
 
-  const loadData = () => {
+  const computeStaffDirectorySignature = (list: StaffUser[]): string =>
+    list
+      .map(
+        (s) =>
+          `${s.id}|${(s.email || '').toLowerCase()}|${s.fullName}|${s.role}|${s.position || s.roleTitle || ''}|${
+            s.dashboardRoute || ''
+          }|${s.assignedProgramme || ''}|${s.status}|${JSON.stringify(s.permissions || {})}`
+      )
+      .join(';;');
+
+  const computeInvitationsSignature = (list: any[]): string =>
+    list
+      .map(
+        (inv) =>
+          `${inv.id || ''}|${inv.code || ''}|${inv.email || ''}|${inv.status || ''}|${Boolean(
+            inv.used
+          )}|${Boolean(inv.revoked)}`
+      )
+      .join(';;');
+
+  const refreshLocalLedgerState = useCallback(() => {
     setTransactions(ledgerEngine.getTransactions());
     setAccounts(ledgerEngine.getAccounts());
     setCustomers(ledgerEngine.getCustomers());
@@ -346,56 +369,49 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
     setAlerts(ledgerEngine.getFraudAlerts());
     setReconciliation(ledgerEngine.performGeneralLedgerReconciliation());
     setTransfers(ledgerEngine.getMoneyTransferRequests());
-    const localStaff = ledgerEngine.getStaffAndAdminDirectory();
-    setStaffDirectory(localStaff);
     setOversightLogs(ledgerEngine.getRestrictedOversightLogs());
+  }, []);
 
-    // Sync authoritative customer records from backend & Firestore
-    ledgerEngine.syncCustomersFromServer().then((synced) => {
-      setCustomers(synced);
-      setAccounts(ledgerEngine.getAccounts());
-    }).catch(() => {});
+  const fetchAuthoritativeServerData = useCallback(async (signal?: AbortSignal) => {
+    const reqId = ++fetchRequestIdRef.current;
 
-    // Sync authoritative invitations and server accounts
-    authService.getAccessInvitations().then((invs) => setBackendInvitations(invs || [])).catch(() => {});
-    authService.getAccountsList().then((accs) => {
-      setServerAccounts(accs || []);
-      if (Array.isArray(accs) && accs.length > 0) {
-        setStaffDirectory((prev) => {
-          const existingIds = new Set(prev.map((s) => s.id));
-          const existingEmails = new Set(prev.map((s) => s.email.toLowerCase()));
-          const extra: StaffUser[] = [];
-          for (const acc of accs) {
-            if (!existingIds.has(acc.id) && !existingEmails.has(acc.email.toLowerCase()) && acc.role !== 'CUSTOMER') {
-              extra.push({
-                id: acc.id,
-                staffCode:
-                  acc.staffCode ||
-                  (acc.role === 'ADMIN' || acc.id.startsWith('STAFF_ADM_')
-                    ? `TMC-ADM-${acc.id.slice(-4).toUpperCase()}`
-                    : `TMC-STF-${acc.id.slice(-4).toUpperCase()}`),
-                fullName: acc.fullName,
-                email: acc.email,
-                phone: acc.phone || '',
-                role: acc.role as any,
-                position: acc.position || acc.roleTitle || acc.duty,
-                dashboardRoute: acc.dashboardRoute || getDedicatedRouteForUser(acc),
-                assignedProgramme: acc.assignedProgramme || 'All Programmes',
-                roleTitle: acc.position || acc.roleTitle || acc.duty || (acc.role === 'ADMIN' ? 'Account Manager' : 'Customer Registration Officer'),
-                permissions: (acc.permissions as any) || getDefaultPermissionsForRole(acc.role === 'ADMIN' ? 'ADMIN' : 'customer_service'),
-                status: acc.status || 'active',
-                lastLogin: acc.lastLogin || new Date().toISOString(),
-                lastActivityAt: new Date().toISOString(),
-                createdAt: acc.createdAt || new Date().toISOString(),
-                isLifetimeSuperAdmin: !!acc.isLifetimeSuperAdmin,
-              });
-            }
-          }
-          return extra.length > 0 ? [...prev, ...extra] : prev;
-        });
+    try {
+      const [accs, invs, syncedCustomers] = await Promise.all([
+        authService.getAccountsList(signal).catch(() => null),
+        authService.getAccessInvitations(signal).catch(() => null),
+        ledgerEngine.syncCustomersFromServer().catch(() => null),
+      ]);
+
+      if (signal?.aborted || reqId !== fetchRequestIdRef.current) {
+        return;
       }
-    }).catch(() => {});
-  };
+
+      if (Array.isArray(syncedCustomers)) {
+        setCustomers(syncedCustomers);
+        setAccounts(ledgerEngine.getAccounts());
+      }
+
+      if (Array.isArray(invs)) {
+        setBackendInvitations((prev) =>
+          computeInvitationsSignature(prev) === computeInvitationsSignature(invs) ? prev : invs
+        );
+      }
+
+      if (Array.isArray(accs) && accs.length > 0) {
+        setServerAccounts(accs);
+        setStaffDirectory((prev) =>
+          computeStaffDirectorySignature(prev) === computeStaffDirectorySignature(accs) ? prev : accs
+        );
+      }
+    } catch {
+      // Ignore aborted or transient fetch error; keep existing rows intact
+    }
+  }, []);
+
+  const loadData = useCallback(() => {
+    refreshLocalLedgerState();
+    void fetchAuthoritativeServerData();
+  }, [refreshLocalLedgerState, fetchAuthoritativeServerData]);
 
   const handleRegisterCustomer = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -751,16 +767,29 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
   };
 
   useEffect(() => {
-    authService.ensureSuperAdminSession().then(() => {
-      loadData();
-    }).catch(() => {
-      loadData();
-    });
-    const unsub = ledgerEngine.subscribe(() => {
-      if (liveMonitoring) loadData();
+    const controller = new AbortController();
+    refreshLocalLedgerState();
+    authService
+      .ensureSuperAdminSession()
+      .catch(() => null)
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          void fetchAuthoritativeServerData(controller.signal);
+        }
+      });
+    return () => {
+      controller.abort();
+    };
+  }, [refreshLocalLedgerState, fetchAuthoritativeServerData]);
+
+  useEffect(() => {
+    if (!liveMonitoring) return;
+    const unsub = ledgerEngine.subscribe((event) => {
+      if (event?.key === 'teamacro_ent_staff_v3') return;
+      refreshLocalLedgerState();
     });
     return unsub;
-  }, [liveMonitoring]);
+  }, [liveMonitoring, refreshLocalLedgerState]);
 
   // When inspecting a transaction, load its immutable journal entry
   useEffect(() => {
@@ -1991,9 +2020,17 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
             </div>
 
             {/* Staff Directory Table */}
-            <div className="bg-white dark:bg-slate-800 rounded-xl border border-[#E0E4EE] dark:border-slate-700 overflow-hidden shadow-xs">
+            <div className="bg-white dark:bg-slate-800 rounded-xl border border-[#E0E4EE] dark:border-slate-700 overflow-hidden shadow-xs min-h-[188px] [contain:layout]">
               <div className="overflow-x-auto">
-                <table className="w-full text-left text-xs">
+                <table className="w-full table-fixed min-w-[920px] text-left text-xs">
+                  <colgroup>
+                    <col className="w-[22%]" />
+                    <col className="w-[18%]" />
+                    <col className="w-[14%]" />
+                    <col className="w-[16%]" />
+                    <col className="w-[9%]" />
+                    <col className="w-[21%]" />
+                  </colgroup>
                   <thead className="bg-[#0B2A5B] text-white font-bold uppercase tracking-wider text-[11px] border-b border-slate-200 dark:border-slate-800">
                     <tr>
                       <th className="p-3">Personnel Details</th>
@@ -2008,7 +2045,7 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
                     {staffDirectory.map((staff) => {
                       const dedicatedRoute = staff.dashboardRoute || getDedicatedRouteForUser(staff);
                       return (
-                        <tr key={staff.id} className="hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors">
+                        <tr key={staff.id || staff.email} className="hover:bg-slate-50 dark:hover:bg-slate-700/50 transition-colors">
                           <td className="p-3">
                             <div className="font-bold text-slate-900 dark:text-white flex items-center gap-2">
                               <span>{staff.fullName}</span>
@@ -2135,7 +2172,7 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
             </div>
 
             {/* Sub-Section 2: Active Access Authorizations & Codes */}
-            <div className="bg-white dark:bg-slate-800 rounded-2xl border border-[#E0E4EE] dark:border-slate-700 overflow-hidden shadow-xs p-4 sm:p-6 space-y-4">
+            <div className="bg-white dark:bg-slate-800 rounded-2xl border border-[#E0E4EE] dark:border-slate-700 overflow-hidden shadow-xs p-4 sm:p-6 space-y-4 min-h-[220px] [contain:layout]">
               <div className="flex items-center justify-between pb-3 border-b border-slate-100 dark:border-slate-700">
                 <div>
                   <h3 className="text-sm font-bold text-slate-900 dark:text-white uppercase tracking-wider flex items-center gap-2">
@@ -2168,7 +2205,7 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                  {backendInvitations.map((inv, idx) => {
+                  {backendInvitations.map((inv) => {
                     const isActive = inv.status === 'ACTIVE' || (!inv.used && !inv.revoked && inv.expiresAt > Date.now());
                     const isRevoked = inv.status === 'REVOKED' || inv.revoked;
                     const isRedeemed = inv.status === 'REDEEMED' || inv.status === 'ACCEPTED' || inv.used;
@@ -2176,7 +2213,7 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
 
                     return (
                       <div
-                        key={inv.id || inv.code || idx}
+                        key={inv.id || inv.code || `${inv.email}-${inv.accessType}-${inv.createdAt || 'inv'}`}
                         className="p-4 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-900 space-y-2.5"
                       >
                         <div className="flex items-center justify-between">
@@ -2853,8 +2890,8 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-200 dark:divide-slate-700">
-                      {linkedJournal.lines.map((l, idx) => (
-                        <tr key={l.id || idx}>
+                      {linkedJournal.lines.map((l) => (
+                        <tr key={l.id || `${l.accountNumber}-${l.direction}-${l.amountKobo}`}>
                           <td className="p-2 font-mono">{l.accountNumber} ({l.accountName || 'Account'})</td>
                           <td className="p-2 font-bold">{l.direction}</td>
                           <td className="p-2 text-right font-mono font-bold">{formatNaira(l.amountKobo)}</td>

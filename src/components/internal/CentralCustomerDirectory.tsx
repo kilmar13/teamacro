@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Search,
   UserPlus,
@@ -82,30 +82,45 @@ export const CentralCustomerDirectory: React.FC<CentralCustomerDirectoryProps> =
     guarantorVerificationStatus: 'Pending Verification',
   });
 
-  const refreshDirectory = async () => {
+  const requestIdRef = useRef(0);
+  const onCustomersChangedRef = useRef(onCustomersChanged);
+  onCustomersChangedRef.current = onCustomersChanged;
+
+  const refreshDirectory = useCallback(async (arg?: AbortSignal | React.MouseEvent) => {
+    const signal = typeof AbortSignal !== 'undefined' && arg instanceof AbortSignal ? arg : undefined;
+    const reqId = ++requestIdRef.current;
     setSyncing(true);
     try {
-      const res = await safeApiFetch('/api/customers');
+      const res = await safeApiFetch('/api/customers', signal ? { signal } : undefined);
+      if (signal?.aborted || reqId !== requestIdRef.current) return;
       if (res.success && Array.isArray(res.customers || res.data?.customers)) {
         const list = res.customers || res.data?.customers;
         setCustomers(list);
-        onCustomersChanged?.(list);
+        onCustomersChangedRef.current?.(list);
       } else {
         const synced = await LedgerEngine.syncCustomersFromServer();
+        if (signal?.aborted || reqId !== requestIdRef.current) return;
         setCustomers(synced);
-        onCustomersChanged?.(synced);
+        onCustomersChangedRef.current?.(synced);
       }
     } catch {
+      if (signal?.aborted || reqId !== requestIdRef.current) return;
       const local = LedgerEngine.getCustomers();
       setCustomers(local);
     } finally {
-      setSyncing(false);
+      if (!signal?.aborted && reqId === requestIdRef.current) {
+        setSyncing(false);
+      }
     }
-  };
+  }, []);
 
   useEffect(() => {
-    refreshDirectory();
-  }, []);
+    const controller = new AbortController();
+    void refreshDirectory(controller.signal);
+    return () => {
+      controller.abort();
+    };
+  }, [refreshDirectory]);
 
   // Keep Guarantor synced if "sameAsNextOfKin" is checked
   useEffect(() => {
@@ -387,9 +402,18 @@ export const CentralCustomerDirectory: React.FC<CentralCustomerDirectoryProps> =
       )}
 
       {/* Customer Directory Table */}
-      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden min-h-[180px] [contain:layout]">
         <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse">
+          <table className="w-full table-fixed min-w-[880px] text-left border-collapse">
+            <colgroup>
+              <col className="w-[14%]" />
+              <col className="w-[22%]" />
+              <col className="w-[16%]" />
+              <col className="w-[20%]" />
+              <col className="w-[12%]" />
+              <col className="w-[8%]" />
+              <col className="w-[8%]" />
+            </colgroup>
             <thead>
               <tr className="bg-slate-900 text-white text-[11px] font-bold uppercase tracking-wider">
                 <th className="py-3.5 px-4">Customer ID</th>

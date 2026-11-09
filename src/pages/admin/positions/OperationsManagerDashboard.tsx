@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   Briefcase,
   Users,
@@ -110,15 +110,20 @@ export const OperationsManagerDashboard: React.FC<OperationsManagerDashboardProp
   const [deletingAccount, setDeletingAccount] = useState<any | null>(null);
   const [isDeletingAccount, setIsDeletingAccount] = useState(false);
 
-  const loadOperationalData = async () => {
+  const requestIdRef = useRef(0);
+
+  const loadOperationalData = useCallback(async (arg?: AbortSignal | React.MouseEvent) => {
+    const signal = typeof AbortSignal !== 'undefined' && arg instanceof AbortSignal ? arg : undefined;
+    const reqId = ++requestIdRef.current;
     setIsLoading(true);
     try {
       const [accList, custRes, colRes, loanRes] = await Promise.all([
-        authService.getAccountsList(),
-        safeApiFetch('/api/customers'),
-        safeApiFetch('/api/operations/collections'),
-        safeApiFetch('/api/operations/loans'),
+        authService.getAccountsList(signal),
+        safeApiFetch('/api/customers', signal ? { signal } : undefined),
+        safeApiFetch('/api/operations/collections', signal ? { signal } : undefined),
+        safeApiFetch('/api/operations/loans', signal ? { signal } : undefined),
       ]);
+      if (signal?.aborted || reqId !== requestIdRef.current) return;
       setStaffAccounts(
         (accList || []).filter(
           (a) =>
@@ -130,15 +135,23 @@ export const OperationsManagerDashboard: React.FC<OperationsManagerDashboardProp
       if (colRes.success) setCollections(colRes.collections || colRes.data?.collections || []);
       if (loanRes.success) setLoans(loanRes.loans || loanRes.data?.loans || []);
     } catch (err) {
-      console.warn('[OperationsManagerDashboard] Failed loading data:', err);
+      if (!signal?.aborted) {
+        console.warn('[OperationsManagerDashboard] Failed loading data:', err);
+      }
     } finally {
-      setIsLoading(false);
+      if (!signal?.aborted && reqId === requestIdRef.current) {
+        setIsLoading(false);
+      }
     }
-  };
+  }, []);
 
   useEffect(() => {
-    loadOperationalData();
-  }, []);
+    const controller = new AbortController();
+    void loadOperationalData(controller.signal);
+    return () => {
+      controller.abort();
+    };
+  }, [loadOperationalData]);
 
   const supervisedStaff = useMemo(
     () =>
@@ -554,8 +567,16 @@ export const OperationsManagerDashboard: React.FC<OperationsManagerDashboardProp
               <h3 className="text-sm font-bold text-white pt-2">
                 Supervised Staff Directory ({supervisedStaff.length})
               </h3>
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse">
+              <div className="overflow-x-auto min-h-[140px] [contain:layout]">
+                <table className="w-full table-fixed min-w-[820px] text-left border-collapse">
+                  <colgroup>
+                    <col className="w-[22%]" />
+                    <col className="w-[20%]" />
+                    <col className="w-[16%]" />
+                    <col className="w-[18%]" />
+                    <col className="w-[10%]" />
+                    <col className="w-[14%]" />
+                  </colgroup>
                   <thead>
                     <tr className="border-b border-white/10 text-[11px] uppercase text-slate-400">
                       <th className="py-2.5 px-3">Account Name</th>

@@ -4625,18 +4625,33 @@ class ServerAuthManager {
     if (!actorSession || (actorSession.role !== 'LIFETIME_SUPER_ADMIN' && actorSession.role !== 'ADMIN')) {
       return [];
     }
-    const list: Array<Omit<AuthAccount, 'passwordHash' | 'passwordSalt' | 'totpSecret' | 'recoveryCodeHashes'>> = [];
+    const byEmail = new Map<string, Omit<AuthAccount, 'passwordHash' | 'passwordSalt' | 'totpSecret' | 'recoveryCodeHashes'>>();
     for (const acc of this.accounts.values()) {
+      if (this.isDeletedAccount(acc.id) || this.isDeletedAccount(acc.email)) {
+        continue;
+      }
       const { passwordHash: _, passwordSalt: __, totpSecret: ___, recoveryCodeHashes: ____, ...safe } = acc;
       const canonicalPos = normalizeCanonicalPosition(safe.position || safe.duty || safe.roleTitle, safe.role);
       const position = canonicalPos || safe.position || safe.duty || safe.roleTitle;
       const dashboardRoute = safe.dashboardRoute || getDedicatedRouteForUser(safe);
-      list.push({
+      const emailKey = (safe.email || safe.id || '').toLowerCase();
+      if (!emailKey) continue;
+      byEmail.set(emailKey, {
         ...safe,
         position,
         dashboardRoute,
       });
     }
+    const list = Array.from(byEmail.values());
+    list.sort((a, b) => {
+      const aRoot = a.isLifetimeSuperAdmin || a.role === 'LIFETIME_SUPER_ADMIN' ? 0 : 1;
+      const bRoot = b.isLifetimeSuperAdmin || b.role === 'LIFETIME_SUPER_ADMIN' ? 0 : 1;
+      if (aRoot !== bRoot) return aRoot - bRoot;
+      const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      if (aTime !== bTime) return aTime - bTime;
+      return String(a.id).localeCompare(String(b.id));
+    });
     return list;
   }
 

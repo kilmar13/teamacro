@@ -223,8 +223,28 @@ export function getDefaultPermissionsForRole(role: StaffRole): PermissionSet {
   }
 }
 
-// Initial Staff Users - Zero Seeded Accounts (All accounts come from authenticated sessions / Firestore)
-const INITIAL_STAFF: StaffUser[] = [];
+// Initial Staff Users - Immutable Root Super Admin baseline directory record (never auto-logged-in)
+const INITIAL_STAFF: StaffUser[] = [
+  {
+    id: 'OWNER_ROOT_3YPAFKI2',
+    staffCode: 'TMC-ROOT-001',
+    fullName: 'David Eromosele',
+    email: 'eromoseledavidson68@gmail.com',
+    phone: '+234 800 000 0001',
+    role: 'LIFETIME_SUPER_ADMIN',
+    position: 'Lifetime Super Admin & Chief Executive',
+    dashboardRoute: '/supa-admin',
+    assignedProgramme: 'All Programmes',
+    roleTitle: 'Lifetime Super Admin & Chief Executive',
+    operationalResponsibility: 'All Programmes',
+    permissions: getDefaultPermissionsForRole('LIFETIME_SUPER_ADMIN'),
+    status: 'active',
+    lastLogin: '2026-10-28T16:07:43.685Z',
+    lastActivityAt: '2026-10-28T16:07:43.685Z',
+    createdAt: '2026-10-28T14:24:06.655Z',
+    isLifetimeSuperAdmin: true,
+  },
+];
 
 // Production Clean Initial Collections - Zero Fake Data
 const INITIAL_CUSTOMERS: CustomerRecord[] = [];
@@ -278,14 +298,14 @@ const INITIAL_BOOTSTRAP_STATE: SuperAdminBootstrapState = {
   isInitialized: true,
   initializedAt: '2025-01-01T08:00:00Z',
   superAdminEmail: 'eromoseledavidson68@gmail.com',
-  superAdminName: 'Davidson Eromosele',
-  lifetimeSuperAdminId: 'LIFETIME_ROOT_SUPER_ADMIN_001',
+  superAdminName: 'David Eromosele',
+  lifetimeSuperAdminId: 'OWNER_ROOT_3YPAFKI2',
   lifetimeSuperAdminEmail: 'eromoseledavidson68@gmail.com',
   canResetWithMasterKey: false,
   lockdownEnforced: true,
   immutableOwnerBound: true,
   initializedByEmail: 'eromoseledavidson68@gmail.com',
-  initializationActorName: 'Davidson Eromosele (Permanent Founder & Lifetime Owner)',
+  initializationActorName: 'David Eromosele (Permanent Founder & Lifetime Owner)',
 };
 
 const INITIAL_MONEY_TRANSFERS: MoneyTransferRequest[] = [];
@@ -519,10 +539,16 @@ function loadFromStorage<T>(key: string, fallback: T): T {
 
 let notifyStorageChangeCallback: ((key: string) => void) | null = null;
 
-function saveToStorage<T>(key: string, value: T): void {
+function saveToStorage<T>(key: string, value: T, silent = false): void {
   try {
-    localStorage.setItem(key, JSON.stringify(value));
+    const serialized = JSON.stringify(value);
+    const prev = localStorage.getItem(key);
+    if (prev === serialized) {
+      return;
+    }
+    localStorage.setItem(key, serialized);
     if (
+      !silent &&
       notifyStorageChangeCallback &&
       key !== STORAGE_KEYS.AUDIT_LOGS &&
       key !== STORAGE_KEYS.CURRENT_STAFF &&
@@ -538,7 +564,17 @@ function saveToStorage<T>(key: string, value: T): void {
 export class LedgerEngine {
   // Staff methods
   static getStaffUsers(): StaffUser[] {
-    return loadFromStorage<StaffUser[]>(STORAGE_KEYS.STAFF, INITIAL_STAFF);
+    const list = loadFromStorage<StaffUser[]>(STORAGE_KEYS.STAFF, INITIAL_STAFF);
+    const hasRoot = list.some(
+      (s) =>
+        s.isLifetimeSuperAdmin === true ||
+        s.role === 'LIFETIME_SUPER_ADMIN' ||
+        s.email?.toLowerCase() === 'eromoseledavidson68@gmail.com'
+    );
+    if (!hasRoot && INITIAL_STAFF.length > 0) {
+      return [INITIAL_STAFF[0], ...list];
+    }
+    return list;
   }
 
   static getCurrentStaff(): StaffUser | null {
@@ -572,10 +608,12 @@ export class LedgerEngine {
   static isLifetimeSuperAdmin(user: any): boolean {
     if (!user) return false;
     const bootstrap = this.getBootstrapState();
-    const ownerId = bootstrap.lifetimeSuperAdminId || 'LIFETIME_ROOT_SUPER_ADMIN_001';
+    const ownerId = bootstrap.lifetimeSuperAdminId || 'OWNER_ROOT_3YPAFKI2';
     const ownerEmail = (bootstrap.superAdminEmail || '').toLowerCase();
     return (
       user.id === ownerId ||
+      user.id === 'OWNER_ROOT_3YPAFKI2' ||
+      user.id === 'LIFETIME_ROOT_SUPER_ADMIN_001' ||
       (ownerEmail && user.email?.toLowerCase() === ownerEmail) ||
       user.isLifetimeSuperAdmin === true ||
       user.role === 'LIFETIME_SUPER_ADMIN'
@@ -584,7 +622,7 @@ export class LedgerEngine {
 
   static getLifetimeSuperAdmin(): StaffUser | null {
     const staff = this.getStaffUsers();
-    return staff.find((s) => this.isLifetimeSuperAdmin(s)) || null;
+    return staff.find((s) => this.isLifetimeSuperAdmin(s)) || INITIAL_STAFF[0] || null;
   }
 
   static authenticateStaff(identifier: string, _password?: string): StaffUser | null {
@@ -887,6 +925,107 @@ export class LedgerEngine {
   // 5. Discreet Super Admin Activity Monitoring
   static getStaffAndAdminDirectory(): StaffUser[] {
     return this.getStaffUsers();
+  }
+
+  static syncStaffDirectoryFromServer(serverAccounts: any[]): StaffUser[] {
+    if (!Array.isArray(serverAccounts) || serverAccounts.length === 0) {
+      return this.getStaffUsers();
+    }
+    const current = this.getStaffUsers();
+    const byEmail = new Map<string, StaffUser>();
+
+    // Ensure immutable Root Super Admin baseline is always present
+    const rootBaseline = INITIAL_STAFF[0];
+    if (rootBaseline) {
+      byEmail.set(rootBaseline.email.toLowerCase(), rootBaseline);
+    }
+
+    for (const item of current) {
+      if (!item || !item.email) continue;
+      if (this.isLifetimeSuperAdmin(item)) {
+        byEmail.set('eromoseledavidson68@gmail.com', {
+          ...rootBaseline,
+          ...item,
+          id: 'OWNER_ROOT_3YPAFKI2',
+          isLifetimeSuperAdmin: true,
+          role: 'LIFETIME_SUPER_ADMIN',
+        });
+      }
+    }
+
+    for (const acc of serverAccounts) {
+      if (!acc || !acc.email || acc.role === 'CUSTOMER') continue;
+      const emailKey = String(acc.email).trim().toLowerCase();
+      const prev = byEmail.get(emailKey);
+      const isRoot =
+        acc.isLifetimeSuperAdmin === true ||
+        acc.role === 'LIFETIME_SUPER_ADMIN' ||
+        emailKey === 'eromoseledavidson68@gmail.com';
+      const resolvedPosition =
+        acc.position ||
+        acc.roleTitle ||
+        acc.duty ||
+        prev?.position ||
+        prev?.roleTitle ||
+        (isRoot
+          ? 'Lifetime Super Admin & Chief Executive'
+          : acc.role === 'ADMIN'
+          ? 'Account Manager'
+          : 'Customer Registration Officer');
+
+      const merged: StaffUser = {
+        ...(prev || {}),
+        id: isRoot ? 'OWNER_ROOT_3YPAFKI2' : String(acc.id || prev?.id || `STF_${emailKey}`),
+        staffCode: isRoot
+          ? 'TMC-ROOT-001'
+          : acc.staffCode ||
+            prev?.staffCode ||
+            (acc.role === 'ADMIN' || String(acc.id || '').startsWith('STAFF_ADM_')
+              ? `TMC-ADM-${String(acc.id || '0001').slice(-4).toUpperCase()}`
+              : `TMC-STF-${String(acc.id || '0001').slice(-4).toUpperCase()}`),
+        fullName: acc.fullName || prev?.fullName || (isRoot ? 'David Eromosele' : acc.email),
+        email: acc.email,
+        phone: acc.phone || prev?.phone || '',
+        role: (isRoot ? 'LIFETIME_SUPER_ADMIN' : acc.role || prev?.role || 'STAFF') as StaffRole,
+        position: resolvedPosition,
+        dashboardRoute:
+          acc.dashboardRoute ||
+          prev?.dashboardRoute ||
+          (isRoot ? '/supa-admin' : acc.role === 'ADMIN' ? '/admin' : '/staff'),
+        assignedProgramme: acc.assignedProgramme || prev?.assignedProgramme || 'All Programmes',
+        roleTitle: resolvedPosition,
+        operationalResponsibility:
+          acc.operationalResponsibility || resolvedPosition || prev?.operationalResponsibility || 'All Programmes',
+        permissions:
+          (acc.permissions as any) ||
+          prev?.permissions ||
+          getDefaultPermissionsForRole(
+            isRoot ? 'LIFETIME_SUPER_ADMIN' : acc.role === 'ADMIN' ? 'ADMIN' : 'customer_service'
+          ),
+        status: acc.status === 'suspended' ? 'suspended' : 'active',
+        lastLogin: acc.lastLogin || prev?.lastLogin || '2026-10-28T16:07:43.685Z',
+        lastActivityAt: prev?.lastActivityAt || acc.lastLogin || '2026-10-28T16:07:43.685Z',
+        createdAt: acc.createdAt || prev?.createdAt || '2026-10-28T14:24:06.655Z',
+        createdByStaffId: acc.createdByStaffId || prev?.createdByStaffId || 'OWNER_ROOT_3YPAFKI2',
+        createdByName: acc.createdByName || prev?.createdByName || 'Super Admin',
+        isLifetimeSuperAdmin: isRoot,
+      };
+      byEmail.set(emailKey, merged);
+    }
+
+    const finalDirectory = Array.from(byEmail.values()).sort((a, b) => {
+      const aRoot = a.isLifetimeSuperAdmin || a.role === 'LIFETIME_SUPER_ADMIN' ? 0 : 1;
+      const bRoot = b.isLifetimeSuperAdmin || b.role === 'LIFETIME_SUPER_ADMIN' ? 0 : 1;
+      if (aRoot !== bRoot) return aRoot - bRoot;
+      const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      if (aTime !== bTime) return aTime - bTime;
+      return String(a.id).localeCompare(String(b.id));
+    });
+
+    // Save silently so localStorage matches authoritative server state without firing recursive listeners
+    saveToStorage(STORAGE_KEYS.STAFF, finalDirectory, true);
+    return finalDirectory;
   }
 
   static getUserActivityLogs(userId: string, actor?: any): AuditLogEntry[] {
@@ -1236,7 +1375,10 @@ export class LedgerEngine {
     return null;
   }
 
-  static ensureCustomerBankAccount(customer: CustomerRecord & { accountNumber?: string }): void {
+  static ensureCustomerBankAccount(
+    customer: CustomerRecord & { accountNumber?: string },
+    silent = false
+  ): void {
     const accounts = loadFromStorage<CustomerAccount[]>(STORAGE_KEYS.ACCOUNTS, INITIAL_ACCOUNTS);
     const exists = accounts.some(
       (a) =>
@@ -1267,7 +1409,7 @@ export class LedgerEngine {
         isSystem: false,
       };
       accounts.push(newAcc);
-      saveToStorage(STORAGE_KEYS.ACCOUNTS, accounts);
+      saveToStorage(STORAGE_KEYS.ACCOUNTS, accounts, silent);
     }
   }
 
@@ -1444,72 +1586,91 @@ export class LedgerEngine {
     return newCustomer;
   }
 
-  static async syncCustomersFromServer(): Promise<CustomerRecord[]> {
+  private static customerSyncInFlight: Promise<CustomerRecord[]> | null = null;
+  private static lastCustomerSyncAt = 0;
+
+  static async syncCustomersFromServer(force = false): Promise<CustomerRecord[]> {
     if (typeof window === 'undefined' || typeof fetch !== 'function') {
       return this.getCustomers();
     }
-    try {
-      const { safeApiFetch, getActiveSessionToken } = await import('../utils/apiClient');
-      if (!getActiveSessionToken()) {
-        return this.getCustomers();
-      }
-      const res = await safeApiFetch('/api/customers', { method: 'GET' });
-      if (!res.success) return this.getCustomers();
-      const serverCustomers: any[] = res.customers || res.data?.customers || [];
-
-      if (Array.isArray(serverCustomers)) {
-        const normalizedList: CustomerRecord[] = [];
-        for (const sc of serverCustomers) {
-          if (!sc || (!sc.fullName && !sc.phone)) continue;
-          const normalized: CustomerRecord = {
-            ...sc,
-            id: sc.id || `cust_${normalizedList.length + 1}`,
-            customerCode: sc.customerCode || `TMC-CST-${1000 + normalizedList.length + 1}`,
-            fullName: sc.fullName || 'Customer',
-            phone: sc.phone || '',
-            altPhone: sc.altPhone || '',
-            email: sc.email || '',
-            address: sc.address || '',
-            ninOrBvn: sc.ninOrBvn || '',
-            idType: sc.idType || '',
-            dateOfBirth: sc.dateOfBirth || '',
-            gender: sc.gender || '',
-            state: sc.state || '',
-            lga: sc.lga || '',
-            occupation: sc.occupation || '',
-            nextOfKinName: sc.nextOfKinName || '',
-            nextOfKinPhone: sc.nextOfKinPhone || '',
-            nextOfKinRelationship: sc.nextOfKinRelationship || '',
-            nextOfKinAddress: sc.nextOfKinAddress || '',
-            guarantorName: sc.guarantorName || '',
-            guarantorPhone: sc.guarantorPhone || '',
-            guarantorRelationship: sc.guarantorRelationship || '',
-            guarantorAddress: sc.guarantorAddress || '',
-            guarantorOccupation: sc.guarantorOccupation || '',
-            guarantorVerificationStatus: sc.guarantorVerificationStatus || 'Not Provided',
-            registrationDate: sc.registrationDate || new Date().toISOString().split('T')[0],
-            registeredAt: sc.registeredAt || sc.createdAt || sc.registrationDate,
-            registeredByStaffId: sc.registeredByStaffId || 'SYSTEM',
-            registeredByName: sc.registeredByName || 'System Registration Officer',
-            registeredByStaffCode: sc.registeredByStaffCode || 'TMC-SYS-0001',
-            registeredByPosition: sc.registeredByPosition || 'Customer Registration Officer',
-            registeredByRole: sc.registeredByRole || 'STAFF',
-            registeredByDepartment:
-              sc.registeredByDepartment || 'Customer Onboarding & KYC Department — Lagos Head Office',
-            status: ((sc.status || 'active').toLowerCase() as 'active' | 'suspended' | 'dormant'),
-            enrolledProgrammes: Array.isArray(sc.enrolledProgrammes) ? sc.enrolledProgrammes : [],
-            activityHistory: Array.isArray(sc.activityHistory) ? sc.activityHistory : [],
-          };
-          normalizedList.push(normalized);
-          this.ensureCustomerBankAccount(normalized);
-        }
-        saveToStorage(STORAGE_KEYS.CUSTOMERS, normalizedList);
-        return normalizedList;
-      }
-    } catch {
-      // Ignore network errors and return local customers
+    if (!force && this.customerSyncInFlight) {
+      return this.customerSyncInFlight;
     }
-    return this.getCustomers();
+    if (!force && Date.now() - this.lastCustomerSyncAt < 2000) {
+      return this.getCustomers();
+    }
+
+    const syncPromise = (async (): Promise<CustomerRecord[]> => {
+      try {
+        const { safeApiFetch, getActiveSessionToken } = await import('../utils/apiClient');
+        if (!getActiveSessionToken()) {
+          return this.getCustomers();
+        }
+        const res = await safeApiFetch('/api/customers', { method: 'GET' });
+        if (!res.success) return this.getCustomers();
+        const serverCustomers: any[] = res.customers || res.data?.customers || [];
+
+        if (Array.isArray(serverCustomers)) {
+          const normalizedList: CustomerRecord[] = [];
+          for (const sc of serverCustomers) {
+            if (!sc || (!sc.fullName && !sc.phone)) continue;
+            const normalized: CustomerRecord = {
+              ...sc,
+              id: sc.id || `cust_${normalizedList.length + 1}`,
+              customerCode: sc.customerCode || `TMC-CST-${1000 + normalizedList.length + 1}`,
+              fullName: sc.fullName || 'Customer',
+              phone: sc.phone || '',
+              altPhone: sc.altPhone || '',
+              email: sc.email || '',
+              address: sc.address || '',
+              ninOrBvn: sc.ninOrBvn || '',
+              idType: sc.idType || '',
+              dateOfBirth: sc.dateOfBirth || '',
+              gender: sc.gender || '',
+              state: sc.state || '',
+              lga: sc.lga || '',
+              occupation: sc.occupation || '',
+              nextOfKinName: sc.nextOfKinName || '',
+              nextOfKinPhone: sc.nextOfKinPhone || '',
+              nextOfKinRelationship: sc.nextOfKinRelationship || '',
+              nextOfKinAddress: sc.nextOfKinAddress || '',
+              guarantorName: sc.guarantorName || '',
+              guarantorPhone: sc.guarantorPhone || '',
+              guarantorRelationship: sc.guarantorRelationship || '',
+              guarantorAddress: sc.guarantorAddress || '',
+              guarantorOccupation: sc.guarantorOccupation || '',
+              guarantorVerificationStatus: sc.guarantorVerificationStatus || 'Not Provided',
+              registrationDate: sc.registrationDate || new Date().toISOString().split('T')[0],
+              registeredAt: sc.registeredAt || sc.createdAt || sc.registrationDate,
+              registeredByStaffId: sc.registeredByStaffId || 'SYSTEM',
+              registeredByName: sc.registeredByName || 'System Registration Officer',
+              registeredByStaffCode: sc.registeredByStaffCode || 'TMC-SYS-0001',
+              registeredByPosition: sc.registeredByPosition || 'Customer Registration Officer',
+              registeredByRole: sc.registeredByRole || 'STAFF',
+              registeredByDepartment:
+                sc.registeredByDepartment || 'Customer Onboarding & KYC Department — Lagos Head Office',
+              status: ((sc.status || 'active').toLowerCase() as 'active' | 'suspended' | 'dormant'),
+              enrolledProgrammes: Array.isArray(sc.enrolledProgrammes) ? sc.enrolledProgrammes : [],
+              activityHistory: Array.isArray(sc.activityHistory) ? sc.activityHistory : [],
+            };
+            normalizedList.push(normalized);
+            this.ensureCustomerBankAccount(normalized, true);
+          }
+          // Pass silent = true so background server sync never triggers recursive storage listeners
+          saveToStorage(STORAGE_KEYS.CUSTOMERS, normalizedList, true);
+          this.lastCustomerSyncAt = Date.now();
+          return normalizedList;
+        }
+      } catch {
+        // Ignore network errors and return local customers
+      } finally {
+        this.customerSyncInFlight = null;
+      }
+      return this.getCustomers();
+    })();
+
+    this.customerSyncInFlight = syncPromise;
+    return syncPromise;
   }
 
   static updateCustomer(id: string, updates: Partial<CustomerRecord>): CustomerRecord | null {
@@ -3431,6 +3592,10 @@ export class LedgerEngine {
 
   getStaffAndAdminDirectory(): StaffUser[] {
     return LedgerEngine.getStaffAndAdminDirectory();
+  }
+
+  syncStaffDirectoryFromServer(serverAccounts: any[]): StaffUser[] {
+    return LedgerEngine.syncStaffDirectoryFromServer(serverAccounts);
   }
 
   getUserActivityLogs(userId: string, actor?: any): AuditLogEntry[] {

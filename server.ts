@@ -423,6 +423,7 @@ app.get('/api/governance', (_req: Request, res: Response) => {
 // Guarantee JSON header for all /api endpoints
 app.use('/api', (_req: Request, res: Response, next: NextFunction) => {
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   next();
 });
 
@@ -2778,10 +2779,11 @@ app.get('/api/auth/accounts', apiHandler(async (req: Request, res: Response) => 
   // Hydrate any Admin/Staff profiles stored in Firestore when cold-started or TTL expired
   if (forceRefresh) {
     try {
-      const [fsAdmins, fsStaff] = await withServerTimeout(
+      const [fsAdmins, fsStaff, fsUsers] = await withServerTimeout(
         Promise.all([
           listFirestoreCollection('admins', callerFbToken),
           listFirestoreCollection('staff', callerFbToken),
+          listFirestoreCollection('users', callerFbToken),
         ]),
         1800
       );
@@ -2841,6 +2843,41 @@ app.get('/api/auth/accounts', apiHandler(async (req: Request, res: Response) => 
           });
         }
       }
+
+      for (const usr of fsUsers) {
+        const usrId = String(usr.uid || usr.id || '');
+        const usrEmail = String(usr.email || '');
+        const usrRole = String(usr.role || '').toUpperCase();
+        if (
+          usrEmail &&
+          (usrRole === 'ADMIN' || usrRole === 'STAFF') &&
+          !serverAuthManager.isDeletedAccount(usrId) &&
+          !serverAuthManager.isDeletedAccount(usrEmail) &&
+          !serverAuthManager.findAccountByIdentifier(usrEmail)
+        ) {
+          const pos = String(
+            usr.position ||
+              usr.duty ||
+              usr.roleTitle ||
+              (usrRole === 'ADMIN' ? 'Account Manager' : 'Customer Registration Officer')
+          );
+          serverAuthManager.syncProvisionedAccount({
+            id: usrId,
+            email: usrEmail,
+            fullName: String(usr.fullName || usrEmail),
+            phone: String(usr.phone || ''),
+            role: usrRole === 'ADMIN' ? 'ADMIN' : 'STAFF',
+            roleTitle: pos,
+            duty: pos,
+            position: pos,
+            dashboardRoute: usr.dashboardRoute ? String(usr.dashboardRoute) : undefined,
+            assignedProgramme: usr.assignedProgramme ? String(usr.assignedProgramme) : undefined,
+            staffCode: usr.staffCode ? String(usr.staffCode) : undefined,
+            status: usr.active === false || usr.status === 'suspended' ? 'suspended' : 'active',
+            fromFirestore: true,
+          });
+        }
+      }
       lastAccountsHydratedAt = Date.now();
     } catch {
       // Non-fatal if Firestore list times out
@@ -2848,6 +2885,7 @@ app.get('/api/auth/accounts', apiHandler(async (req: Request, res: Response) => 
   }
 
   const accounts = serverAuthManager.getPublicAccountsList(session);
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   return res.status(200).json({
     success: true,
     message: 'Accounts retrieved successfully.',

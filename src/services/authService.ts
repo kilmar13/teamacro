@@ -1109,65 +1109,78 @@ class AuthService {
   /**
    * Retrieve active invitations
    */
-  public async getAccessInvitations(): Promise<any[]> {
+  public async getAccessInvitations(signal?: AbortSignal): Promise<any[]> {
     await this.ensureSuperAdminSession();
-    let res = await safeApiFetch('/api/auth/access/invitations');
+    if (signal?.aborted) return [];
+    let res = await safeApiFetch('/api/auth/access/invitations', signal ? { signal } : undefined);
     if (!res.success && (res.statusCode === 401 || res.statusCode === 403)) {
       await this.ensureSuperAdminSession(true);
-      res = await safeApiFetch('/api/auth/access/invitations');
+      if (signal?.aborted) return [];
+      res = await safeApiFetch('/api/auth/access/invitations', signal ? { signal } : undefined);
     }
     if (!res.success) return [];
-    return res.invitations || res.data?.invitations || [];
+    const list: any[] = res.invitations || res.data?.invitations || [];
+    return [...list].sort((a, b) => {
+      const aTime = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+      const bTime = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+      if (aTime !== bTime) return bTime - aTime;
+      return String(a.id || a.code || '').localeCompare(String(b.id || b.code || ''));
+    });
   }
 
   /**
-   * Retrieve accounts directory (merges server directory and local ledger directory)
+   * Retrieve authoritative accounts directory from /api/auth/accounts and sync to local directory silently.
    */
-  public async getAccountsList(): Promise<any[]> {
+  public async getAccountsList(signal?: AbortSignal): Promise<any[]> {
     await this.ensureSuperAdminSession();
-    let res = await safeApiFetch('/api/auth/accounts');
+    if (signal?.aborted) return ledgerEngine.getStaffAndAdminDirectory();
+    let res = await safeApiFetch('/api/auth/accounts', signal ? { signal } : undefined);
     if (!res.success && (res.statusCode === 401 || res.statusCode === 403)) {
       await this.ensureSuperAdminSession(true);
-      res = await safeApiFetch('/api/auth/accounts');
+      if (signal?.aborted) return ledgerEngine.getStaffAndAdminDirectory();
+      res = await safeApiFetch('/api/auth/accounts', signal ? { signal } : undefined);
     }
     const serverAccounts: any[] = res.success ? (res.accounts || res.data?.accounts || []) : [];
-    const localDirectory = ledgerEngine.getStaffAndAdminDirectory();
-    const byEmail = new Map<string, any>();
+    const validServerAccounts: any[] = [];
 
-    for (const acc of localDirectory) {
-      if (acc.email) {
-        const emailKey = acc.email.toLowerCase();
-        const idKey = String(acc.id || '').toLowerCase();
-        if (this.deletedAccountKeys.has(emailKey) || (idKey && this.deletedAccountKeys.has(idKey))) {
-          continue;
-        }
-        byEmail.set(emailKey, acc);
-      }
-    }
     for (const srv of serverAccounts) {
-      if (srv.email) {
-        const emailKey = srv.email.toLowerCase();
-        const idKey = String(srv.id || '').toLowerCase();
-        if (this.deletedAccountKeys.has(emailKey) || (idKey && this.deletedAccountKeys.has(idKey))) {
-          byEmail.delete(emailKey);
-          continue;
-        }
-        const prev = byEmail.get(emailKey) || {};
-        const pos = normalizeCanonicalPosition(srv.position || srv.duty || srv.roleTitle, srv.role) || srv.position || srv.duty || srv.roleTitle;
-        byEmail.set(emailKey, {
-          ...prev,
-          ...srv,
-          position: pos,
-          duty: pos,
-          roleTitle: pos,
-          dashboardRoute: srv.dashboardRoute || getDedicatedRouteForUser(srv),
-          staffCode: srv.staffCode || prev.staffCode || `TMC-${srv.id?.slice(-4) || '001'}`,
-          operationalResponsibility: pos || prev.operationalResponsibility,
-        });
+      if (!srv || !srv.email) continue;
+      const emailKey = String(srv.email).toLowerCase();
+      const idKey = String(srv.id || '').toLowerCase();
+      if (this.deletedAccountKeys.has(emailKey) || (idKey && this.deletedAccountKeys.has(idKey))) {
+        continue;
       }
+      const pos =
+        normalizeCanonicalPosition(srv.position || srv.duty || srv.roleTitle, srv.role) ||
+        srv.position ||
+        srv.duty ||
+        srv.roleTitle;
+      validServerAccounts.push({
+        ...srv,
+        position: pos,
+        duty: pos,
+        roleTitle: pos,
+        dashboardRoute: srv.dashboardRoute || getDedicatedRouteForUser(srv),
+        staffCode:
+          srv.staffCode ||
+          (srv.isLifetimeSuperAdmin || srv.role === 'LIFETIME_SUPER_ADMIN'
+            ? 'TMC-ROOT-001'
+            : srv.role === 'ADMIN' || String(srv.id || '').startsWith('STAFF_ADM_')
+            ? `TMC-ADM-${String(srv.id || '0001').slice(-4).toUpperCase()}`
+            : `TMC-STF-${String(srv.id || '0001').slice(-4).toUpperCase()}`),
+        operationalResponsibility: pos || srv.operationalResponsibility || 'All Programmes',
+      });
     }
 
-    return Array.from(byEmail.values());
+    if (validServerAccounts.length > 0) {
+      return ledgerEngine.syncStaffDirectoryFromServer(validServerAccounts);
+    }
+
+    return ledgerEngine.getStaffAndAdminDirectory().filter((acc) => {
+      const emailKey = String(acc.email || '').toLowerCase();
+      const idKey = String(acc.id || '').toLowerCase();
+      return !this.deletedAccountKeys.has(emailKey) && !(idKey && this.deletedAccountKeys.has(idKey));
+    });
   }
 
   /**

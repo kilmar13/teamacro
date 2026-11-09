@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   ShieldCheck,
   CheckCircle2,
@@ -75,9 +75,12 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   // Quick switch or auth check
   const [activeTab, setActiveTab] = useState<'approvals' | 'staff' | 'operations' | 'customers'>('approvals');
   const [requests, setRequests] = useState<MoneyTransferRequest[]>([]);
-  const [staffList, setStaffList] = useState<StaffUser[]>([]);
+  const [staffList, setStaffList] = useState<StaffUser[]>(() =>
+    ledgerEngine.getStaffAndAdminDirectory()
+  );
   const [customers, setCustomers] = useState<CustomerRecord[]>([]);
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
+  const fetchRequestIdRef = useRef(0);
 
   // Filters
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
@@ -147,74 +150,66 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
   const [newCustNIN, setNewCustNIN] = useState('');
   const [newCustNextOfKin, setNewCustNextOfKin] = useState('');
 
-  const loadData = () => {
+  const computeStaffListSignature = (list: StaffUser[]): string =>
+    list
+      .map(
+        (s) =>
+          `${s.id}|${(s.email || '').toLowerCase()}|${s.fullName}|${s.role}|${s.position || s.roleTitle || ''}|${
+            s.status
+          }|${JSON.stringify(s.permissions || {})}`
+      )
+      .join(';;');
+
+  const refreshLocalLedgerState = useCallback(() => {
     setRequests(ledgerEngine.getMoneyTransferRequests());
-    setStaffList(ledgerEngine.getStaffUsers());
     setCustomers(ledgerEngine.getCustomers());
     setMetrics(ledgerEngine.getManagementSystemSummary());
+  }, []);
 
-    ledgerEngine
-      .syncCustomersFromServer()
-      .then((synced) => {
+  const fetchAuthoritativeServerData = useCallback(async (signal?: AbortSignal) => {
+    const reqId = ++fetchRequestIdRef.current;
+    try {
+      const [accs, synced] = await Promise.all([
+        authService.getAccountsList(signal).catch(() => null),
+        ledgerEngine.syncCustomersFromServer().catch(() => null),
+      ]);
+      if (signal?.aborted || reqId !== fetchRequestIdRef.current) {
+        return;
+      }
+      if (Array.isArray(synced)) {
         setCustomers(synced);
         setMetrics(ledgerEngine.getManagementSystemSummary());
-      })
-      .catch(() => {});
+      }
+      if (Array.isArray(accs) && accs.length > 0) {
+        setStaffList((prev) =>
+          computeStaffListSignature(prev) === computeStaffListSignature(accs) ? prev : accs
+        );
+      }
+    } catch {
+      // Keep existing state intact on transient fetch error
+    }
+  }, []);
 
-    authService
-      .getAccountsList()
-      .then((accs) => {
-        if (Array.isArray(accs) && accs.length > 0) {
-          setStaffList((prev) => {
-            const byEmail = new Map<string, StaffUser>();
-            for (const acc of accs) {
-              if (acc.email && acc.role !== 'CUSTOMER') {
-                const emailKey = acc.email.toLowerCase();
-                const existing = prev.find((p) => p.email?.toLowerCase() === emailKey);
-                byEmail.set(emailKey, {
-                  ...(existing || {}),
-                  id: acc.id || existing?.id || `STAFF_${Date.now()}`,
-                  staffCode:
-                    acc.staffCode ||
-                    existing?.staffCode ||
-                    (acc.role === 'ADMIN' ? `TMC-ADM-${(acc.id || '0001').slice(-4)}` : `TMC-STF-${(acc.id || '0001').slice(-4)}`),
-                  fullName: acc.fullName || existing?.fullName || emailKey,
-                  email: acc.email,
-                  phone: acc.phone || existing?.phone || '',
-                  role: (acc.isLifetimeSuperAdmin ? 'LIFETIME_SUPER_ADMIN' : acc.role || existing?.role || 'STAFF') as any,
-                  roleTitle: acc.position || acc.roleTitle || acc.duty || existing?.roleTitle || 'Operational Staff',
-                  operationalResponsibility:
-                    acc.position || acc.duty || acc.roleTitle || existing?.operationalResponsibility || 'Field operations & customer servicing',
-                  permissions: (acc.permissions || existing?.permissions || {}) as any,
-                  status: acc.status || existing?.status || 'active',
-                  lastLogin: acc.lastLogin || existing?.lastLogin || new Date().toISOString(),
-                  lastActivityAt: existing?.lastActivityAt || new Date().toISOString(),
-                  createdAt: acc.createdAt || existing?.createdAt || new Date().toISOString(),
-                  isLifetimeSuperAdmin: !!(acc.isLifetimeSuperAdmin || existing?.isLifetimeSuperAdmin),
-                });
-              }
-            }
-            return Array.from(byEmail.values());
-          });
-        }
-      })
-      .catch(() => {});
-  };
+  const loadData = useCallback(() => {
+    refreshLocalLedgerState();
+    void fetchAuthoritativeServerData();
+  }, [refreshLocalLedgerState, fetchAuthoritativeServerData]);
 
   useEffect(() => {
-    loadData();
-    const unsub = ledgerEngine.subscribe(() => {
-      setRequests(ledgerEngine.getMoneyTransferRequests());
-      setStaffList(ledgerEngine.getStaffUsers());
-      setCustomers(ledgerEngine.getCustomers());
-      setMetrics(ledgerEngine.getManagementSystemSummary());
+    const controller = new AbortController();
+    refreshLocalLedgerState();
+    void fetchAuthoritativeServerData(controller.signal);
+
+    const unsub = ledgerEngine.subscribe((event) => {
+      if (event?.key === 'teamacro_ent_staff_v3') return;
+      refreshLocalLedgerState();
     });
-    const interval = setInterval(loadData, 5000);
+
     return () => {
+      controller.abort();
       unsub();
-      clearInterval(interval);
     };
-  }, []);
+  }, [refreshLocalLedgerState, fetchAuthoritativeServerData]);
 
   const handleRegisterCustomer = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1166,9 +1161,18 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
             </div>
 
             {/* STAFF TABLE */}
-            <div className="bg-white dark:bg-[#0B162C] border border-slate-200 dark:border-slate-800 shadow-xs overflow-hidden">
+            <div className="bg-white dark:bg-[#0B162C] border border-slate-200 dark:border-slate-800 shadow-xs overflow-hidden min-h-[188px] [contain:layout]">
               <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse text-xs">
+                <table className="w-full table-fixed min-w-[900px] text-left border-collapse text-xs">
+                  <colgroup>
+                    <col className="w-[12%]" />
+                    <col className="w-[22%]" />
+                    <col className="w-[16%]" />
+                    <col className="w-[18%]" />
+                    <col className="w-[9%]" />
+                    <col className="w-[11%]" />
+                    <col className="w-[12%]" />
+                  </colgroup>
                   <thead>
                     <tr className="bg-[#0B2A5B] text-white font-bold uppercase tracking-wider text-[11px]">
                       <th className="p-3.5">Staff Code</th>
@@ -1182,7 +1186,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
                   </thead>
                   <tbody className="divide-y divide-slate-100 dark:divide-slate-800 text-slate-700 dark:text-slate-300">
                     {staffList.map((s) => (
-                      <tr key={s.id} className="hover:bg-[#F4F7FB] dark:hover:bg-slate-900/40 transition-colors">
+                      <tr key={s.id || s.email} className="hover:bg-[#F4F7FB] dark:hover:bg-slate-900/40 transition-colors">
                         <td className="p-3.5 font-mono font-bold text-[#2563EB]">
                           {s.staffCode}
                         </td>
