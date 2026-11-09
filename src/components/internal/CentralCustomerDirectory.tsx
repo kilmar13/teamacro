@@ -227,7 +227,7 @@ export const CentralCustomerDirectory: React.FC<CentralCustomerDirectoryProps> =
         );
       }
 
-      LedgerEngine.saveCustomer(created, currentUser);
+      LedgerEngine.saveCustomer({ ...created, __fromServer: true }, currentUser);
       await refreshDirectory();
       setShowRegisterModal(false);
       setSameAsNextOfKin(false);

@@ -53,6 +53,7 @@ import {
 } from '../../utils/roleRouting';
 import { CentralCustomerDirectory } from '../../components/internal/CentralCustomerDirectory';
 import { CustomerProfileModal } from '../../components/internal/CustomerProfileModal';
+import { safeApiFetch } from '../../utils/apiClient';
 
 interface AdminPortalProps {
   config: BankConfig;
@@ -215,7 +216,7 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
     };
   }, []);
 
-  const handleRegisterCustomer = (e: React.FormEvent) => {
+  const handleRegisterCustomer = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!currentUser) return;
     setActionError(null);
@@ -223,28 +224,37 @@ export const AdminPortal: React.FC<AdminPortalProps> = ({
       if (!newCustName.trim() || !newCustPhone.trim()) {
         throw new Error('Customer full name and phone number are required.');
       }
-      const existing = ledgerEngine.checkCustomerDuplicate(newCustPhone.trim(), newCustEmail.trim() || undefined);
-      if (existing) {
-        throw new Error(existing.reason || `Customer with phone ${newCustPhone} already exists (${existing.fullName})`);
+      const res = await safeApiFetch('/api/customers', {
+        method: 'POST',
+        body: JSON.stringify({
+          customer: {
+            fullName: newCustName.trim(),
+            phone: newCustPhone.trim(),
+            email: newCustEmail.trim() || undefined,
+            address: newCustAddress.trim() || 'Lagos, Nigeria',
+            assignedStaffId: currentUser.id,
+            assignedStaffName: currentUser.fullName,
+            enrolledProgrammes: [],
+            status: 'active',
+            ninOrBvn: newCustNIN.trim(),
+            nextOfKinName: newCustNextOfKin.trim(),
+          },
+        }),
+      });
+      const created = res.customer || res.data?.customer;
+      if (!res.success || res.savedToFirestore === false || !created) {
+        throw new Error(
+          res.message ||
+            res.error ||
+            'Failed to save customer record to Firestore database.'
+        );
       }
-      const created = ledgerEngine.saveCustomer(
-        {
-          fullName: newCustName.trim(),
-          phone: newCustPhone.trim(),
-          email: newCustEmail.trim() || undefined,
-          address: newCustAddress.trim() || 'Lagos, Nigeria',
-          assignedStaffId: currentUser.id,
-          assignedStaffName: currentUser.fullName,
-          enrolledProgrammes: [],
-          status: 'active',
-          ninOrBvn: newCustNIN.trim(),
-          nextOfKinName: newCustNextOfKin.trim(),
-        },
-        currentUser
-      );
+      ledgerEngine.saveCustomer({ ...created, __fromServer: true }, currentUser);
       setCustomers((prev) => [created, ...prev.filter((c) => c.id !== created.id)]);
       loadData();
-      setActionSuccess(`Customer "${created.fullName}" (${created.customerCode}) registered successfully.`);
+      setActionSuccess(
+        `Customer successfully registered — "${created.fullName}" (${created.customerCode}) saved to Firestore.`
+      );
       setShowAddCustomerModal(false);
       setNewCustName('');
       setNewCustPhone('');

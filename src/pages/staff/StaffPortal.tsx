@@ -57,6 +57,7 @@ import { BrandLogo } from '../../components/common/BrandLogo';
 import { ThemeSelector } from '../../components/common/ThemeSelector';
 import { normalizeError } from '../../utils/errorNormalizer';
 import { isReadOnlyAuditor } from '../../utils/roleRouting';
+import { safeApiFetch } from '../../utils/apiClient';
 import { CentralCustomerDirectory } from '../../components/internal/CentralCustomerDirectory';
 import { CustomerProfileModal } from '../../components/internal/CustomerProfileModal';
 
@@ -247,38 +248,47 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({ config, onNavigate, cu
   // ==========================================
 
   // Register Customer
-  const handleRegisterCustomer = (e: React.FormEvent) => {
+  const handleRegisterCustomer = async (e: React.FormEvent) => {
     e.preventDefault();
     setActionError(null);
     try {
       if (!custName.trim() || !custPhone.trim()) {
         throw new Error('Customer full name and phone number are required.');
       }
-      const existing = ledgerEngine.checkCustomerDuplicate(custPhone.trim(), custEmail.trim() || undefined);
-      if (existing) {
-        throw new Error(existing.reason || `Customer with phone ${custPhone} already exists (${existing.fullName})`);
+      const res = await safeApiFetch('/api/customers', {
+        method: 'POST',
+        body: JSON.stringify({
+          customer: {
+            fullName: custName.trim(),
+            phone: custPhone.trim(),
+            email: custEmail.trim() || undefined,
+            address: custAddress.trim() || 'Lagos, Nigeria',
+            assignedStaffId: currentUser.id,
+            assignedStaffName: currentUser.fullName,
+            enrolledProgrammes: [],
+            status: 'active',
+            notes: custNotes,
+            kycIdNumber: custNIN.trim(),
+            ninOrBvn: custNIN.trim(),
+            nextOfKinName: custNextOfKin.trim(),
+          },
+        }),
+      });
+      const created = res.customer || res.data?.customer;
+      if (!res.success || res.savedToFirestore === false || !created) {
+        throw new Error(
+          res.message ||
+            res.error ||
+            'Failed to save customer record to Firestore database.'
+        );
       }
-      const created = ledgerEngine.saveCustomer(
-        {
-          fullName: custName.trim(),
-          phone: custPhone.trim(),
-          email: custEmail.trim() || undefined,
-          address: custAddress.trim() || 'Lagos, Nigeria',
-          assignedStaffId: currentUser.id,
-          assignedStaffName: currentUser.fullName,
-          enrolledProgrammes: [],
-          status: 'active',
-          notes: custNotes,
-          kycIdNumber: custNIN.trim(),
-          ninOrBvn: custNIN.trim(),
-          nextOfKinName: custNextOfKin.trim(),
-        },
-        currentUser
-      );
 
+      ledgerEngine.saveCustomer({ ...created, __fromServer: true }, currentUser);
       setCustomers((prev) => [created, ...prev.filter((c) => c.id !== created.id)]);
       loadData();
-      setActionSuccess(`Customer "${created.fullName}" (${created.customerCode}) successfully registered.`);
+      setActionSuccess(
+        `Customer successfully registered — "${created.fullName}" (${created.customerCode}) saved to Firestore.`
+      );
       setModalType(null);
       setCustName('');
       setCustPhone('');

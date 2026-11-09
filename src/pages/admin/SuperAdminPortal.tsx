@@ -66,6 +66,7 @@ import {
 } from '../../utils/roleRouting';
 import { CentralCustomerDirectory } from '../../components/internal/CentralCustomerDirectory';
 import { CustomerProfileModal } from '../../components/internal/CustomerProfileModal';
+import { safeApiFetch } from '../../utils/apiClient';
 
 interface SuperAdminPortalProps {
   config: BankConfig;
@@ -396,23 +397,37 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
     }).catch(() => {});
   };
 
-  const handleRegisterCustomer = (e: React.FormEvent) => {
+  const handleRegisterCustomer = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newCustomerForm.fullName.trim() || !newCustomerForm.phone.trim()) {
       setApprovalError('Customer Full Name and Phone Number are required.');
       return;
     }
     try {
-      const created = ledgerEngine.saveCustomer({
-        fullName: newCustomerForm.fullName.trim(),
-        phone: newCustomerForm.phone.trim(),
-        email: newCustomerForm.email.trim(),
-        address: newCustomerForm.address.trim(),
-        ninOrBvn: newCustomerForm.ninOrBvn.trim(),
-        nextOfKinName: newCustomerForm.nextOfKinName.trim(),
-        nextOfKinPhone: newCustomerForm.nextOfKinPhone.trim(),
-        status: 'ACTIVE',
+      const res = await safeApiFetch('/api/customers', {
+        method: 'POST',
+        body: JSON.stringify({
+          customer: {
+            fullName: newCustomerForm.fullName.trim(),
+            phone: newCustomerForm.phone.trim(),
+            email: newCustomerForm.email.trim(),
+            address: newCustomerForm.address.trim(),
+            ninOrBvn: newCustomerForm.ninOrBvn.trim(),
+            nextOfKinName: newCustomerForm.nextOfKinName.trim(),
+            nextOfKinPhone: newCustomerForm.nextOfKinPhone.trim(),
+            status: 'ACTIVE',
+          },
+        }),
       });
+      const created = res.customer || res.data?.customer;
+      if (!res.success || res.savedToFirestore === false || !created) {
+        throw new Error(
+          res.message ||
+            res.error ||
+            'Failed to save customer record to Firestore database.'
+        );
+      }
+      ledgerEngine.saveCustomer({ ...created, __fromServer: true });
       setCustomers((prev) => [created, ...prev.filter((c) => c.id !== created.id)]);
       setAccounts(ledgerEngine.getAccounts());
       setShowRegisterCustomerModal(false);
@@ -425,7 +440,9 @@ export const SuperAdminPortal: React.FC<SuperAdminPortalProps> = ({
         nextOfKinName: '',
         nextOfKinPhone: '',
       });
-      setApprovalSuccess(`Customer ${created.fullName} (${created.customerCode || created.id}) registered and synchronized.`);
+      setApprovalSuccess(
+        `Customer successfully registered — ${created.fullName} (${created.customerCode || created.id}) saved to Firestore.`
+      );
       loadData();
     } catch (err: any) {
       setApprovalError(err.message || 'Failed to register customer.');

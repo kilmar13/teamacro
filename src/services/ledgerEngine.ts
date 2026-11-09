@@ -1425,14 +1425,18 @@ export class LedgerEngine {
       `${existing ? 'Updated' : 'Successfully enrolled'} customer ${newCustomer.fullName} (${newCustomer.customerCode})`
     );
 
-    // Persist to backend /api/customers and Firestore
-    if (typeof window !== 'undefined' && typeof fetch === 'function') {
+    // Persist to backend /api/customers and Firestore only when not already synced from server
+    if (
+      !customerData?.__fromServer &&
+      typeof window !== 'undefined' &&
+      typeof fetch === 'function'
+    ) {
       import('../utils/apiClient')
         .then(({ safeApiFetch, getActiveSessionToken }) => {
           if (getActiveSessionToken()) {
             return safeApiFetch('/api/customers', {
               method: 'POST',
-              body: { customer: newCustomer },
+              body: JSON.stringify({ customer: newCustomer }),
             });
           }
         })
@@ -1454,37 +1458,15 @@ export class LedgerEngine {
       const res = await safeApiFetch('/api/customers', { method: 'GET' });
       if (!res.success) return this.getCustomers();
       const serverCustomers: any[] = res.customers || res.data?.customers || [];
-      const localCustomers = this.getCustomers();
 
-      // Push any local customers that aren't on the server yet
-      const serverPhones = new Set(
-        serverCustomers.map((c) => String(c.phone || '').replace(/\s+/g, ''))
-      );
-      for (const localCust of localCustomers) {
-        const cleanLocalPhone = String(localCust.phone || '').replace(/\s+/g, '');
-        if (cleanLocalPhone && !serverPhones.has(cleanLocalPhone)) {
-          safeApiFetch('/api/customers', {
-            method: 'POST',
-            body: { customer: localCust },
-          }).catch(() => {});
-        }
-      }
-
-      if (Array.isArray(serverCustomers) && serverCustomers.length > 0) {
-        const merged = [...localCustomers];
+      if (Array.isArray(serverCustomers)) {
+        const normalizedList: CustomerRecord[] = [];
         for (const sc of serverCustomers) {
           if (!sc || (!sc.fullName && !sc.phone)) continue;
-          const cleanPhone = String(sc.phone || '').replace(/\s+/g, '');
-          const existsIdx = merged.findIndex(
-            (lc) =>
-              lc.id === sc.id ||
-              (cleanPhone && String(lc.phone || '').replace(/\s+/g, '') === cleanPhone)
-          );
           const normalized: CustomerRecord = {
-            ...(existsIdx >= 0 ? merged[existsIdx] : {}),
             ...sc,
-            id: sc.id || `cust_${merged.length + 1}`,
-            customerCode: sc.customerCode || `TMC-CST-${1000 + merged.length + 1}`,
+            id: sc.id || `cust_${normalizedList.length + 1}`,
+            customerCode: sc.customerCode || `TMC-CST-${1000 + normalizedList.length + 1}`,
             fullName: sc.fullName || 'Customer',
             phone: sc.phone || '',
             altPhone: sc.altPhone || '',
@@ -1520,15 +1502,11 @@ export class LedgerEngine {
             enrolledProgrammes: Array.isArray(sc.enrolledProgrammes) ? sc.enrolledProgrammes : [],
             activityHistory: Array.isArray(sc.activityHistory) ? sc.activityHistory : [],
           };
-          if (existsIdx === -1) {
-            merged.unshift(normalized);
-            this.ensureCustomerBankAccount(normalized);
-          } else {
-            merged[existsIdx] = normalized;
-          }
+          normalizedList.push(normalized);
+          this.ensureCustomerBankAccount(normalized);
         }
-        saveToStorage(STORAGE_KEYS.CUSTOMERS, merged);
-        return merged;
+        saveToStorage(STORAGE_KEYS.CUSTOMERS, normalizedList);
+        return normalizedList;
       }
     } catch {
       // Ignore network errors and return local customers

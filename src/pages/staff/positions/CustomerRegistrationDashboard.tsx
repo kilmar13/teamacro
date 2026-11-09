@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { User, CustomerRecord } from '../../../types/banking';
 import { safeApiFetch } from '../../../utils/apiClient';
+import { LedgerEngine } from '../../../services/ledgerEngine';
 import { ASSIGNABLE_PROGRAMMES } from '../../../utils/roleRouting';
 import { CustomerProfileModal, formatDateTimeDisplay, formatFieldOrNotProvided } from '../../../components/internal/CustomerProfileModal';
 
@@ -28,7 +29,7 @@ export const CustomerRegistrationDashboard: React.FC<CustomerRegistrationDashboa
   onLogout,
   onNavigate,
 }) => {
-  const [activeTab, setActiveTab] = useState<'register' | 'directory' | 'incomplete'>('directory');
+  const [activeTab, setActiveTab] = useState<'register' | 'directory' | 'incomplete'>('register');
   const [customers, setCustomers] = useState<CustomerRecord[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
@@ -273,6 +274,7 @@ export const CustomerRegistrationDashboard: React.FC<CustomerRegistrationDashboa
         return;
       }
 
+      LedgerEngine.saveCustomer({ ...savedCustomer, __fromServer: true }, currentUser);
       setFeedback({
         type: 'success',
         message: isEditing

@@ -481,9 +481,15 @@ export function sanitizePermissionsForPosition(
   if (!customPermissions || typeof customPermissions !== 'object') {
     return base;
   }
-  return {
+  const merged: Record<string, boolean> = {
     ...base,
     ...customPermissions,
     canModifySettings: false, // Reserved exclusively for Lifetime Super Admin
   };
+  if (typeof customPermissions.canRegisterCustomers === 'boolean') {
+    merged.canRegisterCustomer = customPermissions.canRegisterCustomers;
+  } else if (typeof customPermissions.canRegisterCustomer === 'boolean') {
+    merged.canRegisterCustomers = customPermissions.canRegisterCustomer;
+  }
+  return merged;
 }
