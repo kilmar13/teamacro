@@ -8,13 +8,36 @@
     "VITE_FIREBASE_PROJECT_ID": "teamacro-a1849",
     "VITE_FIREBASE_FIRESTORE_DATABASE_ID": "ai-studio-teamacro-1c75b7f5-7b8e-4f90-9452-2820167e5d5a"
   },
+  "headers": [
+    {
+      "source": "/favicon.ico",
+      "headers": [
+        { "key": "Content-Type", "value": "image/x-icon" },
+        { "key": "Cache-Control", "value": "public, max-age=86400, must-revalidate" }
+      ]
+    },
+    {
+      "source": "/(favicon\\.png|favicon-32x32\\.png|apple-touch-icon\\.png)",
+      "headers": [
+        { "key": "Content-Type", "value": "image/png" },
+        { "key": "Cache-Control", "value": "public, max-age=86400, must-revalidate" }
+      ]
+    },
+    {
+      "source": "/site.webmanifest",
+      "headers": [
+        { "key": "Content-Type", "value": "application/manifest+json" },
+        { "key": "Cache-Control", "value": "public, max-age=86400, must-revalidate" }
+      ]
+    }
+  ],
   "rewrites": [
     {
       "source": "/api/(.*)",
       "destination": "/api/index?__path=$1"
     },
     {
-      "source": "/((?!api(?:/.*|$)).*)",
+      "source": "/((?!api(?:/.*|$)|assets(?:/.*|$)|favicon\\.ico|favicon\\.png|favicon-32x32\\.png|apple-touch-icon\\.png|site\\.webmanifest|teamacro-.*\\.(?:png|jpeg|jpg)|.*\\.(?:png|jpg|jpeg|gif|webp|svg|ico|css|js|woff2?|ttf|json|txt|xml|webmanifest)$).*)",
       "destination": "/index.html"
     }
   ]

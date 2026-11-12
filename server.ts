@@ -4123,8 +4123,10 @@ if (!isServerlessRuntime) {
     });
   }
 
-  // Serve pre-built static assets if available (used in production or if Vite middleware passes through)
+  // Serve pre-built static assets and public icons before SPA fallback
+  const publicPath = path.resolve(cwd, 'public');
   app.use(express.static(distPath, { index: false, maxAge: isProd ? '1h' : 0 }));
+  app.use(express.static(publicPath, { index: false, maxAge: isProd ? '1h' : 0 }));
 
   app.get('*', (_req: Request, res: Response) => {
     if (fs.existsSync(indexPath)) {

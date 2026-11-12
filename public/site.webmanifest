@@ -1,0 +1,33 @@
+{
+  "name": "TEAMACRO SERVICES LTD",
+  "short_name": "TEAMACRO",
+  "description": "Enterprise-grade microfinance banking platform featuring a comprehensive public portal, customer internet banking, staff operations, double-entry transaction ledger, and Super Admin control center.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#091747",
+  "theme_color": "#091747",
+  "icons": [
+    {
+      "src": "/favicon-32x32.png",
+      "sizes": "32x32",
+      "type": "image/png"
+    },
+    {
+      "src": "/apple-touch-icon.png",
+      "sizes": "180x180",
+      "type": "image/png"
+    },
+    {
+      "src": "/favicon.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/teamacro-square.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
