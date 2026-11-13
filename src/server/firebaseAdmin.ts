@@ -1,8 +1,31 @@
 import crypto from 'crypto';
 import fs from 'fs';
-import { getApps, getApp, initializeApp, cert, App } from 'firebase-admin/app';
-import { getAuth, Auth } from 'firebase-admin/auth';
-import { getFirestore, Firestore } from 'firebase-admin/firestore';
+import { createRequire } from 'module';
+import type { App } from 'firebase-admin/app';
+import type { Auth } from 'firebase-admin/auth';
+import type { Firestore } from 'firebase-admin/firestore';
+
+const requireModule = createRequire(import.meta.url);
+let cachedFbAppMod: typeof import('firebase-admin/app') | null = null;
+let cachedFbAuthMod: typeof import('firebase-admin/auth') | null = null;
+let cachedFbFirestoreMod: typeof import('firebase-admin/firestore') | null = null;
+
+function loadFirebaseAdminModules() {
+  if (!cachedFbAppMod) {
+    cachedFbAppMod = requireModule('firebase-admin/app');
+  }
+  if (!cachedFbAuthMod) {
+    cachedFbAuthMod = requireModule('firebase-admin/auth');
+  }
+  if (!cachedFbFirestoreMod) {
+    cachedFbFirestoreMod = requireModule('firebase-admin/firestore');
+  }
+  return {
+    fbApp: cachedFbAppMod!,
+    fbAuth: cachedFbAuthMod!,
+    fbFirestore: cachedFbFirestoreMod!,
+  };
+}
 
 export const AUTHORIZED_SUPER_ADMIN_EMAIL = 'eromoseledavidson68@gmail.com';
 export const DEFAULT_FIREBASE_PROJECT_ID = 'teamacro-a1849';
@@ -410,12 +433,13 @@ export function getFirebaseAdminServices(): {
   }
 
   try {
+    const { fbApp, fbAuth, fbFirestore } = loadFirebaseAdminModules();
     if (!singletonAdminApp) {
       singletonAdminApp =
-        getApps().length > 0
-          ? getApp()
-          : initializeApp({
-              credential: cert({
+        fbApp.getApps().length > 0
+          ? fbApp.getApp()
+          : fbApp.initializeApp({
+              credential: fbApp.cert({
                 projectId: config.projectId,
                 clientEmail: config.clientEmail,
                 privateKey: config.privateKey,
@@ -425,11 +449,11 @@ export function getFirebaseAdminServices(): {
     }
 
     if (!singletonAdminAuth) {
-      singletonAdminAuth = getAuth(singletonAdminApp);
+      singletonAdminAuth = fbAuth.getAuth(singletonAdminApp);
     }
 
     if (!singletonAdminDb || singletonAdminDbId !== config.firestoreDatabaseId) {
-      singletonAdminDb = getFirestore(singletonAdminApp, config.firestoreDatabaseId);
+      singletonAdminDb = fbFirestore.getFirestore(singletonAdminApp, config.firestoreDatabaseId);
       singletonAdminDbId = config.firestoreDatabaseId;
       if (!firestoreSettingsConfigured) {
         try {
@@ -495,7 +519,7 @@ export function inspectFirebaseAdminEnvironment(): FirebaseAdminEnvironmentRepor
     hasAdminCredentials: config.hasAdminCredentials,
     credentialSource: config.credentialSource,
     adminAppInitialized: Boolean(app),
-    singletonAppCount: getApps().length,
+    singletonAppCount: cachedFbAppMod ? cachedFbAppMod.getApps().length : app ? 1 : 0,
     missingEnvVars,
     recommendedVercelEnvVars: [
       'FIREBASE_SERVICE_ACCOUNT_KEY',

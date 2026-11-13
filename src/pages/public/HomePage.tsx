@@ -11,7 +11,6 @@ import {
   Users,
   Building2,
   TrendingUp,
-  Sparkles,
   Clock,
   Lock,
   X,
@@ -44,7 +43,7 @@ const PROGRAMMES: ProgrammeSpec[] = [
   {
     id: 'daily-ajo',
     number: '01',
-    title: 'Daily Ajo Savings (ROSCA)',
+    title: 'Daily Ajo Savings',
     category: '31-Day Rotating Contribution Cycles',
     color: '#16A34A',
     packName: 'Pack ₦310,000',
@@ -177,13 +176,8 @@ export const HomePage: React.FC<HomePageProps> = ({ config, onNavigate }) => {
       <section className="relative pt-12 pb-20 lg:pt-20 lg:pb-28 bg-gradient-to-b from-[#F4F7FB] via-white to-white dark:from-[#071126] dark:via-[#060D1F] dark:to-[#060D1F] border-b border-slate-100 dark:border-slate-800/80">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 lg:gap-10 items-center">
-            {/* Left Column: Ajo.money Hero Typography with Curved SVG Underline */}
+            {/* Left Column: Hero Typography with Curved SVG Underline */}
             <div className="lg:col-span-6 space-y-6">
-              <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-[#1E5BD8]/10 dark:bg-[#1E5BD8]/20 text-[#1E5BD8] dark:text-[#60A5FA] text-xs font-extrabold uppercase tracking-wider">
-                <Sparkles size={13} />
-                <span>AJO · ESUSU · ADASHE · TARGET SAVINGS & CREDIT</span>
-              </div>
-
               <h1 className="font-display text-4xl sm:text-5xl lg:text-[56px] font-extrabold text-[#0B2A5B] dark:text-white tracking-tight leading-[1.12]">
                 Alternative{' '}
                 <span className="relative inline-block">
@@ -486,18 +480,14 @@ export const HomePage: React.FC<HomePageProps> = ({ config, onNavigate }) => {
 
             {/* Right Column: Copy & Action Link */}
             <div className="lg:col-span-6 order-1 lg:order-2 space-y-5">
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#16A34A]/10 text-[#16A34A] text-xs font-extrabold uppercase tracking-wider">
-                <span>01 · ROTATING SAVINGS & THRIFT</span>
-              </div>
-
               <h2 className="font-display text-3xl sm:text-4xl font-extrabold text-[#0B2A5B] dark:text-white tracking-tight leading-tight">
-                Community financing (ROSCA & Daily Ajo).
+                Community financing & Daily Ajo.
               </h2>
 
               <p className="text-base text-slate-600 dark:text-slate-300 leading-relaxed">
                 Collectively save money or run a disciplined 31-day rotational contribution cycle
                 towards business inventory, shop rent, or household goals. TEAMACRO modernises
-                traditional Nigerian Ajo, Esusu, and Adashe with verified field collectors,
+                traditional daily thrift savings with verified field collectors,
                 passbook reconciliation, and transparent end-of-cycle settlement.
               </p>
 
@@ -538,10 +528,6 @@ export const HomePage: React.FC<HomePageProps> = ({ config, onNavigate }) => {
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 lg:gap-16 items-center">
             {/* Left Column: Copy & Action Link */}
             <div className="lg:col-span-6 space-y-5">
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#2563EB]/10 text-[#2563EB] text-xs font-extrabold uppercase tracking-wider">
-                <span>02 · GOAL SAVINGS & HOUSEHOLD FOOD</span>
-              </div>
-
               <h2 className="font-display text-3xl sm:text-4xl font-extrabold text-[#0B2A5B] dark:text-white tracking-tight leading-tight">
                 Save early and ahead in Fixed Target & Everyhome Food.
               </h2>
@@ -742,10 +728,6 @@ export const HomePage: React.FC<HomePageProps> = ({ config, onNavigate }) => {
 
             {/* Right Column: Copy & Action Link */}
             <div className="lg:col-span-6 order-1 lg:order-2 space-y-5">
-              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#0D9488]/10 text-[#0D9488] text-xs font-extrabold uppercase tracking-wider">
-                <span>03 · LIQUID SAVINGS & STRUCTURED CREDIT</span>
-              </div>
-
               <h2 className="font-display text-3xl sm:text-4xl font-extrabold text-[#0B2A5B] dark:text-white tracking-tight leading-tight">
                 Savings club, Leocash & micro-credit.
               </h2>

@@ -149,7 +149,7 @@ export const Header: React.FC<HeaderProps> = ({
                         </div>
                         <div>
                           <div className="font-display text-xs font-extrabold text-[#0B2A5B] dark:text-white group-hover:text-[#16A34A] transition-colors">
-                            Daily Ajo (ROSCA / Thrift)
+                            Daily Ajo Savings
                           </div>
                           <p className="text-[11px] text-slate-500 dark:text-slate-400 leading-snug mt-0.5">
                             Collectively or individually run 31-day daily thrift contribution cycles.

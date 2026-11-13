@@ -4108,9 +4108,24 @@ if (!isServerlessRuntime) {
 
     app.use(async (req: Request, res: Response, next: NextFunction) => {
       try {
-        const vite = viteInstance || (await getViteServer());
-        if (vite) {
-          return vite.middlewares(req, res, next);
+        // If Vite is already initialized, or if the request is specifically for a source module (/src/*, /@vite/*, /node_modules/*), await Vite
+        const needsViteTransform =
+          req.url.startsWith('/src/') ||
+          req.url.startsWith('/@') ||
+          req.url.startsWith('/node_modules/');
+
+        if (viteInstance) {
+          return viteInstance.middlewares(req, res, next);
+        }
+
+        if (needsViteTransform || !fs.existsSync(indexPath)) {
+          const vite = await getViteServer();
+          if (vite) {
+            return vite.middlewares(req, res, next);
+          }
+        } else {
+          // Trigger Vite warm-up in background while serving pre-built dist asset immediately
+          getViteServer().catch(() => {});
         }
       } catch (err) {
         console.warn('[DEV] Vite middleware handler note:', err);
@@ -4118,9 +4133,9 @@ if (!isServerlessRuntime) {
       next();
     });
 
-    setImmediate(() => {
-      getViteServer();
-    });
+    setTimeout(() => {
+      getViteServer().catch(() => {});
+    }, 150);
   }
 
   // Serve pre-built static assets and public icons before SPA fallback

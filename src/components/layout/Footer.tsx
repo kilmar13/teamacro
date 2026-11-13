@@ -41,7 +41,7 @@ export const Footer: React.FC<FooterProps> = ({ config, onNavigate }) => {
                   onClick={() => handleNav('/home', 'services')}
                   className="hover:text-white transition-colors text-left cursor-pointer"
                 >
-                  Ajo / Esusu / Adashe (ROSCA)
+                  Daily Ajo Savings
                 </button>
               </li>
               <li className="flex items-center gap-2.5">
@@ -248,7 +248,7 @@ export const Footer: React.FC<FooterProps> = ({ config, onNavigate }) => {
           <p className="text-xs text-slate-300/80 leading-relaxed max-w-5xl">
             TEAMACRO SERVICES LTD (RC {config.rcNumber || '1589421'}) is an incorporated Nigerian
             financial operations and cooperative thrift management institution providing structured
-            rotating savings (Daily Ajo / Esusu / Adashe), Fixed Target Savings, Everyhome Food
+            rotating savings (Daily Ajo Savings), Fixed Target Savings, Everyhome Food
             Contributions, Leocash flexible reserves, and micro-credit management for hardworking
             traders, households, and SMEs across Nigeria. All member contributions and loan ledgers
             are protected under dual-control accounting verification.

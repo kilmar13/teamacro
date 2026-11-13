@@ -327,7 +327,7 @@ export const PaymentCollectionDashboard: React.FC<PaymentCollectionDashboardProp
             <div className="text-2xl font-bold text-emerald-400 font-mono mt-1">
               ₦{metrics.savingsTotal.toLocaleString()}
             </div>
-            <div className="text-[11px] text-slate-400 mt-1">Esusu & target programmes</div>
+            <div className="text-[11px] text-slate-400 mt-1">Daily Ajo & target programmes</div>
           </div>
           <div className="p-5 rounded-xl bg-slate-900 border border-slate-800">
             <div className="text-xs text-slate-400">Loan Repayments Collected</div>
